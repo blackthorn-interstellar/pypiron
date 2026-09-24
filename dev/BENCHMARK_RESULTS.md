@@ -76,6 +76,7 @@ Every landed optimization, paired with the meter runs that bracket it.
 | 2026-09-23 | flate2 backend miniz_oxide → zlib-rs (same level 6) | gzip of 54 MB global index / 401 real per-package indexes | 451ms → 105ms / 3.09 MB → 2.93 MB (5% smaller) |
 | 2026-09-23 | Both of the above | microbench @50k cold: simple-root / monster (45k files) | 64ms → 38ms / 158ms → 90ms |
 | 2026-09-23 | Global index renders into one buffer, name set kept sorted (BTreeSet), stamp digest streamed (render.rs, worker.rs) | new name → visible in `/simple/` @780k names, local disk (M2 Max) | 1.19s → 0.95s |
+| 2026-09-24 | Rebuilds reuse sidecars whose listing ETag didn't move (sidecar_cache.rs) | storage reads for one upload to a 1,000-file package, disk / MinIO | 1,011 → 10 / 1,014 → 13 (MinIO visible 0.49s → 0.28s) |
 
 The 2026-07-23 rows came out of the endpoint micro-benchmark loop
 (dev/bench/MICROBENCH.md); a fifth candidate (borrowing `file_version` instead

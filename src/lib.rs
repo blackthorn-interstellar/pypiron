@@ -47,6 +47,7 @@ pub mod replicate;
 pub mod reqsign;
 pub mod serve;
 pub mod sidecar;
+pub mod sidecar_cache;
 pub mod sim;
 pub mod simple;
 pub mod ssrf;

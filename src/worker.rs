@@ -20,7 +20,7 @@
 //! upgraded node drains what an old node wrote.
 
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex, OnceLock,
@@ -49,6 +49,7 @@ use crate::sidecar::{
     is_artifact, sidecar_key, Sidecar, Yanked, FROZEN_SUFFIX, METADATA_SUFFIX, PROVENANCE_SUFFIX,
     SIDECAR_SUFFIX, SUPERSEDING_SUFFIX, TOMBSTONE_SUFFIX,
 };
+use crate::sidecar_cache::{PackageSidecars, SidecarCache};
 use crate::storage::{is_not_found, FileEntry, ObjectMeta, Storage};
 use crate::transparency::FileShas;
 
@@ -1530,14 +1531,18 @@ pub async fn audit(
 /// exactly as the index is built). Used only to seed the genesis checkpoint for
 /// a package the incremental audit did not rebuild; steady-state passes never
 /// call it, so the churn-sized audit cost is preserved.
-async fn current_package_shas(storage: &dyn Storage, pkg: &str) -> Result<FileShas> {
+async fn current_package_shas(
+    storage: &dyn Storage,
+    sidecars: &SidecarCache,
+    pkg: &str,
+) -> Result<FileShas> {
     // `false` = do not backfill missing sidecars, deliberately asymmetric with
     // the rebuild path's `true`. A legacy artifact with no sidecar is simply
     // omitted from this genesis commitment; a later rebuild backfills its
     // sidecar and commits it as ordinary churn. An uncommitted file never
     // triggers a verify-chain violation, so the omission is safe — and this
     // keeps genesis read-only, doing no writes of its own.
-    let (files, _raw) = list_artifacts_for_claim(storage, pkg, false).await?;
+    let (files, _raw) = list_artifacts_for_claim(storage, sidecars, pkg, false).await?;
     Ok(files.into_iter().map(|f| (f.filename, f.sha256)).collect())
 }
 
@@ -2202,7 +2207,7 @@ async fn audit_shard(
                     // Only the genesis pass needs this package's shas (its
                     // rebuild didn't run); steady state contributes no delta.
                     let delta = if collect_deltas && need_full_shas && !maintenance_failed {
-                        current_package_shas(storage, &pkg).await.ok()
+                        current_package_shas(storage, &state.sidecar_cache, &pkg).await.ok()
                     } else {
                         None
                     };
@@ -2734,7 +2739,8 @@ async fn rebuild_package_indexes_inner(
         .metrics
         .index_rebuilds
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let (mut files, mut raw) = list_artifacts_for_claim(storage, pkg, true).await?;
+    let (mut files, mut raw) =
+        list_artifacts_for_claim(storage, &state.sidecar_cache, pkg, true).await?;
     if let Some(omit) = omit {
         files.retain(|f| f.filename != omit);
         raw.retain(|(filename, _)| filename != omit);
@@ -3933,9 +3939,10 @@ async fn global_html_proved_current(
 /// still occupies storage, and the audit counts it off the listing.
 pub async fn list_artifacts(
     storage: &dyn Storage,
+    sidecars: &SidecarCache,
     pkg: &str,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
-    list_artifacts_for_claim(storage, pkg, true).await
+    list_artifacts_for_claim(storage, sidecars, pkg, true).await
 }
 
 /// Request-path project rendering in multi-bucket mode never mutates truth. The
@@ -3943,13 +3950,15 @@ pub async fn list_artifacts(
 /// untyped artifact for now.
 pub async fn list_artifacts_readonly(
     storage: &dyn Storage,
+    sidecars: &SidecarCache,
     pkg: &str,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
-    list_artifacts_for_claim(storage, pkg, false).await
+    list_artifacts_for_claim(storage, sidecars, pkg, false).await
 }
 
 async fn list_artifacts_for_claim(
     storage: &dyn Storage,
+    sidecars: &SidecarCache,
     pkg: &str,
     backfill_missing: bool,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
@@ -4028,6 +4037,17 @@ async fn list_artifacts_for_claim(
                 .then_some((entry, filename))
         })
         .collect();
+    // Each listed sidecar's change detector: a sidecar the last rebuild parsed
+    // under the same detector is reused instead of re-read (sidecar_cache.rs).
+    let sidecar_etags: HashMap<&str, &str> = entries
+        .iter()
+        .filter_map(|e| {
+            let filename = e.key.strip_prefix(&prefix)?.strip_suffix(SIDECAR_SUFFIX)?;
+            Some((filename, e.etag.as_deref()?))
+        })
+        .collect();
+    let memo = sidecars.take(pkg);
+    let fresh = Mutex::new(PackageSidecars::with_capacity(sidecar_etags.len()));
     // Read the package claim once. Besides typing a legacy sidecar backfill, it
     // suppresses a typed mirror record that finished after the claim became
     // private. Such bytes remain inert until replication quarantines them; they
@@ -4035,6 +4055,7 @@ async fn list_artifacts_for_claim(
     let mut metadata = Vec::with_capacity(artifacts.len());
     for chunk in artifacts.chunks(SIDECAR_READ_CONCURRENCY) {
         let loaded = futures::future::join_all(chunk.iter().map(|(entry, filename)| {
+            let etag = sidecar_etags.get(filename).copied();
             load_file_metadata(
                 storage,
                 entry,
@@ -4042,6 +4063,15 @@ async fn list_artifacts_for_claim(
                 &names,
                 pkg_origin,
                 backfill_missing,
+                SidecarMemo {
+                    etag,
+                    known: etag.and_then(|etag| {
+                        memo.get(*filename)
+                            .filter(|(seen, _)| seen == etag)
+                            .map(|(_, sc)| sc)
+                    }),
+                    fresh: &fresh,
+                },
             )
         }))
         .await;
@@ -4054,7 +4084,17 @@ async fn list_artifacts_for_claim(
             metadata.extend(file?);
         }
     }
+    sidecars.put(pkg, fresh.into_inner().unwrap_or_else(|e| e.into_inner()));
     Ok((metadata, raw))
+}
+
+/// One artifact's view of the package's sidecar memo: the detector its sidecar
+/// is listed under, the memoized parse if that detector has not moved, and the
+/// memo this rebuild is filling for the next one.
+struct SidecarMemo<'a> {
+    etag: Option<&'a str>,
+    known: Option<&'a Sidecar>,
+    fresh: &'a Mutex<PackageSidecars>,
 }
 
 /// Load one artifact's index entry from its sidecar (backfilling if absent).
@@ -4070,6 +4110,7 @@ async fn load_file_metadata(
     names: &HashSet<&str>,
     pkg_origin: Option<&str>,
     backfill_missing: bool,
+    memo: SidecarMemo<'_>,
 ) -> Result<Option<FileMetadata>> {
     let has_sidecar = names.contains(format!("{filename}{SIDECAR_SUFFIX}").as_str());
     let mirror_quarantined =
@@ -4079,10 +4120,20 @@ async fn load_file_metadata(
         return Ok(None);
     }
     let sc = if has_sidecar {
-        match read_listed_sidecar(storage, &entry.key).await? {
-            Some(sc) => sc,
-            None => return Ok(None),
+        let sc = match memo.known {
+            Some(sc) => sc.clone(),
+            None => match read_listed_sidecar(storage, &entry.key).await? {
+                Some(sc) => sc,
+                None => return Ok(None),
+            },
+        };
+        if let Some(etag) = memo.etag {
+            memo.fresh
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(filename.to_string(), (etag.to_string(), sc.clone()));
         }
+        sc
     } else if backfill_missing {
         match backfill_sidecar(storage, entry, filename, pkg_origin).await? {
             Some(sc) => sc,
@@ -4461,6 +4512,7 @@ mod tests {
             allow_legacy_versions: false,
             lease_ttl: Duration::from_secs(30),
             index_cache: Arc::new(crate::cache::IndexCache::new(crate::cache::INDEX_CACHE_TTL)),
+            sidecar_cache: Default::default(),
             project_cache: Arc::new(crate::project_cache::ProjectCache::new(
                 crate::cache::INDEX_CACHE_TTL,
             )),
@@ -4505,11 +4557,13 @@ mod tests {
                 key: format!("{DIRTY_PREFIX}pkg!unknown.intent"),
                 size: 0,
                 last_modified: None,
+                etag: None,
             },
             FileEntry {
                 key: format!("{DIRTY_PREFIX}pkg!other.commit"),
                 size: 0,
                 last_modified: Some("2026-01-01T00:00:00Z".into()),
+                etag: None,
             },
         ];
         assert!(consumable_dirty_work(
@@ -4933,6 +4987,7 @@ mod tests {
                     key: k.clone(),
                     size: v.len() as u64,
                     last_modified: Some("2026-01-01T00:00:00Z".to_string()),
+                    etag: None,
                 })
                 .collect();
             out.sort_by(|a, b| a.key.cmp(&b.key));
@@ -5750,8 +5805,11 @@ mod tests {
             "test setup broken: the healthy tick never built the package view"
         );
 
-        // Now one sidecar read blips while a fresh marker is outstanding.
+        // Now one sidecar read blips while a fresh marker is outstanding. Drop
+        // the parsed-sidecar memo first — as a restart would — so the rebuild
+        // has to read it: an unchanged sidecar is otherwise never re-read.
         mark_dirty(storage.as_ref(), "alpha").await.unwrap();
+        state.sidecar_cache.take("alpha");
         storage.fail_reads_of(&sidecar_key(&format!("{PACKAGES_PREFIX}alpha/{FILE}")));
         tick(&state, &pinned).await.unwrap_err();
         storage.heal_reads();
@@ -5775,6 +5833,40 @@ mod tests {
         assert!(
             String::from_utf8(global).unwrap().contains("alpha"),
             "a live package must stay in the global index across a transient read error"
+        );
+    }
+
+    /// The sidecar memo saves re-reading unchanged sidecars, never a changed one:
+    /// a yank rewrites the sidecar, moves its listing detector, and the next
+    /// rebuild must render it — while an unchanged sidecar costs no read.
+    #[tokio::test]
+    async fn a_rewritten_sidecar_is_reread_and_an_unchanged_one_is_not() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = Arc::new(InMemStorage::default());
+        let state = test_app_state(storage.clone(), Duration::from_secs(3600));
+        let pinned = state.pin();
+        let view = format!("{SIMPLE_PREFIX}alpha/index.json");
+        let sidecar = sidecar_key(&format!("{PACKAGES_PREFIX}alpha/{FILE}"));
+        seed_private_artifact(&storage, "alpha", FILE);
+        mark_dirty(storage.as_ref(), "alpha").await.unwrap();
+        tick(&state, &pinned).await.unwrap();
+
+        // Unchanged: a failing read of it would fail the rebuild, so a passing
+        // tick proves the memo answered instead.
+        mark_dirty(storage.as_ref(), "alpha").await.unwrap();
+        storage.fail_reads_of(&sidecar);
+        tick(&state, &pinned).await.unwrap();
+        storage.heal_reads();
+
+        let mut yanked = test_sidecar(8, Some(crate::origin::PRIVATE));
+        yanked.yanked = Yanked::Reason("broken".to_string());
+        storage.insert(&sidecar, serde_json::to_vec(&yanked).unwrap());
+        mark_dirty(storage.as_ref(), "alpha").await.unwrap();
+        tick(&state, &pinned).await.unwrap();
+        let rendered = String::from_utf8(storage.get_bytes(&view).await.unwrap()).unwrap();
+        assert!(
+            rendered.contains(r#""yanked":"broken""#),
+            "the rewritten sidecar's yank must reach the index: {rendered}"
         );
     }
 
@@ -5846,6 +5938,7 @@ mod tests {
                     key,
                     size: 8,
                     last_modified: Some("2026-01-01T00:00:00Z".to_string()),
+                    etag: None,
                 };
                 backfill_sidecar(storage.as_ref(), &entry, FILE, Some(crate::origin::PRIVATE)).await
             })

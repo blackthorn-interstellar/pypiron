@@ -321,6 +321,9 @@ pub struct AppState {
     /// RAM-served rendered `/project/<pkg>/` pages; see project_cache.rs. Spares
     /// the human project page a full package-prefix scan + sidecar parse per hit.
     pub project_cache: Arc<project_cache::ProjectCache>,
+    /// Parsed sidecars from the last rebuild of each package, keyed by the
+    /// listing's change detector; see sidecar_cache.rs.
+    pub sidecar_cache: Arc<crate::sidecar_cache::SidecarCache>,
     /// Where upload spools live (must be real disk, not tmpfs).
     pub spool_dir: std::path::PathBuf,
     /// Caps how many artifact writes may buffer their whole body in RAM at once.
@@ -614,6 +617,7 @@ impl AppState {
             allow_legacy_versions: false,
             index_cache: Arc::new(cache::IndexCache::new(cache::INDEX_CACHE_TTL)),
             project_cache: Arc::new(project_cache::ProjectCache::new(cache::INDEX_CACHE_TTL)),
+            sidecar_cache: Default::default(),
             presign_cache: Arc::new(cache::PresignCache::new(cache::PRESIGN_CACHE_TTL)),
             spool_dir: std::env::temp_dir(),
             artifact_write_semaphore: artifact_write_semaphore(
@@ -1655,6 +1659,7 @@ async fn run_serve(
         index_cache: Arc::new(cache::IndexCache::new(Duration::from_secs(
             cli.index_cache_ttl_secs,
         ))),
+        sidecar_cache: Default::default(),
         project_cache: Arc::new(project_cache::ProjectCache::new(Duration::from_secs(
             cli.index_cache_ttl_secs,
         ))),

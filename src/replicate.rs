@@ -4989,7 +4989,9 @@ mod tests {
             format!(r#"{{"filename":"{filename}"}}"#).into_bytes()
         );
         assert_eq!(storage.list_all(QUARANTINE_PREFIX).await.unwrap().len(), 1);
-        let (rendered, _) = worker::list_artifacts(&storage, "pkg").await.unwrap();
+        let (rendered, _) = worker::list_artifacts(&storage, &Default::default(), "pkg")
+            .await
+            .unwrap();
         assert!(rendered.is_empty());
         // Idempotent: a second pass has nothing left to settle.
         assert_eq!(

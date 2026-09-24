@@ -252,6 +252,7 @@ fn dirty_entries(s: &State) -> Vec<FileEntry> {
                 key: format!("_dirty/p0!{nonce}{suffix}"),
                 size: 0,
                 last_modified: Some(last_modified),
+                etag: None,
             }
         })
         .collect()
@@ -263,6 +264,7 @@ fn parse_key(key: &str) -> MarkerKey {
         key: key.to_string(),
         size: 0,
         last_modified: None,
+        etag: None,
     };
     let (_pkg, marker) = parse_marker(&entry).expect("model markers always parse");
     let nonce = marker

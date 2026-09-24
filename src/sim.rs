@@ -534,6 +534,7 @@ impl Storage for SimStorage {
                     .unwrap_or(o.last_modified)
                     .format(&Rfc3339)
                     .ok(),
+                etag: Some(o.listed_etag()),
             })
             .collect();
         Ok(entries)

@@ -969,6 +969,12 @@ pub struct FileEntry {
     pub size: u64,
     /// RFC 3339 last-modified timestamp (serves as PEP 700 upload-time).
     pub last_modified: Option<String>,
+    /// The same listing-only change detector as [`ObjectMeta::etag`] (the
+    /// cloud ETag + version, or nanosecond mtime + size on disk): equal across
+    /// two listings iff the object was not rewritten between them. `None` when
+    /// the backend reported nothing to compare, so a caller memoizing on it
+    /// must treat the object as always changed.
+    pub etag: Option<String>,
 }
 
 /// One object from a flat (recursive) listing — see [`Storage::list_all`].
@@ -2085,6 +2091,7 @@ impl Storage for DiskStorage {
                         key: format!("{}{}", dir_prefix, name),
                         size: md.len(),
                         last_modified,
+                        etag: Some(disk_etag(&md)),
                     });
                 }
             }
@@ -3100,6 +3107,8 @@ impl Storage for ObjectStorage {
                     last_modified: OffsetDateTime::from_unix_timestamp(m.last_modified.timestamp())
                         .ok()
                         .and_then(|t| t.format(&Rfc3339).ok()),
+                    etag: (m.e_tag.is_some() || m.version.is_some())
+                        .then(|| pack_version(&m.e_tag, &m.version)),
                 })
             })
             .collect();
@@ -4780,6 +4789,7 @@ pub mod test_support {
                     key: k.clone(),
                     size: v.len() as u64,
                     last_modified: Some("2026-01-01T00:00:00Z".to_string()),
+                    etag: Some(listed_etag(v)),
                 })
                 .collect();
             out.sort_by(|a, b| a.key.cmp(&b.key));

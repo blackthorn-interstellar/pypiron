@@ -1079,6 +1079,10 @@ sidecar still parses (a legacy/proxy mirror sidecar reads as a cache). Rebuilds
 read sidecars only;
 if a sidecar is missing (legacy file), the rebuild backfills it by hashing the
 artifact once — create-only, so a real write-time sidecar always wins the race.
+A rebuild re-reads only the sidecars whose listing change detector (ETag +
+version, or nanosecond mtime + size on disk) moved since this process last
+parsed them; the parse memo lives in RAM only (src/sidecar_cache.rs), so it is
+never state to migrate or roll back.
 PEP 658 serving falls out of the layout: `<artifact-url>.metadata` maps directly
 to the adjacent stored file. PEP 740 provenance works the same way —
 `<artifact-url>.provenance` maps to the stored object. pypiron **relays**

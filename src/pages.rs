@@ -274,9 +274,9 @@ async fn render_project(
         return not_found("no such project");
     }
     let listed = if state.buckets.is_multi() {
-        worker::list_artifacts_readonly(storage.as_ref(), &pkg).await
+        worker::list_artifacts_readonly(storage.as_ref(), &state.sidecar_cache, &pkg).await
     } else {
-        worker::list_artifacts(storage.as_ref(), &pkg).await
+        worker::list_artifacts(storage.as_ref(), &state.sidecar_cache, &pkg).await
     };
     let mut files = match listed {
         Ok((files, _raw)) => files,

@@ -89,7 +89,7 @@ ENDPOINTS: list = [
         method="GET",
         path="/project/{pkg}/",
         routes=(("GET", "/project/:package"), ("GET", "/project/:package/")),
-        cold_ops={"read": 42, "list": 31},
+        cold_ops={"read": 32, "list": 31},
         warm_ops={},
         bytes_range=(500, 500000),
     ),
@@ -98,7 +98,7 @@ ENDPOINTS: list = [
         method="GET",
         path="/project/{pkg}/{version}/",
         routes=(("GET", "/project/:package/:version"), ("GET", "/project/:package/:version/")),
-        cold_ops={"read": 68, "list": 31},
+        cold_ops={"read": 33, "list": 31},
         warm_ops={},
         bytes_range=(500, 500000),
     ),
@@ -391,8 +391,8 @@ ENDPOINTS: list = [
         # deliberately adopts no etag, because the listing it could read back may
         # already be a peer's newer body — pinning to that would make this node's
         # poll no-op past a freeze it never saw. The next poll re-reads instead.
-        cold_ops={"read": 6, "write": 6, "list": 2, "delete": 1},
-        warm_ops={"read": 6, "write": 6, "list": 2, "delete": 1},
+        cold_ops={"read": 5, "write": 6, "list": 2, "delete": 1},
+        warm_ops={"read": 5, "write": 6, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -409,8 +409,8 @@ ENDPOINTS: list = [
         # name that endpoint quarantined at this same iteration index. A real
         # change again, so the same read/write pair and, for the same reason, no
         # etag-adopting LIST.
-        cold_ops={"read": 6, "write": 5, "list": 2, "delete": 2},
-        warm_ops={"read": 6, "write": 5, "list": 2, "delete": 2},
+        cold_ops={"read": 5, "write": 5, "list": 2, "delete": 2},
+        warm_ops={"read": 5, "write": 5, "list": 2, "delete": 2},
         bytes_range=(0, 100),
     ),
     _e(
@@ -471,8 +471,8 @@ ENDPOINTS: list = [
         expect=(200, 204),
         mutates=True,
         target="probe",
-        cold_ops={"read": 7, "write": 6, "list": 3, "delete": 5},
-        warm_ops={"read": 7, "write": 6, "list": 3, "delete": 5},
+        cold_ops={"read": 6, "write": 6, "list": 3, "delete": 5},
+        warm_ops={"read": 6, "write": 6, "list": 3, "delete": 5},
         bytes_range=(0, 100),
     ),
 ]

@@ -225,13 +225,19 @@ def sync_to(
 
 
 def kill_process_tree(proc: subprocess.Popen) -> None:
-    """Terminate a process, then kill if needed (cross-platform)."""
+    """Terminate a process, then kill if needed (cross-platform).
+
+    The wait must cover a graceful stop: a cloud-backed server holds /ready
+    down for 3s (load-balancer drain) before it stops, and releases its leader
+    lease only after that. Killing it at 2s stranded the lease, so the next
+    server on the same bucket stalled ~30s for it to expire. Measured stops
+    are ~3.5s, under 7s even with a bucket blackholed; disk stops instantly."""
     if proc.poll() is not None:
         return
     try:
         proc.terminate()
         try:
-            proc.wait(timeout=2.0)
+            proc.wait(timeout=15.0)
             return
         except subprocess.TimeoutExpired:
             pass

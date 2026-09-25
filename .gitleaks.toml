@@ -17,6 +17,9 @@ regexes = [
   '''^admin:secret$''',
   '''^reader:secret$''',
   '''^admin:smoke$''',
+  # A fixed HMAC key for a throwaway test server (tests/test_token_auth.py);
+  # it signs nothing outside that test.
+  '''^test-signing-key-0123456789abcdef$''',
 ]
 
 # Deliberately NOT allowlisted: generated trees (target/, .local/) and the fuzz

@@ -135,7 +135,7 @@ pub enum ArtifactDelivery {
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Deadline for the streaming routes — uploads and artifact downloads move
-/// bodies up to the 1 GiB limit, so a real large wheel over a slow link needs
+/// bodies up to 5 GiB, so a real large wheel over a slow link needs
 /// far longer than a read. Still finite: a trickled transfer can't hold a
 /// connection (and an upload's spool fd) indefinitely.
 const STREAMING_REQUEST_TIMEOUT: Duration = Duration::from_secs(3600);
@@ -1743,6 +1743,8 @@ async fn run_serve(
         .route("/", post(legacy_upload))
         .route("/simple", post(legacy_upload))
         .route("/simple/", post(legacy_upload))
+        // Uploads enforce their own limit, by credential (legacy_upload).
+        .layer(axum::extract::DefaultBodyLimit::disable())
         // Artifact bytes (streamed through this node in `stream` mode).
         .route(
             "/files/:package/:filename",

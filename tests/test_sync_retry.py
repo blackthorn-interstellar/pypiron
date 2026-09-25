@@ -113,8 +113,8 @@ HUGE_NAME = "flaky_pkg-1.0.0-cp312-cp312-manylinux_2_28_x86_64.whl"
 
 
 class OversizePyPI(BaseHTTPRequestHandler):
-    """Lists a normal wheel plus one declared at 2 GiB — over the destination's
-    1 GiB upload limit — and records which artifacts were fetched."""
+    """Lists a normal wheel plus one declared at 6 GiB — over the destination's
+    5 GiB upload limit — and records which artifacts were fetched."""
 
     wheel = make_wheel()
     fetched: list[str] = []
@@ -133,7 +133,7 @@ class OversizePyPI(BaseHTTPRequestHandler):
                     "filename": HUGE_NAME,
                     "url": f"{base}/{HUGE_NAME}",
                     "hashes": {"sha256": "0" * 64},
-                    "size": 2 * 1024**3,
+                    "size": 6 * 1024**3,
                 },
             ]
             body = json.dumps(
@@ -164,7 +164,7 @@ class OversizePyPI(BaseHTTPRequestHandler):
 
 
 def test_sync_fails_oversize_file_without_downloading_it(disk_server, pypiron_bin):
-    """A file over the destination's 1 GiB upload limit fails loudly before any
+    """A file over the destination's 5 GiB upload limit fails loudly before any
     download (it could never be uploaded); the rest of the package still lands."""
     port = find_free_port()
     httpd = ThreadingHTTPServer(("127.0.0.1", port), OversizePyPI)

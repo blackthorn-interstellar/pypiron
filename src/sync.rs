@@ -2951,15 +2951,14 @@ const DOWNLOAD_ATTEMPTS: u32 = 3;
 /// download.
 const UPLOAD_ATTEMPTS: u32 = 5;
 
-/// Headroom under the destination's 1 GiB request-body limit for the multipart
-/// form's other fields (metadata, provenance).
+/// Headroom under the destination's request-body limit for the multipart form's
+/// other fields (metadata, provenance).
 const UPLOAD_FORM_HEADROOM: u64 = 1024 * 1024;
 
 /// Ceiling for an artifact whose listing declares no `size` and whose mirror has
 /// no `--exclude-larger` to fall back on. An unsized file is not a licence to
-/// fill the spool disk (three attempts over, at `--concurrency` in flight). 1 GiB
-/// matches the destination's own request-body limit: a file above it could never
-/// be uploaded anyway, so spooling it is pure disk burn.
+/// fill the spool disk (three attempts over, at `--concurrency` in flight). A
+/// real wheel over 1 GiB declares its size; this only bounds the ones that don't.
 const MAX_UNSIZED_ARTIFACT_BYTES: u64 = 1024 * 1024 * 1024;
 
 /// The most bytes one download may write to the spool. The listing's declared
@@ -3065,13 +3064,13 @@ async fn upload_via_http(
     pkg: &str,
     s: &Selected,
 ) -> Result<bool> {
-    // The destination refuses any request over 1 GiB, so a file this big would
-    // be downloaded in full only to be rejected — on every run.
+    // The destination refuses an admin upload over 5 GiB, so a file this big
+    // would be downloaded in full only to be rejected — on every run.
     if let Some(size) = s.file.size {
-        if size > MAX_UNSIZED_ARTIFACT_BYTES - UPLOAD_FORM_HEADROOM {
+        if size > crate::publish::ADMIN_UPLOAD_BODY_LIMIT - UPLOAD_FORM_HEADROOM {
             bail!(
-                "{} is {size} bytes, over the destination's 1 GiB upload limit; \
-                 skip files this large with --exclude-larger 1000MB",
+                "{} is {size} bytes, over the destination's 5 GiB upload limit; \
+                 skip files this large with --exclude-larger 5000MB",
                 s.file.filename
             );
         }

@@ -403,8 +403,9 @@ Re-running sync is normal. Existing files stay; yanks, removals, and project
 status reconcile from upstream. Changing file-selection settings, including
 `--allow-legacy-versions`, takes effect on the next run without `--full`.
 
-The destination accepts files up to 1 GiB. Sync reports a larger file as failed
-without downloading it; add `--exclude-larger 1000MB` to skip such files quietly.
+The destination accepts files up to 5 GiB from sync (1 GiB from an uploader
+credential). Sync reports a larger file as failed without downloading it; add
+`--exclude-larger 5000MB` to skip such files quietly.
 
 ## Install tokens
 

@@ -117,17 +117,18 @@ On the connected host:
   `32` when the link to the offline server and its storage are fast; lower it
   if that storage is slow.
 - `--spool-dir` holds each file between download and upload. Give it room for
-  `--concurrency` × your largest file — 16 GiB at the default with 1 GiB
-  wheels — on a real disk, not a RAM-backed `/tmp`. Sync itself uses about
+  `--concurrency` × your largest file — about 50 GB at the default if you
+  mirror 3 GB GPU wheels — on a real disk, not a RAM-backed `/tmp`. Sync itself uses about
   250 MB of memory.
 
 On the offline server:
 
 - `--spool-dir` (`PYPIRON_SPOOL_DIR`) receives each upload before it is
   stored. Size it the same way.
-- The server refuses files over 1 GiB. Sync reports each one as a failure
-  without downloading it; add `--exclude-larger 1000MB` (just under 1 GiB) to
-  leave them out of the run instead.
+- The server accepts files up to 5 GiB from sync, enough for GPU builds of
+  PyTorch and the NVIDIA CUDA wheels. Sync reports a larger file as a failure
+  without downloading it; add `--exclude-larger 5000MB` to leave such files out
+  instead.
 - On object storage the server uses about 0.5 GB of memory during the sync.
   Setting `MIMALLOC_ARENA_MAX_OBJECT_SIZE=256KiB` in its environment makes it
   return freed memory sooner, roughly halving that.

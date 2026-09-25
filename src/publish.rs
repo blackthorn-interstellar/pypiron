@@ -114,16 +114,25 @@ pub struct PublishRequest {
 /// Largest piece of the upload body the form parser sees at once.
 const FORM_READ_PIECE: usize = 64 * 1024;
 
+/// Largest upload request from an uploader credential.
+pub(crate) const UPLOAD_BODY_LIMIT: u64 = 1024 * 1024 * 1024;
+/// Largest upload request from the admin credential — what `sync` pushes with.
+/// CUDA-class wheels (torch, nvidia-*) run 1–3 GB, and 5 GiB is S3's cap on the
+/// single-part copy that publishes a large upload.
+pub(crate) const ADMIN_UPLOAD_BODY_LIMIT: u64 = 5 * 1024 * 1024 * 1024;
+
 /// The upload body, handed to the form parser one bounded piece per poll. The
 /// parser (multer) drains every piece already queued into one buffer that grows
 /// by doubling, so a fast client pushed it past 1 MiB per upload: a fresh odd
 /// size each time, which the allocator kept long after it was freed (server RSS
 /// climbed with file count while the live heap stayed flat). Splitting is
-/// zero-copy; the extra yield per piece is noise next to the bytes.
-fn bounded_form_reads(body: Body) -> Body {
+/// zero-copy; the extra yield per piece is noise next to the bytes. A body that
+/// runs past `limit` (one sent without a Content-Length) ends in an error.
+fn bounded_form_reads(body: Body, limit: u64) -> Body {
     let mut inner = body.into_data_stream();
     let mut rest = axum::body::Bytes::new();
     let mut yielded = false;
+    let mut seen: u64 = 0;
     Body::from_stream(futures::stream::poll_fn(move |cx| {
         if std::mem::take(&mut yielded) {
             cx.waker().wake_by_ref();
@@ -133,6 +142,12 @@ fn bounded_form_reads(body: Body) -> Body {
             match std::task::ready!(inner.poll_next_unpin(cx)) {
                 Some(Ok(bytes)) => rest = bytes,
                 other => return std::task::Poll::Ready(other),
+            }
+            seen += rest.len() as u64;
+            if seen > limit {
+                return std::task::Poll::Ready(Some(Err(axum::Error::new(
+                    "upload body over the size limit",
+                ))));
             }
         }
         yielded = true;
@@ -146,10 +161,6 @@ pub(crate) async fn legacy_upload(
     headers: HeaderMap,
     request: Request,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
-    let request = request.map(bounded_form_reads);
-    let mut multipart = Multipart::from_request(request, &state)
-        .await
-        .map_err(|e| (e.status(), e.body_text()))?;
     // Mirror-ness lives in a form field, so whether *admin* is required can't
     // be decided until the body is parsed. But every upload needs at least
     // uploader rights, so reject that up front — preserving "never read the
@@ -165,6 +176,25 @@ pub(crate) async fn legacy_upload(
             (StatusCode::UNAUTHORIZED, "Unauthorized".into())
         });
     }
+    // The route itself sets no body limit; this is it, by credential.
+    let limit = if is_admin {
+        ADMIN_UPLOAD_BODY_LIMIT
+    } else {
+        UPLOAD_BODY_LIMIT
+    };
+    let declared = headers
+        .get(axum::http::header::CONTENT_LENGTH)
+        .and_then(|v| v.to_str().ok()?.parse::<u64>().ok());
+    if declared.is_some_and(|len| len > limit) {
+        return Err((
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("Upload is larger than this server accepts ({limit} bytes)"),
+        ));
+    }
+    let request = request.map(|body| bounded_form_reads(body, limit));
+    let mut multipart = Multipart::from_request(request, &state)
+        .await
+        .map_err(|e| (e.status(), e.body_text()))?;
 
     let mut filename_opt: Option<String> = None;
     let mut spooled: Option<upload::FinishedSpool> = None;
@@ -2042,14 +2072,26 @@ mod tests {
     #[tokio::test]
     async fn bounded_form_reads_caps_pieces_and_keeps_bytes() {
         let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
-        let mut stream = bounded_form_reads(Body::from(data.clone())).into_data_stream();
+        let len = data.len() as u64;
+        let mut stream = bounded_form_reads(Body::from(data.clone()), len).into_data_stream();
         let mut got = Vec::new();
         while let Some(piece) = futures::StreamExt::next(&mut stream).await {
             let piece = piece.unwrap();
             assert!(piece.len() <= FORM_READ_PIECE);
             got.extend_from_slice(&piece);
         }
-        assert_eq!(got, data);
+        assert_eq!(got, data, "a body exactly at the limit passes whole");
+
+        // One byte over (as a body with no Content-Length would be) ends in an error.
+        let mut stream = bounded_form_reads(Body::from(data), len - 1).into_data_stream();
+        let mut failed = false;
+        while let Some(piece) = futures::StreamExt::next(&mut stream).await {
+            if piece.is_err() {
+                failed = true;
+                break;
+            }
+        }
+        assert!(failed, "a body over the limit must error");
     }
 
     #[test]

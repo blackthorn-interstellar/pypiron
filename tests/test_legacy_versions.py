@@ -152,7 +152,8 @@ def _file_row(wheel):
 
 def test_sync_skips_legacy_version_and_continues(disk_server, pypiron_bin, tmp_path):
     """A mirror run that meets a legacy-versioned upstream file skips just that
-    file (logged) and mirrors the rest — one ancient release can't break it."""
+    file (counted; listed only on request) and mirrors the rest — one ancient
+    release can't break it."""
     package = "mixedpkg"
     good = make_wheel(package, GOOD_VERSION, tmp_path)
     legacy = make_wheel(package, LEGACY_VERSION, tmp_path)
@@ -193,7 +194,28 @@ def test_sync_skips_legacy_version_and_continues(disk_server, pypiron_bin, tmp_p
         assert not (pkg_dir / legacy.name).exists(), "the legacy file must be skipped"
 
         combined = out + err
-        assert "skipping non-PEP-440" in combined, f"the skip must be logged:\n{combined}"
+        assert "1 non-PEP-440 skipped" in combined, f"the skip must be counted:\n{combined}"
+        assert legacy.name not in combined, f"per-file listing is opt-in:\n{combined}"
+
+        # --list-legacy-skips names each skipped file (--full: past the 304 memo).
+        rc, out, err = sync_to(
+            pypiron_bin,
+            disk_server,
+            "--include-package",
+            package,
+            "--include-format",
+            "wheel",
+            "--exclude-newer",
+            "",
+            "--advisory-feed",
+            "",
+            "--full",
+            "--list-legacy-skips",
+            source=f"{source_url}/simple",
+        )
+        combined = out + err
+        assert rc == 0, combined
+        assert "skipping non-PEP-440" in combined, combined
         assert legacy.name in combined, combined
     finally:
         source_gen.close()

@@ -53,6 +53,7 @@ use crate::status::ProjectStatusDoc;
 use crate::upload::{FinishedSpool, UploadSpool};
 
 mod pypicloud;
+pub(crate) mod status_line;
 
 /// Protocol exposed by the server named with `--from`.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, ValueEnum)]
@@ -235,6 +236,11 @@ pub struct SyncArgs {
     /// `[sync].allow-legacy-versions`.
     #[arg(long = "allow-legacy-versions", env = "PYPIRON_ALLOW_LEGACY_VERSIONS")]
     pub allow_legacy_versions: bool,
+
+    /// Log each file skipped for a non-PEP-440 version. Off by default: an old
+    /// project can have hundreds, so the run only counts them in its summary.
+    #[arg(long = "list-legacy-skips", env = "PYPIRON_SYNC_LIST_LEGACY_SKIPS")]
+    pub list_legacy_skips: bool,
 
     /// PEM bundle of extra CA certificates to trust for the **source** TLS — the
     /// private root a corporate forwarding TLS proxy (a MITM appliance) presents.
@@ -871,6 +877,8 @@ struct Resolved {
     /// Mirror files whose version isn't valid PEP 440. When false (the default),
     /// [`select_from_index`] skips them; see the flag on [`SyncArgs`].
     allow_legacy_versions: bool,
+    /// Log each legacy-version skip (`--list-legacy-skips`); else only count it.
+    list_legacy_skips: bool,
     mirror: ResolvedMirror,
     denylist: Denylist,
     /// The raw `--exclude-older` input (e.g. `"800 days"`), kept verbatim for
@@ -1065,6 +1073,7 @@ impl Resolved {
             full: args.full,
             allow_legacy_versions: args.allow_legacy_versions
                 || sync.allow_legacy_versions.unwrap_or(false),
+            list_legacy_skips: args.list_legacy_skips,
             denylist: Denylist::from_specs(&mirror.exclude_packages),
             mirror,
             exclude_older_raw,
@@ -1842,10 +1851,15 @@ struct Progress {
     start: Instant,
     pkgs_total: usize,
     pkgs_done: AtomicUsize,
+    /// Packages whose selection is known (their bytes are in `bytes_seen`).
+    pkgs_known: AtomicUsize,
     files_done: AtomicU64,
+    /// Bytes downloaded so far, counted as they stream in so a multi-GB wheel
+    /// moves the meter while it transfers, not only when it finishes.
     bytes_done: AtomicU64,
     bytes_seen: AtomicU64,
     skipped: AtomicU64,
+    legacy_skipped: AtomicU64,
     errors: AtomicU64,
     /// Signalled when the run is over so the ticker stops immediately instead of
     /// sleeping out its interval.
@@ -1858,10 +1872,12 @@ impl Progress {
             start: Instant::now(),
             pkgs_total,
             pkgs_done: AtomicUsize::new(0),
+            pkgs_known: AtomicUsize::new(0),
             files_done: AtomicU64::new(0),
             bytes_done: AtomicU64::new(0),
             bytes_seen: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
+            legacy_skipped: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             done: tokio::sync::Notify::new(),
         }
@@ -1870,14 +1886,24 @@ impl Progress {
     /// Files newly selected to upload for a package (and the bytes they'll move),
     /// fed into the ETA's total-size extrapolation.
     fn discover(&self, bytes: u64) {
+        self.pkgs_known.fetch_add(1, Ordering::Relaxed);
         self.bytes_seen.fetch_add(bytes, Ordering::Relaxed);
     }
     fn skip(&self, n: u64) {
         self.skipped.fetch_add(n, Ordering::Relaxed);
     }
-    fn file_done(&self, bytes: u64) {
-        self.files_done.fetch_add(1, Ordering::Relaxed);
+    fn legacy_skip(&self) {
+        self.legacy_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+    fn downloaded(&self, bytes: u64) {
         self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
+    }
+    /// Take back a failed download attempt's bytes; its retry counts them again.
+    fn undownloaded(&self, bytes: u64) {
+        self.bytes_done.fetch_sub(bytes, Ordering::Relaxed);
+    }
+    fn file_done(&self) {
+        self.files_done.fetch_add(1, Ordering::Relaxed);
     }
     fn file_err(&self) {
         self.errors.fetch_add(1, Ordering::Relaxed);
@@ -1892,8 +1918,8 @@ impl Progress {
         let pkgs_done = self.pkgs_done.load(Ordering::Relaxed);
         let files_done = self.files_done.load(Ordering::Relaxed);
         let bytes_done = self.bytes_done.load(Ordering::Relaxed);
-        let bytes_seen = self.bytes_seen.load(Ordering::Relaxed);
         let skipped = self.skipped.load(Ordering::Relaxed);
+        let legacy = self.legacy_skipped.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
         let rate = if el > 0.0 {
             bytes_done as f64 / el
@@ -1902,49 +1928,65 @@ impl Progress {
         };
 
         if final_ {
+            let legacy = if legacy > 0 {
+                format!(" · {} non-PEP-440 skipped", fmt_count(legacy))
+            } else {
+                String::new()
+            };
             return format!(
-                "sync done: {pkgs_done}/{} pkgs · {} files · {} in {} (avg {}/s) · {skipped} already present · {errors} errors",
+                "sync done: {pkgs_done}/{} pkgs · {} files · {} in {} (avg {}/s) · {} already present{legacy} · {errors} errors",
                 self.pkgs_total,
                 fmt_count(files_done),
                 human_bytes(bytes_done),
                 human_dur(el),
                 human_bytes(rate as u64),
+                fmt_count(skipped),
             );
         }
 
-        let pct = if self.pkgs_total > 0 {
-            100.0 * pkgs_done as f64 / self.pkgs_total as f64
-        } else {
-            0.0
+        // Extrapolate the run's total bytes from the packages whose selection is
+        // known (a 304'd or finished package counts: its share is settled), then
+        // divide what's left by the current rate.
+        let known = self.pkgs_known.load(Ordering::Relaxed).max(pkgs_done);
+        let est_total = (known > 0).then(|| {
+            let seen = self.bytes_seen.load(Ordering::Relaxed) as f64;
+            (seen * self.pkgs_total as f64 / known as f64).max(bytes_done as f64)
+        });
+        let bytes = match est_total {
+            Some(total) if total > 0.0 => format!(
+                "{} of ~{} ({:.0}%)",
+                human_bytes(bytes_done),
+                human_bytes(total as u64),
+                100.0 * bytes_done as f64 / total
+            ),
+            _ => human_bytes(bytes_done),
         };
-        // Extrapolate the run's total bytes from the fraction of packages done,
-        // then divide the remaining bytes by the current rate. Unknown until at
-        // least one package has finished and some bytes have moved.
-        let eta = if pkgs_done > 0 && bytes_done > 0 {
-            let est_total = bytes_seen as f64 * self.pkgs_total as f64 / pkgs_done as f64;
-            let remaining = (est_total - bytes_done as f64).max(0.0);
-            format!(", ~{} left", human_dur(remaining / rate))
-        } else {
-            String::new()
+        let eta = match est_total {
+            Some(total) if rate > 0.0 => {
+                format!(" · ~{} left", human_dur((total - bytes_done as f64) / rate))
+            }
+            _ => String::new(),
         };
         format!(
-            "sync {pkgs_done}/{} pkgs {pct:.0}% · {} files {} · {}/s {:.1} f/s · {} elapsed{eta} · {errors} err",
+            "sync {pkgs_done}/{} pkgs · {} files · {bytes} · {}/s · {} elapsed{eta} · {errors} err",
             self.pkgs_total,
             fmt_count(files_done),
-            human_bytes(bytes_done),
             human_bytes(rate as u64),
-            if el > 0.0 { files_done as f64 / el } else { 0.0 },
             human_dur(el),
         )
     }
 }
 
-/// Spawn the background ticker. On a TTY it overwrites one line each second; when
-/// stderr is redirected (a log file) it prints a fresh line every 30s instead.
+/// Spawn the background ticker. On a TTY it redraws one status line each second
+/// (log records scroll above it); when stderr is redirected (a log file) it
+/// prints a fresh line every 30s instead.
 fn spawn_progress(progress: Arc<Progress>) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         let tty = std::io::stderr().is_terminal();
         let interval = std::time::Duration::from_secs(if tty { 1 } else { 30 });
+        if tty {
+            status_line::set(progress.render(false));
+        }
         loop {
             // Wake on the interval or the instant the run finishes — whichever
             // comes first — so a fast run isn't padded out to a full interval.
@@ -1953,16 +1995,13 @@ fn spawn_progress(progress: Arc<Progress>) -> tokio::task::JoinHandle<()> {
                 _ = progress.done.notified() => break,
             }
             if tty {
-                eprint!("\r\x1b[2K{}", progress.render(false));
-                let _ = std::io::Write::flush(&mut std::io::stderr());
+                status_line::set(progress.render(false));
             } else {
                 eprintln!("{}", progress.render(false));
             }
         }
-        if tty {
-            // Leave the carriage at column 0 so the summary prints on its own line.
-            eprintln!();
-        }
+        // Erase the meter so the summary prints on its own line.
+        status_line::clear();
     })
 }
 
@@ -2194,6 +2233,9 @@ pub async fn run_sync(
         let _ = ticker.await;
     }
     eprintln!("{}", progress.render(true));
+    if !resolved.list_legacy_skips && progress.legacy_skipped.load(Ordering::Relaxed) > 0 {
+        eprintln!("(--list-legacy-skips names the skipped non-PEP-440 files)");
+    }
 
     if failures > 0 {
         bail!("{failures} package(s) failed to sync");
@@ -2297,7 +2339,7 @@ async fn sync_one_package(
     };
 
     let (selected, upstream_status, upstream_files, next_eligible_at) =
-        select_from_index(index, resolved, spec);
+        select_from_index(index, resolved, spec, progress);
 
     let mut errors = 0usize;
 
@@ -2349,7 +2391,7 @@ async fn sync_one_package(
         if dest_origin != Some(origin::OriginState::Private) {
             bail!("timestamp repair requires a private destination package: {pkg}");
         }
-        repair_upload_times(client, resolved, pkg, &selected, local).await?;
+        repair_upload_times(client, resolved, pkg, &selected, local, progress).await?;
         return Ok(PackageOutcome { new_cursor: None });
     }
 
@@ -2415,9 +2457,9 @@ async fn sync_one_package(
     // `file_slots` inside `upload_via_http` is the actual bound.
     let results: Vec<Result<bool>> = stream::iter(selected)
         .map(|s| async move {
-            let r = upload_via_http(client, resolved, endpoint, pkg, &s).await;
+            let r = upload_via_http(client, resolved, endpoint, pkg, &s, progress).await;
             match &r {
-                Ok(_) => progress.file_done(s.file.size.unwrap_or(0)),
+                Ok(_) => progress.file_done(),
                 Err(_) => progress.file_err(),
             }
             r
@@ -2578,6 +2620,7 @@ async fn repair_upload_times(
     pkg: &str,
     selected: &[Selected],
     local: &SimpleIndex,
+    progress: &Progress,
 ) -> Result<()> {
     let local_files: HashMap<_, _> = local
         .files
@@ -2600,17 +2643,9 @@ async fn repair_upload_times(
         let digest = match file.sha256() {
             Some(digest) => digest.to_string(),
             None => {
-                download_verified(
-                    client,
-                    &resolved.guard,
-                    file,
-                    &resolved.spool_dir,
-                    resolved.source_auth.as_ref(),
-                    spool_ceiling(file, &resolved.mirror),
-                    true,
-                )
-                .await?
-                .sha256
+                download_verified(client, resolved, file, true, progress)
+                    .await?
+                    .sha256
             }
         };
         if dest
@@ -2773,6 +2808,7 @@ fn select_from_index(
     index: SimpleIndex,
     resolved: &Resolved,
     spec: &PackageSpec,
+    progress: &Progress,
 ) -> (
     Vec<Selected>,
     UpstreamStatus,
@@ -2843,11 +2879,19 @@ fn select_from_index(
                 .as_deref()
                 .is_none_or(|v| Version::from_str(v).is_err())
         {
-            warn!(
-                package = %spec.name,
-                filename = %file.filename,
-                "sync: skipping non-PEP-440 (legacy) version; pass --allow-legacy-versions to mirror it"
-            );
+            // Report only what the legacy rule alone kept out; a file the
+            // format/tag filters drop anyway isn't news.
+            if !matches_mirror(&file, &resolved.mirror) {
+                continue;
+            }
+            progress.legacy_skip();
+            if resolved.list_legacy_skips {
+                warn!(
+                    package = %spec.name,
+                    filename = %file.filename,
+                    "sync: skipping non-PEP-440 (legacy) version; pass --allow-legacy-versions to mirror it"
+                );
+            }
             continue;
         }
         if let Some(specifiers) = &spec.specifiers {
@@ -2973,12 +3017,10 @@ fn spool_ceiling(file: &SimpleFile, mirror: &ResolvedMirror) -> u64 {
 
 async fn download_verified(
     client: &Client,
-    guard: &crate::ssrf::Guard,
+    resolved: &Resolved,
     file: &SimpleFile,
-    spool_dir: &Path,
-    source_auth: Option<&SourceAuth>,
-    max_bytes: u64,
     allow_missing_hash: bool,
+    progress: &Progress,
 ) -> Result<FinishedSpool> {
     let expected = file.sha256();
     if expected.is_none() && !allow_missing_hash {
@@ -2986,13 +3028,24 @@ async fn download_verified(
     }
     let mut last_err = None;
     for attempt in 1..=DOWNLOAD_ATTEMPTS {
-        match download_once(client, guard, file, spool_dir, source_auth, max_bytes).await {
+        match download_once(
+            client,
+            &resolved.guard,
+            file,
+            &resolved.spool_dir,
+            resolved.source_auth.as_ref(),
+            spool_ceiling(file, &resolved.mirror),
+            progress,
+        )
+        .await
+        {
             Ok(spool)
                 if expected.is_none_or(|digest| spool.sha256.eq_ignore_ascii_case(digest)) =>
             {
                 return Ok(spool);
             }
             Ok(spool) => {
+                progress.undownloaded(spool.size);
                 last_err = Some(anyhow!(
                     "sha256 mismatch for {} (expected {}, got {})",
                     file.filename,
@@ -3026,31 +3079,45 @@ async fn download_once(
     spool_dir: &Path,
     source_auth: Option<&SourceAuth>,
     max_bytes: u64,
+    progress: &Progress,
 ) -> Result<FinishedSpool> {
-    let url = reqwest::Url::parse(&file.url)
-        .with_context(|| format!("unparseable file URL for {}", file.filename))?;
-    let resp = crate::ssrf::guarded_get_with(client, guard, url, None, |req, hop| {
-        match hop_auth(source_auth, hop) {
-            Some((u, p)) => req.basic_auth(u, Some(p)),
-            None => req,
+    // Count bytes live for the meter; a failed attempt takes its share back.
+    let mut counted = 0u64;
+    let result = async {
+        let url = reqwest::Url::parse(&file.url)
+            .with_context(|| format!("unparseable file URL for {}", file.filename))?;
+        let resp =
+            crate::ssrf::guarded_get_with(client, guard, url, None, |req, hop| {
+                match hop_auth(source_auth, hop) {
+                    Some((u, p)) => req.basic_auth(u, Some(p)),
+                    None => req,
+                }
+            })
+            .await?
+            .error_for_status()?;
+        let mut spool = UploadSpool::new(spool_dir).await?;
+        let mut stream = resp.bytes_stream();
+        while let Some(chunk) = stream.next().await {
+            let chunk = chunk?;
+            spool.write_chunk(&chunk).await?;
+            progress.downloaded(chunk.len() as u64);
+            counted += chunk.len() as u64;
+            if spool.size() > max_bytes {
+                bail!(
+                    "{} overran its download ceiling ({} > {max_bytes} bytes)",
+                    file.filename,
+                    spool.size()
+                );
+            }
         }
-    })
-    .await?
-    .error_for_status()?;
-    let mut spool = UploadSpool::new(spool_dir).await?;
-    let mut stream = resp.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        spool.write_chunk(&chunk?).await?;
-        if spool.size() > max_bytes {
-            bail!(
-                "{} overran its download ceiling ({} > {max_bytes} bytes)",
-                file.filename,
-                spool.size()
-            );
-        }
+        // No fsync: this spool is a throwaway source for the upload, deleted after.
+        spool.finish(false).await
     }
-    // No fsync: this spool is a throwaway source for the upload, deleted after.
-    spool.finish(false).await
+    .await;
+    if result.is_err() {
+        progress.undownloaded(counted);
+    }
+    result
 }
 
 /// Push one file through the remote `/legacy/` as a mirror upload, carrying
@@ -3063,6 +3130,7 @@ async fn upload_via_http(
     endpoint: &str,
     pkg: &str,
     s: &Selected,
+    progress: &Progress,
 ) -> Result<bool> {
     // The destination refuses an admin upload over 5 GiB, so a file this big
     // would be downloaded in full only to be rejected — on every run.
@@ -3083,12 +3151,10 @@ async fn upload_via_http(
     // Held until after the POST below: dropping the spool deletes its temp file.
     let spool = download_verified(
         client,
-        &resolved.guard,
+        resolved,
         &s.file,
-        &resolved.spool_dir,
-        resolved.source_auth.as_ref(),
-        spool_ceiling(&s.file, &resolved.mirror),
         resolved.source_kind == SourceKind::Pypicloud,
+        progress,
     )
     .await?;
 
@@ -4370,6 +4436,7 @@ mod tests {
             dry_run: false,
             full: false,
             allow_legacy_versions: false,
+            list_legacy_skips: false,
             denylist: Denylist::from_specs(&filter.exclude_packages),
             mirror: filter,
             exclude_older_raw: None,

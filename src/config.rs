@@ -588,7 +588,13 @@ mod tests {
             ),
             (
                 "sync",
-                &["dry_run", "full", "no_progress", "repair_upload_times"],
+                &[
+                    "dry_run",
+                    "full",
+                    "list_legacy_skips",
+                    "no_progress",
+                    "repair_upload_times",
+                ],
             ),
         ];
         // Repeatable flags are plural in the file; `--from`/`--to` are their own keys.

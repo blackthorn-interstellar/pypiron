@@ -917,10 +917,12 @@ pub async fn cli_main() -> Result<()> {
         // or `docker logs`.
         LogFormat::Text => tracing_subscriber::fmt()
             .with_ansi(std::io::stdout().is_terminal())
+            .with_writer(crate::sync::status_line::LogWriter)
             .with_env_filter(env_filter)
             .init(),
         LogFormat::Json => tracing_subscriber::fmt()
             .json()
+            .with_writer(crate::sync::status_line::LogWriter)
             .with_env_filter(env_filter)
             .init(),
     }

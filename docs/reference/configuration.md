@@ -54,7 +54,7 @@ the same name, minus the `--`. The exceptions stay in CLI/env: the serve
 credentials (`--admin-user`, `--admin-pass`, `--uploader-user`,
 `--uploader-pass`, `--read-user`, `--read-pass`, `--token-signing-key`,
 `--azure-access-key`), `--config` itself, and the one-shot sync switches
-`--dry-run`, `--full`, `--no-progress`, and `--repair-upload-times`.
+`--dry-run`, `--full`, `--list-legacy-skips`, `--no-progress`, and `--repair-upload-times`.
 `sync.admin-pass` exists for closed deployment files, but env is cleaner:
 `PYPIRON_SYNC_ADMIN_PASS`.
 
@@ -396,8 +396,9 @@ require pypiron 0.0.23 or newer on both the sync client and destination server.
 | `--spool-dir PATH` | `PYPIRON_SYNC_SPOOL_DIR` | system temp | Download spool directory. |
 | `--dry-run` | `PYPIRON_SYNC_DRY_RUN` | `false` | Print work, write nothing. |
 | `--full` | `PYPIRON_SYNC_FULL` | `false` | Ignore cursors and reconcile every selected project. |
-| `--no-progress` | `PYPIRON_SYNC_NO_PROGRESS` | `false` | Hide the live progress meter. |
-| `--allow-legacy-versions` | `PYPIRON_ALLOW_LEGACY_VERSIONS` | `false` | Mirror files without an inferable PEP 440 version. Otherwise they are logged and skipped. Applies in sync, because the destination accepts mirror uploads. |
+| `--no-progress` | `PYPIRON_SYNC_NO_PROGRESS` | `false` | Hide the live progress line (packages, bytes, rate, time left). |
+| `--allow-legacy-versions` | `PYPIRON_ALLOW_LEGACY_VERSIONS` | `false` | Mirror files without an inferable PEP 440 version. Otherwise they are skipped and counted in the run summary. Applies in sync, because the destination accepts mirror uploads. |
+| `--list-legacy-skips` | `PYPIRON_SYNC_LIST_LEGACY_SKIPS` | `false` | Log each file skipped for a non-PEP-440 version, not just the count. |
 
 Re-running sync is normal. Existing files stay; yanks, removals, and project
 status reconcile from upstream. Changing file-selection settings, including

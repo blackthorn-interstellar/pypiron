@@ -1686,7 +1686,9 @@ fn response_etag(resp: &reqwest::Response) -> Option<String> {
 /// Stream a response body into memory under a hard cap.
 async fn read_body_capped(resp: reqwest::Response, cap: u64, url: &str) -> Result<Vec<u8>> {
     use futures::StreamExt;
-    let mut bytes = Vec::new();
+    // Sized up front when the length is known: growing by doubling to a ~35 MB
+    // feed allocated ~2x that, which the allocator then kept.
+    let mut bytes = Vec::with_capacity(resp.content_length().unwrap_or(0).min(cap) as usize);
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.with_context(|| format!("reading {url}"))?;

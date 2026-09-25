@@ -107,3 +107,82 @@ def test_sync_retries_transient_download_failures(disk_server, pypiron_bin):
         assert stored.read_bytes() == FlakyPyPI.wheel
     finally:
         httpd.shutdown()
+
+
+HUGE_NAME = "flaky_pkg-1.0.0-cp312-cp312-manylinux_2_28_x86_64.whl"
+
+
+class OversizePyPI(BaseHTTPRequestHandler):
+    """Lists a normal wheel plus one declared at 2 GiB — over the destination's
+    1 GiB upload limit — and records which artifacts were fetched."""
+
+    wheel = make_wheel()
+    fetched: list[str] = []
+
+    def do_GET(self):  # noqa: N802 - stdlib naming
+        base = f"http://127.0.0.1:{self.server.server_port}/files"
+        if self.path == "/simple/flaky-pkg/":
+            files = [
+                {
+                    "filename": WHEEL_NAME,
+                    "url": f"{base}/{WHEEL_NAME}",
+                    "hashes": {"sha256": hashlib.sha256(self.wheel).hexdigest()},
+                    "size": len(self.wheel),
+                },
+                {
+                    "filename": HUGE_NAME,
+                    "url": f"{base}/{HUGE_NAME}",
+                    "hashes": {"sha256": "0" * 64},
+                    "size": 2 * 1024**3,
+                },
+            ]
+            body = json.dumps(
+                {"meta": {"api-version": "1.1"}, "name": "flaky-pkg", "files": files}
+            ).encode()
+            self.send_response(200)
+            self.send_header("Content-Type", "application/vnd.pypi.simple.v1+json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path.startswith("/files/"):
+            OversizePyPI.fetched.append(self.path.rsplit("/", 1)[-1])
+            if not self.path.endswith(WHEEL_NAME):
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", "application/octet-stream")
+            self.send_header("Content-Length", str(len(self.wheel)))
+            self.end_headers()
+            self.wfile.write(self.wheel)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, *args):  # quiet
+        pass
+
+
+def test_sync_fails_oversize_file_without_downloading_it(disk_server, pypiron_bin):
+    """A file over the destination's 1 GiB upload limit fails loudly before any
+    download (it could never be uploaded); the rest of the package still lands."""
+    port = find_free_port()
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), OversizePyPI)
+    thread = threading.Thread(target=httpd.serve_forever, daemon=True)
+    thread.start()
+    try:
+        rc, out, err = sync_to(
+            pypiron_bin,
+            disk_server,
+            "--include-package",
+            "flaky-pkg",
+            source=f"http://127.0.0.1:{port}",
+            timeout=120,
+        )
+        assert rc != 0, f"an unuploadable file must fail the run:\n{out}\n{err}"
+        assert "--exclude-larger" in out + err
+        assert HUGE_NAME not in OversizePyPI.fetched, "oversize file was downloaded"
+        stored = disk_server["data_dir"] / "packages" / "flaky-pkg" / WHEEL_NAME
+        assert stored.read_bytes() == OversizePyPI.wheel
+    finally:
+        httpd.shutdown()

@@ -131,6 +131,11 @@ clone, `uv pip install` resolves correctly against our mirror for a sampled
 set of the weirdest survivors, and every file PyPI serves that we refused is
 logged with a reason we can defend.
 
+The offline stand-in for M1–M3 is `dev/bench/airgap.py`: a disk-backed pypiron
+as the source, a fresh MinIO-backed pypiron as the destination, a cached
+real-shaped corpus, and peak RSS/CPU of both sides from `/usr/bin/time -l`.
+It runs on a laptop with no internet, so use it for before/after, not absolutes.
+
 Politeness is part of the spec: identifiable User-Agent with contact info,
 bounded request rate against pypi.org's JSON API, conditional requests and
 backoff on the re-walk. Fastly absorbs the bytes; the API gets treated gently.

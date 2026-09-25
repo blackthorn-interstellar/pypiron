@@ -31,8 +31,8 @@ use object_store::path::Path as OsPath;
 use object_store::signer::Signer;
 use object_store::{
     Attribute, Attributes, Error as OsError, GetOptions, GetRange, ObjectStore, ObjectStoreExt,
-    PutMode, PutMultipartOptions, PutOptions, PutPayload, RetryConfig, StaticCredentialProvider,
-    UpdateVersion, WriteMultipart,
+    PutMode, PutMultipartOptions, PutOptions, PutPayload, PutPayloadMut, RetryConfig,
+    StaticCredentialProvider, UpdateVersion, WriteMultipart,
 };
 
 use crate::config::BucketOverride;
@@ -2418,14 +2418,36 @@ struct GcsResource {
     md5_hash: Option<String>,
 }
 
+/// A spooled file as a PUT body of `READ_CHUNK` blocks (see there for why not
+/// one `Vec`). The body is still whole in RAM, as the single PUT needs it.
+async fn read_payload(path: &std::path::Path) -> std::io::Result<PutPayload> {
+    let mut file = fs::File::open(path).await?;
+    let mut buf = vec![0u8; READ_CHUNK];
+    let mut payload = PutPayloadMut::new().with_block_size(READ_CHUNK);
+    loop {
+        match file.read(&mut buf).await? {
+            0 => return Ok(payload.freeze()),
+            n => payload.extend_from_slice(&buf[..n]),
+        }
+    }
+}
+
 /// At or below this size an upload is a single conditional PUT; above it the
 /// body streams to a unique staging key as parallel multipart parts (bounded
-/// RSS) and is then published atomically with `copy_if_not_exists`. The 16 MB
-/// part size keeps a ~900 MB wheel to a handful of in-flight parts.
+/// RSS) and is then published atomically with `copy_if_not_exists`. 8 MiB parts
+/// × 10,000 (the S3 part cap) still reach 80 GB, past S3's 5 GiB copy limit.
 pub(crate) const MULTIPART_THRESHOLD: u64 = 64 * 1024 * 1024;
-const MULTIPART_PART_SIZE: usize = 16 * 1024 * 1024;
-const MULTIPART_CONCURRENCY: usize = 6;
-const READ_CHUNK: usize = 8 * 1024 * 1024;
+const MULTIPART_PART_SIZE: usize = 8 * 1024 * 1024;
+const MULTIPART_CONCURRENCY: usize = 4;
+/// Spool reads go through one reused buffer into blocks of this size. Keeping
+/// every upload's body in same-sized, modest blocks lets the allocator recycle
+/// them; one whole-file `Vec` per upload (a new odd size every time) left RSS
+/// ratcheting up to ~2 GB over a bulk sync while the live heap stayed ~100 MB.
+const READ_CHUNK: usize = 256 * 1024;
+/// RAM one multipart upload holds at peak: the parts in flight, the part being
+/// filled, and the read buffer (~41 MiB) — what the write budget charges it.
+pub(crate) const MULTIPART_FOOTPRINT: u64 =
+    (MULTIPART_PART_SIZE * (MULTIPART_CONCURRENCY + 1) + READ_CHUNK) as u64;
 
 /// Staging keys live here; large uploads land under this prefix and are then
 /// published (copy-if-not-exists) to their final key. Always cleaned up.
@@ -2876,6 +2898,24 @@ impl ObjectStorage {
             .body(Body::from_stream(res.into_stream()))?)
     }
 
+    async fn put_payload_if_absent(
+        &self,
+        key: &str,
+        payload: PutPayload,
+        content_type: Option<&str>,
+    ) -> Result<bool> {
+        let opts = PutOptions {
+            mode: PutMode::Create,
+            attributes: ct_attrs(content_type),
+            ..Default::default()
+        };
+        match self.store.put_opts(&self.oskey(key), payload, opts).await {
+            Ok(_) => Ok(true),
+            Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => Ok(false),
+            Err(e) => Err(self.store_err(e, "put_if_absent", key)),
+        }
+    }
+
     /// Stream a spooled file into a multipart upload at `staging`, bounding
     /// resident memory to a few parts in flight. Aborts on any error so no
     /// orphaned parts linger billable.
@@ -3019,20 +3059,8 @@ impl Storage for ObjectStorage {
         bytes: Vec<u8>,
         content_type: Option<&str>,
     ) -> Result<bool> {
-        let opts = PutOptions {
-            mode: PutMode::Create,
-            attributes: ct_attrs(content_type),
-            ..Default::default()
-        };
-        match self
-            .store
-            .put_opts(&self.oskey(key), PutPayload::from(bytes), opts)
+        self.put_payload_if_absent(key, PutPayload::from(bytes), content_type)
             .await
-        {
-            Ok(_) => Ok(true),
-            Err(OsError::AlreadyExists { .. } | OsError::Precondition { .. }) => Ok(false),
-            Err(e) => Err(self.store_err(e, "put_if_absent", key)),
-        }
     }
 
     async fn put_file_if_absent(
@@ -3047,10 +3075,10 @@ impl Storage for ObjectStorage {
             .len();
         if size <= MULTIPART_THRESHOLD {
             // Small enough to create with one conditional PUT.
-            let bytes = fs::read(path)
+            let payload = read_payload(path)
                 .await
                 .with_context(|| format!("read upload spool {}", path.display()))?;
-            return self.put_if_absent(key, bytes, content_type).await;
+            return self.put_payload_if_absent(key, payload, content_type).await;
         }
         // Too big for a single PUT: stream to a unique staging key (bounded
         // RSS), then publish atomically. copy_if_not_exists is the race-free
@@ -3145,13 +3173,26 @@ impl Storage for ObjectStorage {
     }
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
-        for k in keys {
-            match self.store.delete(&self.oskey(k)).await {
-                Ok(()) => {}
-                Err(error) => match self.classify_get(error, "delete", k) {
-                    None => {}
-                    Some(err) => return Err(err),
-                },
+        // One key (leases, single markers) keeps the plain DELETE: per-request
+        // retries, and stores without multi-object delete keep working.
+        if let [k] = keys {
+            return match self.store.delete(&self.oskey(k)).await {
+                Ok(()) => Ok(()),
+                Err(error) => self.classify_get(error, "delete", k).map_or(Ok(()), Err),
+            };
+        }
+        // Batched: S3's DeleteObjects takes 1,000 keys a request, so draining a
+        // marker backlog is a handful of requests instead of one per key.
+        let paths: Vec<object_store::Result<OsPath>> =
+            keys.iter().map(|k| Ok(self.oskey(k))).collect();
+        let mut results = self
+            .store
+            .delete_stream(futures::stream::iter(paths).boxed());
+        while let Some(result) = results.next().await {
+            if let Err(error) = result {
+                if let Some(err) = self.classify_get(error, "delete", "batch") {
+                    return Err(err);
+                }
             }
         }
         Ok(())

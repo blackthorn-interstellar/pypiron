@@ -1062,12 +1062,14 @@ pub struct ServeArgs {
     #[arg(long, env = "PYPIRON_WAIT_ON_UPLOAD_SECS", default_value = "10")]
     pub(crate) wait_on_upload_secs: u64,
 
-    /// Cap on how many uploads may buffer their whole body in RAM at once. On an
-    /// object-store backend an artifact at or under the 64 MiB single-PUT ceiling
-    /// is read fully into memory before the conditional PUT, so unbounded
-    /// concurrent uploads can OOM a small node; the default of 4 bounds that to a
-    /// ~256 MiB worst case. Only object-store backends are gated — disk hardlinks
-    /// the spool and is never serialized. `0` means unbounded.
+    /// RAM budget for uploads in flight, in 64 MiB units. On an object-store
+    /// backend an artifact at or under the 64 MiB single-PUT ceiling is read
+    /// fully into memory before the conditional PUT (a larger one holds a ~41 MiB
+    /// multipart window), so unbounded concurrent uploads can OOM a small node.
+    /// Each upload is charged its own footprint, so the default of 4 (~256 MiB)
+    /// admits four 64 MiB uploads or ~40 6 MiB ones at once. Only object-store
+    /// backends are gated — disk hardlinks the spool and is never serialized.
+    /// `0` means unbounded.
     #[arg(
         long,
         env = "PYPIRON_MAX_CONCURRENT_ARTIFACT_WRITES",

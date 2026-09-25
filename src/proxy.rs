@@ -1827,7 +1827,7 @@ impl Proxy {
             spool.flush().await?;
             progress.wrote(spool.size());
         }
-        spool.finish().await
+        spool.finish(true).await
     }
 
     /// PEP 691 file URLs may be absolute or relative; relative ones resolve

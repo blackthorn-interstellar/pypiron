@@ -123,10 +123,11 @@
 # Upload spool directory. Point at real disk where /tmp is a RAM-backed tmpfs,
 # or multi-GB wheels spool into memory.
 # spool-dir = "/var/spool/pypiron"
-# Cap on how many uploads may buffer their whole body in RAM at once. On an
-# object-store backend a file up to 64 MiB is read fully into memory for one
-# conditional PUT, so unbounded concurrency can OOM a small node; 4 bounds the
-# worst case to ~256 MiB. Disk hardlinks the spool and is never gated. 0 = off.
+# Memory budget for uploads in progress, in 64 MiB units. On an object-store
+# backend a file up to 64 MiB is read fully into memory for one conditional PUT,
+# so unbounded concurrency can OOM a small node. Each upload is charged its own
+# size, so 4 (~256 MiB) admits four 64 MiB files or ~40 small ones at once.
+# Disk hardlinks the spool and is never gated. 0 = off.
 # max-concurrent-artifact-writes = 4
 
 # Logging. By default only mutations (uploads, deletes, yanks) are logged; turn
@@ -229,8 +230,8 @@
 # as-private = false
 # One-off repair of old migration dates: pass --repair-upload-times (CLI/env
 # only), with --as-private and --dry-run to preview. Upgrade client and server.
-# concurrency = 4                           # parallel transfers within one package
-# package-concurrency = 8                   # packages synced in parallel
+# concurrency = 16                          # files transferring at once, all packages
+# package-concurrency = 16                  # packages checked in parallel
 # spool-dir = "/var/spool/pypiron-sync"     # download spool; real disk, not tmpfs, for multi-GB wheels
 # Skip upstream files whose version string isn't valid PEP 440 (the default), so
 # a single ancient release can't break a mirror run. Decided entirely here: the

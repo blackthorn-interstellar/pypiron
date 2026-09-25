@@ -127,7 +127,8 @@ pub struct ServeConfig {
     pub spool_dir: Option<PathBuf>,
     pub wait_on_upload: Option<bool>,
     pub wait_on_upload_secs: Option<u64>,
-    /// Cap on concurrent in-RAM artifact writes; `0` means unbounded. Only
+    /// RAM budget for in-flight artifact writes, in 64 MiB units; each write is
+    /// charged its own footprint. `0` means unbounded. Only
     /// object-store backends are gated.
     pub max_concurrent_artifact_writes: Option<u64>,
     /// Accept uploads whose version isn't valid PEP 440. Off by default (reject).
@@ -542,7 +543,7 @@ mod tests {
             Some(Path::new("private-packages.txt"))
         );
         assert!(cfg.sync.private_patterns.is_none());
-        assert_eq!(cfg.sync.concurrency, Some(4));
+        assert_eq!(cfg.sync.concurrency, Some(16));
     }
 
     /// Every `serve`/`sync` flag has a `PYPIRON_*` env var and a same-named key

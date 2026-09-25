@@ -59,3 +59,18 @@ command location. The junior stopped at the build prerequisite before reaching
 the repair section; this is not a whole-page pass. Release preparation replaced
 the source-build prerequisite with the concrete minimum version, 0.0.23. The
 fix commit is tagged [v0.0.23](https://github.com/blackthorn-interstellar/pypiron/tree/v0.0.23).
+
+
+## September 24, 2026 — large first sync
+
+`docs/guides/air-gapped.md` ("Plan a large first sync") and the sync
+`--concurrency`, `--max-concurrent-artifact-writes` and `--s3-endpoint-url`
+rows of `docs/reference/configuration.md`: airgapped-ops (Opus and Codex),
+grumpy-sre and platform-veteran, then one extraction analyst. Confirmed: the
+section was framed as "connected host" but half of it was about the offline
+server; spool size and sync memory needed numbers; "fast link to cloud" named
+the wrong link; "before this release" had no version; "disk is not gated" was
+unclear; the allocator setting didn't say what it does. Split the section by
+host, stated sizes, and named v0.0.23. Left for the owner: files over 1 GiB
+can't be mirrored at all (a product limit, not copy). Fix commit: the sync
+throughput/memory commit of this date.

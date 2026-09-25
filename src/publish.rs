@@ -9,10 +9,12 @@ use std::time::Duration;
 
 use anyhow::Result;
 use axum::{
-    extract::{Multipart, Path, State},
+    body::Body,
+    extract::{FromRequest, Multipart, Path, Request, State},
     http::{HeaderMap, StatusCode},
     response::IntoResponse,
 };
+use futures::StreamExt as _;
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::{error, warn};
 
@@ -109,11 +111,45 @@ pub struct PublishRequest {
     pub provenance: Option<String>,
 }
 
+/// Largest piece of the upload body the form parser sees at once.
+const FORM_READ_PIECE: usize = 64 * 1024;
+
+/// The upload body, handed to the form parser one bounded piece per poll. The
+/// parser (multer) drains every piece already queued into one buffer that grows
+/// by doubling, so a fast client pushed it past 1 MiB per upload: a fresh odd
+/// size each time, which the allocator kept long after it was freed (server RSS
+/// climbed with file count while the live heap stayed flat). Splitting is
+/// zero-copy; the extra yield per piece is noise next to the bytes.
+fn bounded_form_reads(body: Body) -> Body {
+    let mut inner = body.into_data_stream();
+    let mut rest = axum::body::Bytes::new();
+    let mut yielded = false;
+    Body::from_stream(futures::stream::poll_fn(move |cx| {
+        if std::mem::take(&mut yielded) {
+            cx.waker().wake_by_ref();
+            return std::task::Poll::Pending;
+        }
+        if rest.is_empty() {
+            match std::task::ready!(inner.poll_next_unpin(cx)) {
+                Some(Ok(bytes)) => rest = bytes,
+                other => return std::task::Poll::Ready(other),
+            }
+        }
+        yielded = true;
+        let n = rest.len().min(FORM_READ_PIECE);
+        std::task::Poll::Ready(Some(Ok(rest.split_to(n))))
+    }))
+}
+
 pub(crate) async fn legacy_upload(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
-    mut multipart: Multipart,
+    request: Request,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
+    let request = request.map(bounded_form_reads);
+    let mut multipart = Multipart::from_request(request, &state)
+        .await
+        .map_err(|e| (e.status(), e.body_text()))?;
     // Mirror-ness lives in a form field, so whether *admin* is required can't
     // be decided until the body is parsed. But every upload needs at least
     // uploader rights, so reject that up front — preserving "never read the
@@ -174,7 +210,14 @@ pub(crate) async fn legacy_upload(
                         }
                     }
                 }
-                spooled = Some(spool.finish().await.map_err(|e| {
+                // fsync only when a bucket may hard-link this file into truth
+                // (disk); an object store copies it out and it is deleted after.
+                let durable = !state
+                    .buckets
+                    .handles()
+                    .iter()
+                    .all(|h| h.storage.buffers_uploads_in_ram());
+                spooled = Some(spool.finish(durable).await.map_err(|e| {
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
                         format!("Could not finish upload spool: {e}"),
@@ -457,27 +500,46 @@ pub(crate) async fn legacy_upload(
     publish_record(&state, &pinned, req).await
 }
 
-/// Acquire a permit iff this backend buffers the whole artifact body in RAM to
-/// write it. Object stores read the spooled body fully into memory for a single
-/// conditional PUT (a body at or under the 64 MiB multipart threshold), so
-/// unbounded concurrent uploads allocate ~N×64 MiB and can OOM a small node; the
-/// permit caps that. Disk hardlinks the spool (~0 RAM) and reports `false`, so it
-/// returns `None` and is never serialized. Called immediately before — and
-/// outside — `store_artifact_verified`, so queue time never burns that call's
+/// Acquire write-budget permits iff this backend buffers the artifact body in RAM
+/// to write it. Object stores read the spooled body fully into memory for a
+/// single conditional PUT (a body at or under the 64 MiB multipart threshold), or
+/// hold a multipart window for a larger one, so unbounded concurrent uploads can
+/// OOM a small node. The budget is counted in MiB, so each write is charged its
+/// real footprint ([`artifact_write_weight`]) and many small wheels run at once
+/// where a single-slot count would queue them behind a few big ones. Disk
+/// hardlinks the spool (~0 RAM) and reports `false`, so it returns `None` and is
+/// never serialized. Called immediately before — and outside —
+/// `store_artifact_verified`, so queue time never burns that call's
 /// payload-scaled write timeout; the returned permit is held across the store and
 /// released on drop.
 async fn acquire_artifact_write_permit<'a>(
     sem: &'a tokio::sync::Semaphore,
     storage: &dyn Storage,
+    size: u64,
 ) -> Option<tokio::sync::SemaphorePermit<'a>> {
     if storage.buffers_uploads_in_ram() {
         // `acquire` errors only if the semaphore is closed, which never happens
         // (it lives as long as the process). On that impossible error, proceed
         // unbounded rather than fail an upload — fail-open on a memory guard.
-        sem.acquire().await.ok()
+        sem.acquire_many(artifact_write_weight(size)).await.ok()
     } else {
         None
     }
+}
+
+/// Permits (MiB, rounded up) an object-store write of `size` bytes holds: the
+/// whole body for a single PUT, the multipart window above the threshold. Never
+/// more than one 64 MiB slot, and the budget is at least one slot, so a single
+/// write can always proceed — no charge can deadlock.
+fn artifact_write_weight(size: u64) -> u32 {
+    let bytes = if size <= storage::MULTIPART_THRESHOLD {
+        size
+    } else {
+        storage::MULTIPART_FOOTPRINT
+    };
+    // At most 64 (MULTIPART_THRESHOLD in MiB); at least 1 so an empty body still
+    // counts as a write in flight.
+    bytes.div_ceil(1024 * 1024).max(1) as u32
 }
 
 /// The storage-protocol core of an upload: origin observation → reserved-name
@@ -714,7 +776,7 @@ pub async fn publish_record(
     // Bound peak RAM across concurrent uploads on backends that buffer the body
     // to write it (object stores). Held across the store call, released on drop.
     let write_permit =
-        acquire_artifact_write_permit(&state.artifact_write_semaphore, storage).await;
+        acquire_artifact_write_permit(&state.artifact_write_semaphore, storage, size).await;
     let store_result = storage::store_artifact_verified(
         storage,
         &key,
@@ -1905,7 +1967,7 @@ mod tests {
         storage.set_buffers_uploads_in_ram(true);
         let sem = Arc::new(tokio::sync::Semaphore::new(1));
 
-        let first = acquire_artifact_write_permit(&sem, storage.as_ref()).await;
+        let first = acquire_artifact_write_permit(&sem, storage.as_ref(), 1).await;
         assert!(first.is_some(), "an object-store write takes a permit");
         assert_eq!(sem.available_permits(), 0, "the only permit is held");
 
@@ -1913,7 +1975,7 @@ mod tests {
         let sem2 = sem.clone();
         let storage2 = storage.clone();
         let second = tokio::spawn(async move {
-            let _permit = acquire_artifact_write_permit(&sem2, storage2.as_ref()).await;
+            let _permit = acquire_artifact_write_permit(&sem2, storage2.as_ref(), 1).await;
             // Reached only once `first` is released.
         });
         tokio::task::yield_now().await;
@@ -1939,8 +2001,8 @@ mod tests {
         // buffers_uploads_in_ram defaults false — the disk-backend shape.
         let sem = Arc::new(tokio::sync::Semaphore::new(1));
 
-        let a = acquire_artifact_write_permit(&sem, storage.as_ref()).await;
-        let b = acquire_artifact_write_permit(&sem, storage.as_ref()).await;
+        let a = acquire_artifact_write_permit(&sem, storage.as_ref(), 1).await;
+        let b = acquire_artifact_write_permit(&sem, storage.as_ref(), 1).await;
         assert!(
             a.is_none() && b.is_none(),
             "a disk-shaped backend takes no permit"
@@ -1958,17 +2020,58 @@ mod tests {
         // default-sized semaphore hands out the permit without ever pending.
         let storage = Arc::new(storage::test_support::InMemStorage::default());
         storage.set_buffers_uploads_in_ram(true);
-        let cap = crate::app::DEFAULT_MAX_CONCURRENT_ARTIFACT_WRITES as usize;
-        let sem = Arc::new(tokio::sync::Semaphore::new(cap));
+        let sem = crate::app::artifact_write_semaphore(
+            crate::app::DEFAULT_MAX_CONCURRENT_ARTIFACT_WRITES,
+        );
+        let cap = sem.available_permits();
 
         let permit = tokio::time::timeout(
             Duration::from_millis(50),
-            acquire_artifact_write_permit(&sem, storage.as_ref()),
+            acquire_artifact_write_permit(&sem, storage.as_ref(), 6 << 20),
         )
         .await
         .expect("an uncontended acquire never waits");
         assert!(permit.is_some());
-        assert_eq!(sem.available_permits(), cap - 1);
+        assert_eq!(
+            sem.available_permits(),
+            cap - 6,
+            "a 6 MiB wheel holds 6 MiB"
+        );
+    }
+
+    #[tokio::test]
+    async fn bounded_form_reads_caps_pieces_and_keeps_bytes() {
+        let data: Vec<u8> = (0..200_000u32).map(|i| i as u8).collect();
+        let mut stream = bounded_form_reads(Body::from(data.clone())).into_data_stream();
+        let mut got = Vec::new();
+        while let Some(piece) = futures::StreamExt::next(&mut stream).await {
+            let piece = piece.unwrap();
+            assert!(piece.len() <= FORM_READ_PIECE);
+            got.extend_from_slice(&piece);
+        }
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn artifact_write_weight_charges_the_resident_footprint() {
+        const MIB: u64 = 1024 * 1024;
+        assert_eq!(artifact_write_weight(0), 1, "an empty body still counts");
+        assert_eq!(artifact_write_weight(MIB), 1);
+        assert_eq!(artifact_write_weight(MIB + 1), 2, "rounded up");
+        assert_eq!(artifact_write_weight(storage::MULTIPART_THRESHOLD), 64);
+        // Above the threshold only the multipart window is resident — less than
+        // a full single PUT, so a huge wheel never starves the small ones.
+        let multipart = artifact_write_weight(5 << 30);
+        assert_eq!(
+            u64::from(multipart),
+            storage::MULTIPART_FOOTPRINT.div_ceil(MIB)
+        );
+        assert!(multipart < 64);
+        // No charge exceeds one slot: the smallest budget always admits a write.
+        assert!(
+            artifact_write_weight(u64::MAX) as usize
+                <= crate::app::artifact_write_semaphore(1).available_permits()
+        );
     }
 
     #[tokio::test]

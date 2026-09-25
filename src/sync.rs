@@ -188,14 +188,15 @@ pub struct SyncArgs {
     )]
     pub advisory_feed: Option<String>,
 
-    /// Parallel downloads/uploads within one package (default 4).
+    /// Files downloading/uploading at once across the whole sync (default 16).
+    /// One package with many files can use every free slot.
     #[arg(long, env = "PYPIRON_SYNC_CONCURRENCY")]
     pub concurrency: Option<usize>,
 
-    /// Packages synced in parallel (default 8). The long tail of any real
-    /// mirror is hundreds of thousands of 2-file packages; per-file
-    /// concurrency alone leaves throughput gated on serial per-package
-    /// round-trips.
+    /// Packages worked on in parallel (default 16): index lookups and
+    /// per-package bookkeeping. The long tail of any real mirror is hundreds of
+    /// thousands of 2-file packages, so these round-trips run ahead of the
+    /// file transfers, which `--concurrency` bounds.
     #[arg(long, env = "PYPIRON_SYNC_PACKAGE_CONCURRENCY")]
     pub package_concurrency: Option<usize>,
 
@@ -858,6 +859,9 @@ struct Resolved {
     src_explicit: bool,
     concurrency: usize,
     package_concurrency: usize,
+    /// One slot per file in flight across every package (`--concurrency`), held
+    /// around each file's download + upload.
+    file_slots: tokio::sync::Semaphore,
     spool_dir: PathBuf,
     /// Extra CA bundle for the source TLS (`--upstream-ca-cert` /
     /// `[sync].upstream-ca-cert`); loaded fail-closed before the client is built.
@@ -982,13 +986,16 @@ impl Resolved {
 
         // A `0` here would mean "no work in flight" — `chunks(0)`/`buffer_unordered(0)`
         // panic or stall — so refuse it rather than silently coercing a typo to 1.
-        let concurrency = args.concurrency.or(sync.concurrency).unwrap_or(4);
+        let concurrency = args.concurrency.or(sync.concurrency).unwrap_or(16);
         let package_concurrency = args
             .package_concurrency
             .or(sync.package_concurrency)
-            .unwrap_or(8);
+            .unwrap_or(16);
         if concurrency == 0 {
             bail!("--concurrency must be at least 1");
+        }
+        if concurrency > tokio::sync::Semaphore::MAX_PERMITS {
+            bail!("--concurrency is too large");
         }
         if package_concurrency == 0 {
             bail!("--package-concurrency must be at least 1");
@@ -1047,6 +1054,7 @@ impl Resolved {
             src_explicit,
             concurrency,
             package_concurrency,
+            file_slots: tokio::sync::Semaphore::new(concurrency),
             spool_dir: args
                 .spool_dir
                 .clone()
@@ -2137,8 +2145,8 @@ pub async fn run_sync(
     let cursors = load_cursors(&client, &resolved).await;
 
     // Keep the package slots occupied as each finishes; a slow package must
-    // not prevent later packages from starting. File concurrency stays bounded
-    // independently within each package.
+    // not prevent later packages from starting. Files in flight are bounded
+    // globally by `file_slots`, not per package.
     let progress = Arc::new(Progress::new(resolved.mirror.include_packages.len()));
     let ticker = (!args.no_progress).then(|| spawn_progress(progress.clone()));
     let mut failures = 0usize;
@@ -2400,6 +2408,11 @@ async fn sync_one_package(
         return Ok(PackageOutcome { new_cursor: None });
     }
 
+    // Biggest first: a multi-GB wheel started last would run alone at the end.
+    let mut selected = selected;
+    selected.sort_by_key(|s| std::cmp::Reverse(s.file.size.unwrap_or(0)));
+    // Sized to the global pool, so one big package can fill every free slot;
+    // `file_slots` inside `upload_via_http` is the actual bound.
     let results: Vec<Result<bool>> = stream::iter(selected)
         .map(|s| async move {
             let r = upload_via_http(client, resolved, endpoint, pkg, &s).await;
@@ -2932,6 +2945,16 @@ async fn download_provenance(
 /// existed. Hash mismatches retry too: a truncated body looks identical.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
 
+/// Upload POST attempts, backing off 2+4+8+16 s: long enough to ride out a
+/// half-minute storage stall behind the destination. A transient 5xx/429 or
+/// dropped connection must not fail the package and throw away a verified
+/// download.
+const UPLOAD_ATTEMPTS: u32 = 5;
+
+/// Headroom under the destination's 1 GiB request-body limit for the multipart
+/// form's other fields (metadata, provenance).
+const UPLOAD_FORM_HEADROOM: u64 = 1024 * 1024;
+
 /// Ceiling for an artifact whose listing declares no `size` and whose mirror has
 /// no `--exclude-larger` to fall back on. An unsized file is not a licence to
 /// fill the spool disk (three attempts over, at `--concurrency` in flight). 1 GiB
@@ -3027,7 +3050,8 @@ async fn download_once(
             );
         }
     }
-    spool.finish().await
+    // No fsync: this spool is a throwaway source for the upload, deleted after.
+    spool.finish(false).await
 }
 
 /// Push one file through the remote `/legacy/` as a mirror upload, carrying
@@ -3041,6 +3065,22 @@ async fn upload_via_http(
     pkg: &str,
     s: &Selected,
 ) -> Result<bool> {
+    // The destination refuses any request over 1 GiB, so a file this big would
+    // be downloaded in full only to be rejected — on every run.
+    if let Some(size) = s.file.size {
+        if size > MAX_UNSIZED_ARTIFACT_BYTES - UPLOAD_FORM_HEADROOM {
+            bail!(
+                "{} is {size} bytes, over the destination's 1 GiB upload limit; \
+                 skip files this large with --exclude-larger 1000MB",
+                s.file.filename
+            );
+        }
+    }
+    let _slot = resolved
+        .file_slots
+        .acquire()
+        .await
+        .context("file slot pool closed")?;
     // Held until after the POST below: dropping the spool deletes its temp file.
     let spool = download_verified(
         client,
@@ -3053,13 +3093,74 @@ async fn upload_via_http(
     )
     .await?;
 
+    // PEP 740: forward the provenance object verbatim; the receiving server
+    // stores it as the `.provenance` companion. Best-effort and UTF-8 (the
+    // object is JSON), so a fetch failure just omits the supply-chain signal.
+    let mut provenance = None;
+    if !resolved.as_private {
+        if let Some(prov_url) = &s.file.provenance {
+            if let Some(prov) = download_provenance(
+                client,
+                &resolved.guard,
+                prov_url,
+                resolved.source_auth.as_ref(),
+            )
+            .await
+            {
+                provenance = String::from_utf8(prov).ok();
+            }
+        }
+    }
+
     info!("  - uploading {}", s.file.filename);
-    // Stream the spool file into the multipart body instead of re-buffering it
-    // in RAM (the artifact already lives on disk from the download).
+    let mut attempt = 1;
+    loop {
+        // A streamed body is consumed by the send, so each attempt rebuilds the
+        // form from the spool.
+        let form = upload_form(resolved, pkg, s, &spool, provenance.as_deref()).await?;
+        let req = with_admin_auth(client.post(endpoint).multipart(form), resolved);
+        let err = match req.send().await {
+            // Already present — or our own earlier attempt landed.
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => return Ok(false),
+            Ok(resp) if resp.status().is_success() => return Ok(true),
+            Ok(resp)
+                if resp.status().is_server_error()
+                    || resp.status() == reqwest::StatusCode::TOO_MANY_REQUESTS =>
+            {
+                http_body_error(resp, "upload failed").await
+            }
+            Ok(resp) => return Err(http_body_error(resp, "upload failed").await),
+            Err(e) => anyhow::Error::from(e).context("upload failed"),
+        };
+        if attempt == UPLOAD_ATTEMPTS {
+            return Err(err);
+        }
+        warn!(file=%s.file.filename, attempt, error=?err, "upload failed; retrying");
+        tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
+        attempt += 1;
+    }
+}
+
+/// Size of each read from the spool into the upload body: large enough that a
+/// multi-MB wheel is a few dozen blocking-pool hops, not thousands.
+const UPLOAD_READ_CHUNK: usize = 256 * 1024;
+
+/// The `/legacy/` multipart form for one mirrored file, streaming its body from
+/// the spool instead of re-buffering it in RAM.
+async fn upload_form(
+    resolved: &Resolved,
+    pkg: &str,
+    s: &Selected,
+    spool: &FinishedSpool,
+    provenance: Option<&str>,
+) -> Result<multipart::Form> {
     let file = fs::File::open(spool.path.path())
         .await
         .with_context(|| format!("reopening spool for {}", s.file.filename))?;
-    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(file));
+    let body = reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::with_capacity(
+        file,
+        UPLOAD_READ_CHUNK,
+    ));
     let part = multipart::Part::stream_with_length(body, spool.size)
         .file_name(s.file.filename.clone())
         .mime_str("application/octet-stream")?;
@@ -3101,34 +3202,11 @@ async fn upload_via_http(
                 form = form.text("yanked_reason", reason.trim().to_string());
             }
         }
-        // PEP 740: forward the provenance object verbatim; the receiving server
-        // stores it as the `.provenance` companion. Best-effort and UTF-8 (the
-        // object is JSON), so a fetch failure just omits the supply-chain signal.
-        if let Some(prov_url) = &s.file.provenance {
-            if let Some(prov) = download_provenance(
-                client,
-                &resolved.guard,
-                prov_url,
-                resolved.source_auth.as_ref(),
-            )
-            .await
-            {
-                if let Ok(text) = String::from_utf8(prov) {
-                    form = form.text("provenance", text);
-                }
-            }
+        if let Some(text) = provenance {
+            form = form.text("provenance", text.to_string());
         }
     }
-
-    let req = with_admin_auth(client.post(endpoint).multipart(form), resolved);
-    let resp = req.send().await?;
-    if resp.status() == reqwest::StatusCode::CONFLICT {
-        return Ok(false);
-    }
-    if !resp.status().is_success() {
-        return Err(http_body_error(resp, "upload failed").await);
-    }
-    Ok(true)
+    Ok(form)
 }
 
 /// Gates one caller lifts from the mirror predicate. Everything is enforced by
@@ -4287,6 +4365,7 @@ mod tests {
             src_explicit: false,
             concurrency: 1,
             package_concurrency: 1,
+            file_slots: tokio::sync::Semaphore::new(1),
             spool_dir: std::env::temp_dir(),
             upstream_ca_cert: None,
             dry_run: false,

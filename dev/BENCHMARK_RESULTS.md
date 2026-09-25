@@ -712,6 +712,36 @@ the new `/metrics` counters, read straight off the server:
 - Seeding note: `aws s3 sync` of 209,290 tiny objects took 818 s — CLI-concurrency
   bound (10 parallel PUTs), not a server path; irrelevant to steady-state cost.
 
+### Run 010 — 2026-09-24 — first-time bulk sync into a fresh S3 server (offline)
+
+- Rig: M2 Max laptop; MinIO in a 4-vCPU colima VM; source is a disk-backed
+  pypiron on localhost. MinIO is the ceiling here, so read these as A/B only.
+- Corpus: `dev/bench/airgap.py` default — 150 real project names, 1,500 random-byte
+  wheels, 8.85 GB, mean 5.9 MB, tail to 200 MB (`--torch`: +2 × 900 MB).
+- Baseline `52bcf13`; "after" is the sync/upload memory + concurrency change.
+
+| Run | wall | MB/s | client RSS | client sys CPU | server peak RSS |
+|---|---|---|---|---|---|
+| baseline, defaults (pc 8 × c 4/package) | 218–225 s | 39–41 | 218–267 MB | 86–88 s | 1.86–2.09 GB (climbing) |
+| baseline, `--concurrency 16` | 221 s | 40 | 281 MB | 103 s | 2.39 GB |
+| baseline, server write slots unlimited | 207 s | 43 | 309 MB | 114 s | 2.24 GB |
+| after, defaults (16 files in flight) | 166 s | 53 | 220–250 MB | 9 s | **512–562 MB** (levels off) |
+| after, `--concurrency 32` | 183 s | 48 | 271 MB | 12 s | 620 MB |
+| after, `--concurrency 8` (pre-memory-fix build) | 145–147 s | 60–61 | 178–209 MB | 8 s | — |
+| after, `--torch` | 217 s | 49 | 201 MB | 12 s | 496 MB (baseline 1.82 GB) |
+| after + `MIMALLOC_ARENA_MAX_OBJECT_SIZE=256KiB` | 159 s | 56 | 278 MB | 9 s | **285–329 MB** (flat) |
+
+- Throughput: the server let only 4 S3 writes run at once regardless of size;
+  now a 256 MiB memory budget is charged per MiB, so ~40 small wheels write at
+  once. The client pool is global instead of package × file.
+- Client kernel time 88 s → 9 s: the throwaway spool is no longer fsynced and
+  is written/read in 256 KiB blocks instead of per network chunk / 4 KiB.
+- Server RSS was never a leak: the live heap stayed ~85–135 MB (macOS `heap`
+  snapshots). mimalloc kept every freed odd-sized whole-file PUT buffer and
+  multer's doubling form buffer. PUT bodies are now built from reused 256 KiB
+  blocks and the form parser gets ≤64 KiB pieces.
+- Index lag after sync end stayed < 0.5 s throughout: the worker is not the bound.
+
 <!--
 Template:
 

@@ -11,9 +11,13 @@ use anyhow::Result;
 use md5::{Digest as _, Md5};
 use sha2::{Digest, Sha256};
 use tokio::fs::{File, OpenOptions};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncWriteExt, BufWriter};
 
 static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Write buffer in front of the spool file. Network bodies arrive 8-16 KiB at a
+/// time; batching them keeps each blocking-pool hop to a quarter-MiB write.
+const SPOOL_WRITE_BUF: usize = 256 * 1024;
 
 /// Temp-file path that cleans up after itself; survives every early-return
 /// path of the upload handler without leaking spool files.
@@ -32,7 +36,7 @@ impl Drop for TempPath {
 }
 
 pub struct UploadSpool {
-    file: File,
+    file: BufWriter<File>,
     path: TempPath,
     hasher: Sha256,
     /// Content MD5, computed in the same streaming pass. Not a security digest —
@@ -83,7 +87,7 @@ impl UploadSpool {
             match opts.open(&path).await {
                 Ok(file) => {
                     return Ok(Self {
-                        file,
+                        file: BufWriter::with_capacity(SPOOL_WRITE_BUF, file),
                         path: TempPath(path),
                         hasher: Sha256::new(),
                         md5: Md5::new(),
@@ -106,7 +110,19 @@ impl UploadSpool {
     pub async fn write_chunk(&mut self, chunk: &[u8]) -> Result<()> {
         self.hasher.update(chunk);
         self.md5.update(chunk);
-        self.file.write_all(chunk).await?;
+        // Top the buffer up exactly, so every write reaching the file is a full
+        // SPOOL_WRITE_BUF. tokio copies each write into a buffer of its own that
+        // grows to fit; ragged flushes grew it to odd sizes up to double this.
+        let mut rest = chunk;
+        while !rest.is_empty() {
+            let room = match SPOOL_WRITE_BUF - self.file.buffer().len() {
+                0 => SPOOL_WRITE_BUF, // full: this write flushes it first
+                room => room,
+            };
+            let (head, tail) = rest.split_at(room.min(rest.len()));
+            self.file.write_all(head).await?;
+            rest = tail;
+        }
         self.size += chunk.len() as u64;
         Ok(())
     }
@@ -132,9 +148,15 @@ impl UploadSpool {
         Ok(())
     }
 
-    pub async fn finish(mut self) -> Result<FinishedSpool> {
+    /// Seal the spool. `durable` fsyncs it: required when the file may become
+    /// stored truth (the disk backend hard-links it into the data dir), wasted
+    /// when it is only a throwaway source for a network write that is deleted
+    /// right after (the sync client, an object-store server).
+    pub async fn finish(mut self, durable: bool) -> Result<FinishedSpool> {
         self.file.flush().await?;
-        self.file.sync_data().await?;
+        if durable {
+            self.file.get_ref().sync_data().await?;
+        }
         Ok(FinishedSpool {
             path: self.path,
             sha256: format!("{:x}", self.hasher.finalize()),
@@ -150,30 +172,33 @@ mod tests {
 
     #[tokio::test]
     async fn chunked_spool_matches_whole_file_hash() {
-        let payload: Vec<u8> = (0..100_000u32).flat_map(|i| i.to_le_bytes()).collect();
+        let payload: Vec<u8> = (0..300_000u32).flat_map(|i| i.to_le_bytes()).collect();
         let mut expected = Sha256::new();
         expected.update(&payload);
         let expected = format!("{:x}", expected.finalize());
         let expected_md5 = crate::hash::hex(Md5::digest(&payload).as_slice());
 
-        let mut spool = UploadSpool::new(&std::env::temp_dir()).await.unwrap();
-        // Uneven chunk sizes: hash and size must not depend on chunking.
-        for chunk in payload.chunks(7919) {
-            spool.write_chunk(chunk).await.unwrap();
-        }
-        let done = spool.finish().await.unwrap();
+        // Uneven chunk sizes, below, at and above the write buffer: hash, size
+        // and bytes must not depend on chunking.
+        for size in [7919, SPOOL_WRITE_BUF, SPOOL_WRITE_BUF * 3 / 2 + 1] {
+            let mut spool = UploadSpool::new(&std::env::temp_dir()).await.unwrap();
+            for chunk in payload.chunks(size) {
+                spool.write_chunk(chunk).await.unwrap();
+            }
+            let done = spool.finish(true).await.unwrap();
 
-        assert_eq!(done.sha256, expected);
-        assert_eq!(done.md5, expected_md5);
-        assert_eq!(done.size, payload.len() as u64);
-        assert_eq!(std::fs::read(done.path.path()).unwrap(), payload);
+            assert_eq!(done.sha256, expected);
+            assert_eq!(done.md5, expected_md5);
+            assert_eq!(done.size, payload.len() as u64);
+            assert_eq!(std::fs::read(done.path.path()).unwrap(), payload);
+        }
     }
 
     #[tokio::test]
     async fn temp_file_removed_on_drop() {
         let mut spool = UploadSpool::new(&std::env::temp_dir()).await.unwrap();
         spool.write_chunk(b"abc").await.unwrap();
-        let done = spool.finish().await.unwrap();
+        let done = spool.finish(true).await.unwrap();
         let path = done.path.path().to_path_buf();
         assert!(path.exists());
         drop(done);

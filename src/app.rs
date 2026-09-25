@@ -208,20 +208,26 @@ type ProjectsPageCache = Arc<std::sync::Mutex<Option<(std::time::Instant, u64, b
 type EmptyOriginObservations =
     Arc<tokio::sync::Mutex<std::collections::HashMap<(u64, String), (String, std::time::Instant)>>>;
 
-/// Default cap on concurrent in-RAM artifact writes (see
-/// [`AppState::artifact_write_semaphore`]). Four × the 64 MiB single-PUT ceiling
-/// is a ~256 MiB worst case — headroom for a small node, room to raise on a big
-/// one. `0` on the flag means unbounded.
+/// Default in-RAM artifact-write budget, in units of the 64 MiB single-PUT
+/// ceiling (see [`AppState::artifact_write_semaphore`]): four × 64 MiB is a
+/// ~256 MiB worst case — headroom for a small node, room to raise on a big one.
+/// `0` on the flag means unbounded.
 pub const DEFAULT_MAX_CONCURRENT_ARTIFACT_WRITES: u64 = 4;
 
-/// Build the artifact-write semaphore from the configured cap. `0` means
-/// unbounded ([`tokio::sync::Semaphore::MAX_PERMITS`]); any other value is the
-/// permit count, clamped so an absurd config can't exceed the permit ceiling.
+/// Permits (MiB) per configured artifact-write slot: one full single-PUT body.
+pub const ARTIFACT_WRITE_SLOT_MIB: u64 = crate::storage::MULTIPART_THRESHOLD >> 20;
+
+/// Build the artifact-write semaphore from the configured cap: a budget of
+/// `cap × 64` permits, one per MiB an in-flight write holds in RAM. `0` means
+/// unbounded ([`tokio::sync::Semaphore::MAX_PERMITS`]); an absurd config is
+/// clamped to that ceiling.
 pub fn artifact_write_semaphore(max_concurrent: u64) -> Arc<tokio::sync::Semaphore> {
     let permits = if max_concurrent == 0 {
         tokio::sync::Semaphore::MAX_PERMITS
     } else {
-        (max_concurrent as usize).min(tokio::sync::Semaphore::MAX_PERMITS)
+        usize::try_from(max_concurrent.saturating_mul(ARTIFACT_WRITE_SLOT_MIB))
+            .unwrap_or(usize::MAX)
+            .min(tokio::sync::Semaphore::MAX_PERMITS)
     };
     Arc::new(tokio::sync::Semaphore::new(permits))
 }
@@ -326,10 +332,11 @@ pub struct AppState {
     pub sidecar_cache: Arc<crate::sidecar_cache::SidecarCache>,
     /// Where upload spools live (must be real disk, not tmpfs).
     pub spool_dir: std::path::PathBuf,
-    /// Caps how many artifact writes may buffer their whole body in RAM at once.
-    /// Object stores read a spooled upload fully into memory for a single
-    /// conditional PUT, so N unbounded concurrent uploads allocate ~N×64 MiB and
-    /// can OOM; a permit is held across the store call (publish.rs), gated to
+    /// Caps the RAM that concurrent artifact writes may hold at once: one permit
+    /// per MiB. Object stores read a spooled upload fully into memory for a
+    /// single conditional PUT (or hold a multipart window for a large one), so
+    /// unbounded concurrent uploads can OOM; each write holds permits for its
+    /// footprint across the store call (publish.rs), gated to
     /// object-store backends only — disk hardlinks the spool (~0 RAM) and is
     /// never gated. Scoped to the direct-upload path; the replication-leg and
     /// sync-ingestion writes buffer unbounded still (separate F47 vectors, see
@@ -2642,10 +2649,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn artifact_write_semaphore_maps_zero_to_unbounded_and_n_to_n() {
-        // A concrete cap becomes exactly that many permits.
-        assert_eq!(artifact_write_semaphore(4).available_permits(), 4);
-        assert_eq!(artifact_write_semaphore(1).available_permits(), 1);
+    fn artifact_write_semaphore_maps_zero_to_unbounded_and_n_to_n_budgets() {
+        // A concrete cap becomes that many 64 MiB budgets, one permit per MiB.
+        assert_eq!(artifact_write_semaphore(4).available_permits(), 256);
+        assert_eq!(artifact_write_semaphore(1).available_permits(), 64);
         // `0` means unbounded — the full permit ceiling, so an acquire never
         // meaningfully waits.
         assert_eq!(

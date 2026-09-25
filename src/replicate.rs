@@ -825,7 +825,7 @@ async fn stage_from_bucket(
             );
         }
     }
-    let finished = spool.finish().await?;
+    let finished = spool.finish(true).await?;
     let path = finished.path.path().to_path_buf();
     Ok((
         finished.sha256,

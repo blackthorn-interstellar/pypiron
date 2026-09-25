@@ -109,7 +109,7 @@ These apply to every bucket of the same backend:
 
 | Flag | Env | Default | Meaning |
 | --- | --- | --- | --- |
-| `--s3-endpoint-url URL` | `PYPIRON_S3_ENDPOINT_URL` | none | S3-compatible endpoint (MinIO et al.); every `s3://` bucket. |
+| `--s3-endpoint-url URL` | `PYPIRON_S3_ENDPOINT_URL` | none | S3-compatible endpoint (MinIO et al.); every `s3://` bucket. Set `AWS_DISABLE_BULK_DELETE=true` if the store lacks multi-object delete. |
 | `--s3-force-path-style` | `PYPIRON_S3_FORCE_PATH_STYLE` | `false` | Path-style addressing; every `s3://` bucket. |
 | `--gcs-service-account-path PATH` | `PYPIRON_GCS_SERVICE_ACCOUNT_PATH` | none | GCS service-account JSON key. Enables presigned redirects. |
 | `--gcs-endpoint-url URL` | `PYPIRON_GCS_ENDPOINT_URL` | none | GCS local emulator or custom endpoint. |
@@ -225,7 +225,7 @@ backends are supported. With more than one bucket:
 | `--artifact-delivery auto\|redirect\|stream` | `PYPIRON_ARTIFACT_DELIVERY` | `auto` | Redirect object-store downloads for compatible clients or stream through the server. A first uncached proxy download may stream under `--proxy-stream-threshold`. |
 | `--wait-on-upload` | `PYPIRON_WAIT_ON_UPLOAD` | `false` | Wait for index visibility before upload returns. |
 | `--wait-on-upload-secs N` | `PYPIRON_WAIT_ON_UPLOAD_SECS` | `10` | Bound for that wait. |
-| `--max-concurrent-artifact-writes N` | `PYPIRON_MAX_CONCURRENT_ARTIFACT_WRITES` | `4` | Concurrent object-store uploads allowed to buffer up to `64MiB` each. Default worst case is about `256MiB`. Disk is not gated; `0` is unlimited. |
+| `--max-concurrent-artifact-writes N` | `PYPIRON_MAX_CONCURRENT_ARTIFACT_WRITES` | `4` | Memory for object-store uploads in progress, in `64MiB` units. The default of `4` caps it at about `256MiB`: four `64MiB` files at once, or about 40 files of `6MiB`. Uploads beyond it wait their turn. Disk storage has no limit; `0` removes it. |
 | `--allow-legacy-versions` | `PYPIRON_ALLOW_LEGACY_VERSIONS` | `false` | Accept direct uploads with non-PEP-440 versions. File type is irrelevant. Sync has a separate flag below. |
 | `--access-log` | `PYPIRON_ACCESS_LOG` | `false` | Log reads too, not only mutations. |
 | `--access-log-format structured\|clf` | `PYPIRON_ACCESS_LOG_FORMAT` | `structured` | Structured logs or Combined Log Format. |
@@ -391,8 +391,8 @@ require pypiron 0.0.23 or newer on both the sync client and destination server.
 | `--private-pattern PATTERN` | `PYPIRON_PRIVATE_PATTERN` | none | Refuse to mirror names matching `PATTERN`; with `--source-kind pypicloud --as-private`, migrate the matching projects instead. Repeatable; comma-separated in the env var. Also top-level `private-patterns`. [Details](#reserved-private-names). |
 | `--private-patterns-from FILE` | `PYPIRON_PRIVATE_PATTERNS_FROM` | none | Read patterns from `FILE`, one per line. Blank lines and `#` comments are ignored. Also top-level `private-patterns-from`. |
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Deliver an advisory snapshot to the destination. A URL or path overrides the source feed; `""` disables. Failure warns but does not stop package sync. |
-| `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `4` | Transfers within one package. |
-| `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `8` | Maximum packages in parallel. Each completed package frees a slot for the next, even while another package is stalled. |
+| `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `16` | Files transferring at once, across all packages; within a package, the largest start first. Through v0.0.23 it counted per package: multiply an old value by `--package-concurrency` to keep the same parallelism. |
+| `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `16` | Packages checked in parallel. Each completed package frees a slot for the next, even while another package is stalled. |
 | `--spool-dir PATH` | `PYPIRON_SYNC_SPOOL_DIR` | system temp | Download spool directory. |
 | `--dry-run` | `PYPIRON_SYNC_DRY_RUN` | `false` | Print work, write nothing. |
 | `--full` | `PYPIRON_SYNC_FULL` | `false` | Ignore cursors and reconcile every selected project. |
@@ -402,6 +402,9 @@ require pypiron 0.0.23 or newer on both the sync client and destination server.
 Re-running sync is normal. Existing files stay; yanks, removals, and project
 status reconcile from upstream. Changing file-selection settings, including
 `--allow-legacy-versions`, takes effect on the next run without `--full`.
+
+The destination accepts files up to 1 GiB. Sync reports a larger file as failed
+without downloading it; add `--exclude-larger 1000MB` to skip such files quietly.
 
 ## Install tokens
 

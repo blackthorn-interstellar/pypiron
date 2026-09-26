@@ -61,6 +61,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-23 Bug: `sync --admin-pass` without `--admin-user` silently sent no credential (`with_admin_auth` needs both) and then reported the destination "rejected the admin credentials" (401), while `serve` treats a lone `--admin-pass` as user `admin`; a lone `--admin-user` was likewise dropped instead of refusing (AGENTS.md: half-configured credentials refuse). Sync now uses `serve`'s rule and refuses a password-less username. Found by a hands-on run against real PyPI; blackbox test red first.
 - 2026-09-23 Bug: `verify-index`/`verify-chain` against a missing `--data-dir` (a typo) read every listing as empty and exited 0 with "0 divergence(s)"/"no chain", though the docs say storage read failures exit 2. A read-only verify now refuses a disk root that does not exist (exit 2, naming the path). Blackbox test red first.
 
+- 2026-09-25 Bug: `buckets migrate` with a one-bucket list (disk, or a single `--buckets` entry) always failed "no reachable bucket was available to migrate" — `migrate_topology_with` returns an empty report outside multi-bucket mode, read as unreachability. It now refuses up front saying migration needs two or more buckets and that one bucket means restarting with it (no only-copy check). Reproduced on disk; blackbox test asserts the message.
 ## Rejected
 
 - 2026-09-22 Refuse `POST /project/<pkg>/status` for a package with no files (it leaves a stray `.project-status.json` that `verify-index` counts as a package): `sync` relays upstream status for projects whose files were all filtered out, so a 404 would fail those runs; the stray file is not a divergence.
@@ -80,6 +81,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Drop `cargo check` from `make check` (~3.5 s of ~48 s): `clippy --all-targets` unifies dev-dependency features (tokio `test-util`) into the lib build, so only plain `cargo check` catches production code leaning on a test-only feature.
 - 2026-09-22 Delete the seven `#[cfg(test)]` compatibility shims in `origin.rs`/`buckets.rs`: they compile only under test, so the "−85 non-test lines" is a counting artifact; moving test helpers is reorganizing, not simplifying.
 - 2026-09-19 `--private-prefix` of 255 or 256 bytes now refuses startup because `{prefix}-*` exceeds the 256-byte pattern cap (a regression in c030441). Real, but no deployment has a 255-byte namespace; not worth a change until someone hits it. One-line fix if ever wanted: build the `-*` pattern in `PrivateNames::new` without re-parsing.
+- 2026-09-25 `create-token --config` ignores a malformed file (lead): a missing file already fails, and `create-token` reads no config key, so nothing is lost.
 
 ## Empty iterations
 
@@ -237,4 +239,3 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 ## Leads (not yet adjudicated)
 
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.
-- Bug?: `create-token` with an explicit `--config` that is missing or malformed never loads it (`src/app.rs` ~891/~983), against "Config file. Read by every command." Reproduced by Codex. Also `buckets migrate` to a single remaining bucket always exits 1 "no reachable bucket" (`src/buckets.rs` ~746 returns an empty report when not multi), though the guide says the same migration removes a bucket; code-traced only.

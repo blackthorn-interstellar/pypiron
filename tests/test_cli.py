@@ -99,6 +99,15 @@ def test_verify_against_a_missing_data_dir_could_not_run(pypiron_bin: Path, tmp_
         assert "no-such-store" in cp.stderr, cp.stderr
 
 
+def test_buckets_migrate_single_bucket_says_why_it_refuses(pypiron_bin: Path, tmp_path: Path):
+    """One bucket has no topology to migrate. The refusal says so instead of
+    blaming a reachable bucket for being unreachable."""
+    cp = _run(pypiron_bin, "buckets", "migrate", "--data-dir", str(tmp_path))
+    assert cp.returncode != 0, cp.stdout + cp.stderr
+    assert "two or more buckets" in cp.stderr, cp.stderr
+    assert "no reachable bucket" not in cp.stderr, cp.stderr
+
+
 # `config init` prints an annotated pypiron.toml to stdout. It is the guided
 # path to a first config: `pypiron config init > pypiron.toml`, then uncomment.
 

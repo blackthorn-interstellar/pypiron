@@ -483,6 +483,13 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
         .map(|(storage, name)| BucketHandle { storage, name })
         .collect();
     let buckets = BucketSet::new(handles);
+    if !buckets.is_multi() {
+        bail!(
+            "`buckets migrate` applies only to a list of two or more buckets; single-bucket \
+             mode does not read or write topology stamps. To run on one bucket, stop the fleet \
+             and restart it with that bucket (no only-copy check is made for the buckets left out)."
+        );
+    }
     let is_availability = |error: &anyhow::Error| {
         bucket_health::classify(observed_storage::signal_for_error(error))
             == bucket_health::SignalClass::AvailabilityFailure

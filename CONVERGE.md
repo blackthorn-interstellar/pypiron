@@ -88,7 +88,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-25 "accepts files up to 5 GiB" while sync caps at 5 GiB minus 1 MiB of form headroom: rounding; the doc's `--exclude-larger 5000MB` is already under it.
 ## Empty iterations
 
-2 consecutive (2026-09-25). (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+3 consecutive (2026-09-25; third pass: every dependency used, no dead-code allowances, no unreferenced pub fn). Converged at 2cbbe63 on 2026-09-25. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 

@@ -542,6 +542,7 @@ mod tests {
             yanked: Yanked::Flag(false),
             origin: None,
             yank_epoch: 0,
+            upload_time_revision: 0,
             snapshot: false,
             store_checksum: None,
         }

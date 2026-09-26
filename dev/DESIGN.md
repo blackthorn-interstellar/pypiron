@@ -1062,14 +1062,18 @@ milliseconds), the **first-uploaded-wins** tiebreak for the rare cross-partition
 byte conflict: the older epoch wins, the loser is quarantined. It is absent on
 legacy sidecars and on mirror artifacts; a conflict with either side missing it,
 or with the two within a 2 s skew, degrades to quarantine-both + alarm.
-`yank-epoch` is the sidecar's monotonic revision, retaining its historical field
-name. Every yank/unyank flip and historical upload-time repair increments it;
-the cross-bucket merge takes the max epoch and adopts the whole sidecar (no wall
-clocks, which two buckets cannot agree on); absent means 0. Timestamp repairs
-use the same CAS, intent/commit, and fan-out path as yanks, preserving yank state
-and the server-stamped `upload-epoch-ms`. At equal revisions the existing
-fail-closed yank preference and deterministic sidecar-digest tie-break still
-apply, including concurrent repairs during a partition. `snapshot` records a mirror record's provenance: a
+`yank-epoch` counts yank/unyank flips and `upload-time-revision` counts
+historical upload-time repairs; both are absent when 0. The cross-bucket merge
+adopts one whole sidecar (no wall clocks, which two buckets cannot agree on),
+ranked by: higher `yank-epoch`; at equal epochs, yanked over not (fail-closed);
+then higher `upload-time-revision`; then the deterministic sidecar-digest
+tie-break. Yank history ranks first so no number of timestamp repairs on one
+side of a partition can undo a yank made on the other; the cost is that such a
+repair loses and must be re-run. Sidecars written before
+`upload-time-revision` existed counted repairs in `yank-epoch`, which only
+overstates their yank history. Timestamp repairs use the same CAS,
+intent/commit, and fan-out path as yanks, preserving yank state and the
+server-stamped `upload-epoch-ms`. `snapshot` records a mirror record's provenance: a
 `sync --to` snapshot (`snapshot=true`) fans out pre-ack, a proxy-cache fill (the
 bit absent/false) replicates asynchronously via a post-serve note. Both are
 truth that converges — the bit picks the mechanism, never *whether* a mirror

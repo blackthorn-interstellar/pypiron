@@ -904,6 +904,7 @@ pub async fn publish_record(
         origin: Some(desired_origin.to_string()),
         upload_epoch_ms: (!is_mirror).then(now_epoch_millis),
         yank_epoch: 0,
+        upload_time_revision: 0,
         // A `sync --to` upload is a snapshot: mirror content the operator chose,
         // tagged so its origin reads honestly (a proxy cache carries this false).
         // Provenance only — both snapshot and cache replicate; private stays false.
@@ -1742,7 +1743,11 @@ async fn edit_sidecar(
                 wrote = true;
                 break;
             }
-            sc.yank_epoch = sc.yank_epoch.checked_add(1).ok_or_else(|| {
+            let revision = match &edit {
+                SidecarEdit::Yank(_) => &mut sc.yank_epoch,
+                SidecarEdit::UploadTime { .. } => &mut sc.upload_time_revision,
+            };
+            *revision = revision.checked_add(1).ok_or_else(|| {
                 (
                     StatusCode::CONFLICT,
                     "sidecar revision exhausted".to_string(),

@@ -365,20 +365,29 @@ pub fn is_yanked(sc: &Sidecar) -> bool {
     !matches!(sc.yanked.normalized(), Yanked::Flag(false))
 }
 
-/// Yank merge: max epoch wins; on an equal epoch a
-/// conflicting state resolves to yanked (fail-closed); a residual tie (both
-/// yanked, different reasons) breaks on the lexicographically smaller sidecar
-/// sha256. Never a wall clock — two buckets have two clocks.
+/// Sidecar merge: max yank epoch wins; on an equal epoch a conflicting state
+/// resolves to yanked (fail-closed); only then does the higher upload-time
+/// revision win, so a timestamp repair can never outrank a yank. A residual
+/// tie (both yanked, different reasons) breaks on the lexicographically
+/// smaller sidecar sha256. Never a wall clock — two buckets have two clocks.
 pub fn yank_merge(a: &Sidecar, b: &Sidecar) -> MergeChoice {
-    if a.yank_epoch > b.yank_epoch {
-        return MergeChoice::A;
-    }
-    if b.yank_epoch > a.yank_epoch {
-        return MergeChoice::B;
+    if a.yank_epoch != b.yank_epoch {
+        return if a.yank_epoch > b.yank_epoch {
+            MergeChoice::A
+        } else {
+            MergeChoice::B
+        };
     }
     let (ay, by) = (is_yanked(a), is_yanked(b));
     if ay != by {
         return if ay { MergeChoice::A } else { MergeChoice::B };
+    }
+    if a.upload_time_revision != b.upload_time_revision {
+        return if a.upload_time_revision > b.upload_time_revision {
+            MergeChoice::A
+        } else {
+            MergeChoice::B
+        };
     }
     // A residual same-epoch tie includes differing yank reasons and the
     // write-time metadata from two byte-identical partition uploads. Exact
@@ -407,6 +416,7 @@ pub(crate) mod tests {
             yanked,
             origin: Some(origin.to_string()),
             yank_epoch: epoch,
+            upload_time_revision: 0,
             upload_epoch_ms: None,
             snapshot: false,
             store_checksum: None,
@@ -710,6 +720,22 @@ pub(crate) mod tests {
         assert_eq!(yank_merge(&clear, &yanked), MergeChoice::B);
         // Identical → Equal.
         assert_eq!(yank_merge(&clear, &clear.clone()), MergeChoice::Equal);
+    }
+
+    #[test]
+    fn upload_time_repairs_never_outrank_a_yank() {
+        // Partition: bucket A takes two timestamp repairs, bucket B one yank.
+        let mut repaired = sc("x", PRIVATE, Yanked::Flag(false), 0);
+        repaired.upload_time = "2020-01-01T00:00:00Z".into();
+        repaired.upload_time_revision = 2;
+        let yanked = sc("x", PRIVATE, Yanked::Flag(true), 1);
+        assert_eq!(yank_merge(&repaired, &yanked), MergeChoice::B);
+        assert_eq!(yank_merge(&yanked, &repaired), MergeChoice::A);
+        // Between equal yank histories, the later repair wins.
+        let mut older = repaired.clone();
+        older.upload_time_revision = 1;
+        assert_eq!(yank_merge(&repaired, &older), MergeChoice::A);
+        assert_eq!(yank_merge(&older, &repaired), MergeChoice::B);
     }
 
     #[test]

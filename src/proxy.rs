@@ -1252,6 +1252,7 @@ impl Proxy {
             // Proxy fills are mirror truth (§4/§6.2).
             origin: Some(origin::MIRROR.to_string()),
             yank_epoch: 0,
+            upload_time_revision: 0,
             upload_epoch_ms: None,
             // A proxy fill is a cache, not a `sync --to` snapshot — but it still
             // replicates, asynchronously via a post-serve `_repl/` note (the

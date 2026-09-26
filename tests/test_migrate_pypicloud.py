@@ -417,7 +417,7 @@ def test_repair_dates_is_hash_checked_previewable_and_repeatable(
         assert rc == 0, f"{out}\n{err}"
         _wait_date(disk_server, package, wheel, SOURCE_DATE)
         after = json.loads(sc_path.read_text())
-        assert after == {**before, "upload-time": SOURCE_DATE, "yank-epoch": 1}
+        assert after == {**before, "upload-time": SOURCE_DATE, "upload-time-revision": 1}
         assert artifact.stat().st_mtime_ns == before_stat.st_mtime_ns
         assert artifact.read_bytes() == wheel.read_bytes()
         assert not artifact.with_name(missing.name).exists()
@@ -566,13 +566,15 @@ def test_private_migration_dates_require_admin_and_explicit_mode(disk_server, tm
     sc = json.loads(_sidecar(server, package, wheel).read_text())
     assert sc["upload-time"] == SOURCE_DATE
     assert sc["yanked"] == "withdrawn"
-    assert sc["yank-epoch"] == 2
+    assert sc["yank-epoch"] == 1
+    assert sc["upload-time-revision"] == 1
     body["upload-time"] = "2019-01-01T00:00:00Z"
     code, response, _ = http_request_auth("POST", url, data=json.dumps(body).encode(), **admin)
     assert code == 200, response
     sc = json.loads(_sidecar(server, package, wheel).read_text())
     assert sc["yanked"] == "withdrawn"
-    assert sc["yank-epoch"] == 3
+    assert sc["yank-epoch"] == 1
+    assert sc["upload-time-revision"] == 2
     code, response, _ = http_request_auth("POST", url, data=json.dumps(body).encode(), **admin)
     assert code == 200, response
     assert json.loads(_sidecar(server, package, wheel).read_text()) == sc

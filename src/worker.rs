@@ -4235,6 +4235,7 @@ async fn backfill_sidecar(
         origin: pkg_origin.map(str::to_string),
         upload_epoch_ms: None,
         yank_epoch: 0,
+        upload_time_revision: 0,
         // A backfilled sidecar cannot prove it was a `sync --to` snapshot, so its
         // provenance stays "cache" until a real sync re-stamps snapshot=true.
         // (Both replicate; the bit is provenance only.)
@@ -4470,6 +4471,7 @@ mod tests {
             origin: origin.map(str::to_string),
             upload_epoch_ms: None,
             yank_epoch: 0,
+            upload_time_revision: 0,
             snapshot: false,
             store_checksum: None,
         }

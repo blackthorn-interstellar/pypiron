@@ -203,6 +203,7 @@ fn to_sidecar(a: &AbsSidecar) -> Sidecar {
         ),
         upload_epoch_ms: a.epoch_ms.map(u64::from),
         yank_epoch: u64::from(a.yank_epoch),
+        upload_time_revision: 0,
         snapshot: a.snapshot,
         store_checksum: None,
     }

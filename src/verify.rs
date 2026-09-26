@@ -571,6 +571,7 @@ mod tests {
             yanked: crate::sidecar::Yanked::Flag(false),
             origin: Some(origin.to_string()),
             yank_epoch: 0,
+            upload_time_revision: 0,
             snapshot: false,
             store_checksum: None,
         }

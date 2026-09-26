@@ -83,10 +83,12 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-19 `--private-prefix` of 255 or 256 bytes now refuses startup because `{prefix}-*` exceeds the 256-byte pattern cap (a regression in c030441). Real, but no deployment has a 255-byte namespace; not worth a change until someone hits it. One-line fix if ever wanted: build the `-*` pattern in `PrivateNames::new` without re-parsing.
 - 2026-09-25 `create-token --config` ignores a malformed file (lead): a missing file already fails, and `create-token` reads no config key, so nothing is lost.
 - 2026-09-25 Azure with a customer-provided encryption key cannot publish a 5,000–5,120 MiB upload (Codex, code trace): `Put Blob From URL`'s 5,000 MiB source cap would surface as `409` and be read as "already exists". Needs CPK plus a file in a 120 MiB window; unverifiable without Azure.
-
+- 2026-09-25 `docs/security.md` "checks public packages ... before it serves or caches them" vs `sync` storing a known-`MAL-*` file: "caches" is the proxy fill; synced bytes are refused at the byte gate, which the next sentence states.
+- 2026-09-25 `--advisory-feed ""` does not disable blocking when `--malware-block true` is also explicit: deliberate (`src/app.rs` ~1577) so an air-gapped node can block from a `sync`-delivered snapshot; contradictory flags, not a doc error.
+- 2026-09-25 "accepts files up to 5 GiB" while sync caps at 5 GiB minus 1 MiB of form headroom: rounding; the doc's `--exclude-larger 5000MB` is already under it.
 ## Empty iterations
 
-1 consecutive (2026-09-25). (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+2 consecutive (2026-09-25). (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 

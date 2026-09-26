@@ -82,10 +82,11 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-22 Delete the seven `#[cfg(test)]` compatibility shims in `origin.rs`/`buckets.rs`: they compile only under test, so the "−85 non-test lines" is a counting artifact; moving test helpers is reorganizing, not simplifying.
 - 2026-09-19 `--private-prefix` of 255 or 256 bytes now refuses startup because `{prefix}-*` exceeds the 256-byte pattern cap (a regression in c030441). Real, but no deployment has a 255-byte namespace; not worth a change until someone hits it. One-line fix if ever wanted: build the `-*` pattern in `PrivateNames::new` without re-parsing.
 - 2026-09-25 `create-token --config` ignores a malformed file (lead): a missing file already fails, and `create-token` reads no config key, so nothing is lost.
+- 2026-09-25 Azure with a customer-provided encryption key cannot publish a 5,000–5,120 MiB upload (Codex, code trace): `Put Blob From URL`'s 5,000 MiB source cap would surface as `409` and be read as "already exists". Needs CPK plus a file in a 120 MiB window; unverifiable without Azure.
 
 ## Empty iterations
 
-0 consecutive. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+1 consecutive (2026-09-25). (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
 
 ## Open questions
 
@@ -235,6 +236,27 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   "mutations by default; every request with `--access-log`". Recommendation: A —
   the sentence exists for fail2ban rules, and the rules are only useful if the
   guess-heavy path is in the log. Cost of choosing wrong: low either way.
+
+- **Should a mirror upload that lost its sidecar write keep PyPI's metadata on
+  retry?** When a mirror upload's bytes land but the sidecar write right after
+  fails, the server answers `503` and, by design (`src/publish.rs`, the
+  filename-fence comment), leaves the bytes standing. `sync` now retries 5xx
+  (`29176f4`); the retry hits the immutable create, gets `409`, and sync counts
+  the file as present and advances its cursor. The worker later backfills the
+  sidecar with no `requires-python` and the storage time as the upload time, and
+  no later run repairs it, against VISION ("Mirrored packages carry PyPI's
+  original upload times in their sidecars"). Reproduced on disk (a directory at
+  the sidecar path forces the failure: `503`, then `409`, no sidecar). Before
+  the retry change the run failed once, but the next run skipped the file by
+  filename and lost the metadata the same way. Options: (A) on the duplicate
+  path of a mirror upload whose sidecar is absent, hash the stored bytes and,
+  if they match the upload's sha256, install the uploader's sidecar — ~20
+  lines, but races the worker's own backfill and re-reads up to 5 GiB; (B) let
+  `sync` also repair mirror upload times and `requires-python` on existing
+  files, like `--repair-upload-times` does for private ones; (C) accept it as a
+  rare storage-fault residue. Recommendation: B only if metadata fidelity
+  matters beyond first write; otherwise C — the fault needs a storage failure
+  between two consecutive writes. Cost of choosing wrong: low.
 
 ## Leads (not yet adjudicated)
 

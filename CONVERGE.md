@@ -92,7 +92,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-26 Warm fresh binaries in the test fixtures (`make test` locally: 61 startup timeouts, incl. `test_upgrade`): the cause is this Mac's `syspolicyd` (busy at ~37% CPU, 11 days up) taking ~96 s on the first exec of each newly written unsigned binary; the second exec is instant and Linux CI is green. A machine fix (Developer Tools exemption for the terminal), not a repo change.
 ## Empty iterations
 
-1 (2026-09-27: Codex review of `24de58c` found only a rollback-compat question, logged). Reset 2026-09-26 when `24de58c` landed after the converged mark at 2cbbe63.
+2 (2026-09-27: Codex review of `24de58c` found only a rollback-compat question, logged; a 10-minute rotating `make vopr-soak` at `5676b3d` ran ~222k seeds, 0 failed, 0 audit repairs). Reset 2026-09-26 when `24de58c` landed after the converged mark at 2cbbe63.
 
 ## Open questions
 

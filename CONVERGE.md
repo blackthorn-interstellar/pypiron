@@ -63,6 +63,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 - 2026-09-25 Bug: `buckets migrate` with a one-bucket list (disk, or a single `--buckets` entry) always failed "no reachable bucket was available to migrate" — `migrate_topology_with` returns an empty report outside multi-bucket mode, read as unreachability. It now refuses up front saying migration needs two or more buckets and that one bucket means restarting with it (no only-copy check). Reproduced on disk; blackbox test asserts the message.
 - 2026-09-26 Bug (red CI): nightly `fuzz_coremeta` failed five nights running ("parse fabricated project_urls"). Harness bug: `parse` strips control bytes before reading headers, so `Project-U\0RL:` is a `Project-URL` header, but the harness counted headers over the unstripped text. It now counts over `strip_control_chars` output. New seed `nul-in-header-key` panicked first.
+- 2026-09-26 Bug (red CI): nightly three-bucket vopr seed 1036100824 failed `AUDIT_PREMATURE_CONSUMPTION` — a rebuild rendered another bucket's sidecar (upload-time 00:04:31 vs 00:06:01) and consumed the marker, leaving the view wrong until the audit. The node-wide parsed-sidecar memo was keyed by package only, and an etag detects change only within one store; two buckets listed the same etag over different bytes. The memo is now keyed by (storage handle, package). Seed red first; ~150k seeds across every nightly profile clean.
 ## Rejected
 
 - 2026-09-22 Refuse `POST /project/<pkg>/status` for a package with no files (it leaves a stray `.project-status.json` that `verify-index` counts as a package): `sync` relays upstream status for projects whose files were all filtered out, so a 404 would fail those runs; the stray file is not a divergence.
@@ -264,4 +265,5 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 ## Leads (not yet adjudicated)
 
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.
-- Red CI: nightly Simulation (three-bucket vopr) seed 1036100824 fails `AUDIT_PREMATURE_CONSUMPTION` on `vopr-delta` (view upload-time 00:04:31, truth 00:06:01); reproduces at `24de58c`. Next iteration's task.
+- Partitioned three-bucket vopr (non-blocking lane) seed 5036212411 fails `UNTYPED_DISAPPEARANCE`, also before the sidecar-memo fix: `--seed 5036212411 --nodes 3 --buckets 3 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100`.
+- `tests/test_upgrade.py::test_upgrade_then_rollback_serves_everything` fails locally ([disk] and [s3]) at `4673497` without the sidecar-memo fix: the downloaded v0.0.24 release server never answers and its log is empty, though the binary runs `--version` fine.

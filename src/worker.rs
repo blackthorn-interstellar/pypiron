@@ -4046,7 +4046,7 @@ async fn list_artifacts_for_claim(
             Some((filename, e.etag.as_deref()?))
         })
         .collect();
-    let memo = sidecars.take(pkg);
+    let memo = sidecars.take(storage, pkg);
     let fresh = Mutex::new(PackageSidecars::with_capacity(sidecar_etags.len()));
     // Read the package claim once. Besides typing a legacy sidecar backfill, it
     // suppresses a typed mirror record that finished after the claim became
@@ -4084,7 +4084,11 @@ async fn list_artifacts_for_claim(
             metadata.extend(file?);
         }
     }
-    sidecars.put(pkg, fresh.into_inner().unwrap_or_else(|e| e.into_inner()));
+    sidecars.put(
+        storage,
+        pkg,
+        fresh.into_inner().unwrap_or_else(|e| e.into_inner()),
+    );
     Ok((metadata, raw))
 }
 
@@ -5811,7 +5815,7 @@ mod tests {
         // the parsed-sidecar memo first — as a restart would — so the rebuild
         // has to read it: an unchanged sidecar is otherwise never re-read.
         mark_dirty(storage.as_ref(), "alpha").await.unwrap();
-        state.sidecar_cache.take("alpha");
+        state.sidecar_cache.take(storage.as_ref(), "alpha");
         storage.fail_reads_of(&sidecar_key(&format!("{PACKAGES_PREFIX}alpha/{FILE}")));
         tick(&state, &pinned).await.unwrap_err();
         storage.heal_reads();

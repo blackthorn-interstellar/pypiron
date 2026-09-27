@@ -2086,9 +2086,22 @@ async fn settle_mirror_quarantine(
     // is safe and terminal: the private record reads `Live { Private }` under a
     // spent fence, which `decide` resolves and `clear_spent_demotion_fence`
     // finishes.
+    //
+    // So does a `.superseding` intent. A supersede is the other resolution of
+    // the same demotion, and it REPLACES the mirror body with `put_if_match`
+    // rather than creating over an empty key — so our bytes can be read here
+    // and private truth be standing by the time the delete lands. The intent
+    // is declared before the supersede touches the body, so checking it after
+    // the read shrinks that window from one write to three. It cannot close
+    // it: that needs a conditional delete, which no backend here offers.
+    // Measured: vopr seeds 5036212411 and 5036216135 (`--nodes 3 --buckets 3
+    // --packages 6 --files 2 --ops 160 --partition 100`), a peer's replicated
+    // private body deleted with nothing but the demotion fence standing.
     let body_is_ours = match storage.get_bytes(&akey).await {
         Ok(standing) => {
-            if preserved.as_deref() != Some(sha256_hex(&standing).as_str()) {
+            if preserved.as_deref() != Some(sha256_hex(&standing).as_str())
+                || storage.head_exists(&superseding_key(&akey)).await?
+            {
                 return Ok(marker_created || preserved.is_some());
             }
             true
@@ -3960,6 +3973,31 @@ mod tests {
         let ra = read_record(a.as_ref(), "pkg", filename).await.unwrap();
         let rb = read_record(b.as_ref(), "pkg", filename).await.unwrap();
         assert_eq!(decide(&ra, &rb), Verdict::Noop);
+    }
+
+    /// A settle yields to a supersede in flight. The supersede replaces the
+    /// mirror body with `put_if_match` after declaring its intent, so the body
+    /// this settle read and preserved may already be private truth by the time
+    /// its delete lands — vopr seed 5036212411.
+    #[tokio::test]
+    async fn a_demotion_settle_yields_to_a_supersede_in_flight() {
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let storage = InMemStorage::default();
+        seed_live(&storage, "pkg", filename, b"mirror bytes", MIRROR);
+        storage.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+        storage.insert(&superseding_key(&key), b"{}".to_vec());
+
+        settle_mirror_quarantine(&storage, "pkg", filename)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.get_bytes(&key).await.unwrap(),
+            b"mirror bytes",
+            "the settle dropped a body a supersede was replacing"
+        );
+        assert!(storage.head_exists(&sidecar_key(&key)).await.unwrap());
     }
 
     /// A demotion settle drops only the body it personally preserved.

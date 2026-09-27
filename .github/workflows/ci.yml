@@ -254,6 +254,14 @@ jobs:
           # pinned by
           # `replicate::tests::a_copy_never_publishes_truth_over_a_body_the_bucket_lost`.
           cargo run --example vopr -- --seed 62000150551 --nodes 3 --buckets 2 --packages 6 --files 2 --ops 80 --fail-percent 3 --partition 100
+          # The same settle racing a supersede on the same bucket. Both resolve
+          # one demotion; the supersede REPLACES the mirror body the settle had
+          # just read and preserved, and the settle's delete then took the
+          # peer's private bytes with only the demotion fence standing
+          # (UNTYPED_DISAPPEARANCE). The settle now yields to a `.superseding`
+          # intent. Three buckets needed; `--shrink`-minimized 160 -> 25 ops.
+          # Pinned by `replicate::tests::a_demotion_settle_yields_to_a_supersede_in_flight`.
+          cargo run --example vopr -- --seed 5036212411 --nodes 3 --buckets 3 --packages 6 --files 2 --ops 25 --fail-percent 3 --partition 100
           # Two false FREEZE_UNJUSTIFIED reds, both HARNESS defects: the freeze
           # was right and the attestation could not see its evidence.
           # `publish_record` refuses an upload over a `.tombstone`/`.frozen` and

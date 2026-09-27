@@ -64,6 +64,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-25 Bug: `buckets migrate` with a one-bucket list (disk, or a single `--buckets` entry) always failed "no reachable bucket was available to migrate" — `migrate_topology_with` returns an empty report outside multi-bucket mode, read as unreachability. It now refuses up front saying migration needs two or more buckets and that one bucket means restarting with it (no only-copy check). Reproduced on disk; blackbox test asserts the message.
 - 2026-09-26 Bug (red CI): nightly `fuzz_coremeta` failed five nights running ("parse fabricated project_urls"). Harness bug: `parse` strips control bytes before reading headers, so `Project-U\0RL:` is a `Project-URL` header, but the harness counted headers over the unstripped text. It now counts over `strip_control_chars` output. New seed `nul-in-header-key` panicked first.
 - 2026-09-26 Bug (red CI): nightly three-bucket vopr seed 1036100824 failed `AUDIT_PREMATURE_CONSUMPTION` — a rebuild rendered another bucket's sidecar (upload-time 00:04:31 vs 00:06:01) and consumed the marker, leaving the view wrong until the audit. The node-wide parsed-sidecar memo was keyed by package only, and an etag detects change only within one store; two buckets listed the same etag over different bytes. The memo is now keyed by (storage handle, package). Seed red first; ~150k seeds across every nightly profile clean.
+- 2026-09-27 Bug (partitioned vopr seeds 5036212411, 5036216135): a demotion settle on one bucket read the mirror body, a concurrent supersede replaced it with private truth, and the settle's blind delete then took the private bytes (`UNTYPED_DISAPPEARANCE`, self-healed by a later sweep). The settle now also yields when a `.superseding` intent stands, shrinking the window from one write to three; 212k partitioned seeds 2 -> 0 failures. Unit test red first; shrunk seed pinned in CI.
 ## Rejected
 
 - 2026-09-22 Refuse `POST /project/<pkg>/status` for a package with no files (it leaves a stray `.project-status.json` that `verify-index` counts as a package): `sync` relays upstream status for projects whose files were all filtered out, so a 404 would fail those runs; the stray file is not a divergence.
@@ -88,6 +89,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-25 `docs/security.md` "checks public packages ... before it serves or caches them" vs `sync` storing a known-`MAL-*` file: "caches" is the proxy fill; synced bytes are refused at the byte gate, which the next sentence states.
 - 2026-09-25 `--advisory-feed ""` does not disable blocking when `--malware-block true` is also explicit: deliberate (`src/app.rs` ~1577) so an air-gapped node can block from a `sync`-delivered snapshot; contradictory flags, not a doc error.
 - 2026-09-25 "accepts files up to 5 GiB" while sync caps at 5 GiB minus 1 MiB of form headroom: rounding; the doc's `--exclude-larger 5000MB` is already under it.
+- 2026-09-26 Warm fresh binaries in the test fixtures (`make test` locally: 61 startup timeouts, incl. `test_upgrade`): the cause is this Mac's `syspolicyd` (busy at ~37% CPU, 11 days up) taking ~96 s on the first exec of each newly written unsigned binary; the second exec is instant and Linux CI is green. A machine fix (Developer Tools exemption for the terminal), not a repo change.
 ## Empty iterations
 
 0 (reset 2026-09-26: `24de58c` landed after the converged mark; the previous run converged at 2cbbe63 on 2026-09-25).
@@ -262,8 +264,21 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   matters beyond first write; otherwise C — the fault needs a storage failure
   between two consecutive writes. Cost of choosing wrong: low.
 
+- **Should storage gain a conditional delete so replication repairs can never
+  delete bytes another repair just installed?** A demotion settle
+  (`settle_mirror_quarantine`, `src/replicate.rs`) checks "the body standing is
+  the one I preserved" and then deletes blindly. A concurrent supersede or
+  private upload landing in between loses its bytes on that bucket until a later
+  sweep restores them from a peer (seen in partitioned vopr at ~1 in 100k seeds
+  before the `.superseding` check, 0 in 212k after; a sibling race — two settles
+  racing a private create — is untouched). Options: (A) add a delete-if-version
+  primitive to the storage trait (native on GCS/Azure; S3 conditional delete and
+  the disk backend would need care) and use it in the settle; (B) accept the
+  narrowed window, since nothing is permanently lost and the sweep self-heals.
+  Recommendation: B for now — A is a storage-layer design change for a
+  self-healing seconds-long window; revisit if a failing seed recurs. Cost of
+  choosing wrong: low.
+
 ## Leads (not yet adjudicated)
 
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.
-- Partitioned three-bucket vopr (non-blocking lane) seed 5036212411 fails `UNTYPED_DISAPPEARANCE`, also before the sidecar-memo fix: `--seed 5036212411 --nodes 3 --buckets 3 --packages 6 --files 2 --ops 160 --fail-percent 3 --partition 100`.
-- `tests/test_upgrade.py::test_upgrade_then_rollback_serves_everything` fails locally ([disk] and [s3]) at `4673497` without the sidecar-memo fix: the downloaded v0.0.24 release server never answers and its log is empty, though the binary runs `--version` fine.

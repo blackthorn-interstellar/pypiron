@@ -28,8 +28,9 @@ fuzz_target!(|data: &[u8]| {
     // the way the parser enumerates headers (decode lossily, stop at the first
     // blank line where the body begins, skip folded continuation lines) and
     // assert the count is an upper bound. A regression that double-counts or
-    // invents an entry trips this.
-    let text = String::from_utf8_lossy(data);
+    // invents an entry trips this. Count over the control-stripped text the
+    // parser reads: `Project-U\0RL:` is a `Project-URL` header once the NUL goes.
+    let text = coremeta::strip_control_chars(&String::from_utf8_lossy(data));
     let mut header_urls = 0usize;
     for line in text.split_inclusive('\n') {
         let content = line.trim_end_matches(['\r', '\n']);

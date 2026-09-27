@@ -62,6 +62,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-23 Bug: `verify-index`/`verify-chain` against a missing `--data-dir` (a typo) read every listing as empty and exited 0 with "0 divergence(s)"/"no chain", though the docs say storage read failures exit 2. A read-only verify now refuses a disk root that does not exist (exit 2, naming the path). Blackbox test red first.
 
 - 2026-09-25 Bug: `buckets migrate` with a one-bucket list (disk, or a single `--buckets` entry) always failed "no reachable bucket was available to migrate" — `migrate_topology_with` returns an empty report outside multi-bucket mode, read as unreachability. It now refuses up front saying migration needs two or more buckets and that one bucket means restarting with it (no only-copy check). Reproduced on disk; blackbox test asserts the message.
+- 2026-09-26 Bug (red CI): nightly `fuzz_coremeta` failed five nights running ("parse fabricated project_urls"). Harness bug: `parse` strips control bytes before reading headers, so `Project-U\0RL:` is a `Project-URL` header, but the harness counted headers over the unstripped text. It now counts over `strip_control_chars` output. New seed `nul-in-header-key` panicked first.
 ## Rejected
 
 - 2026-09-22 Refuse `POST /project/<pkg>/status` for a package with no files (it leaves a stray `.project-status.json` that `verify-index` counts as a package): `sync` relays upstream status for projects whose files were all filtered out, so a 404 would fail those runs; the stray file is not a divergence.
@@ -88,7 +89,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-25 "accepts files up to 5 GiB" while sync caps at 5 GiB minus 1 MiB of form headroom: rounding; the doc's `--exclude-larger 5000MB` is already under it.
 ## Empty iterations
 
-3 consecutive (2026-09-25; third pass: every dependency used, no dead-code allowances, no unreferenced pub fn). Converged at 2cbbe63 on 2026-09-25. (2026-09-22: a 10-minute `make vopr-soak` at `b17de0d` ran 235,576 seeds, 0 failed, 0 ack-totality misses.)
+0 (reset 2026-09-26: `24de58c` landed after the converged mark; the previous run converged at 2cbbe63 on 2026-09-25).
 
 ## Open questions
 
@@ -263,3 +264,4 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 ## Leads (not yet adjudicated)
 
 - Flaky: `tests/test_crash_consistency.py::test_dual_leadership_overlap_triggers_cas_conflict` failed once in a full run on 2026-09-22 (loaded machine) and passed 3/3 alone right after.
+- Red CI: nightly Simulation (three-bucket vopr) seed 1036100824 fails `AUDIT_PREMATURE_CONSUMPTION` on `vopr-delta` (view upload-time 00:04:31, truth 00:06:01); reproduces at `24de58c`. Next iteration's task.

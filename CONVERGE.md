@@ -92,7 +92,7 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-26 Warm fresh binaries in the test fixtures (`make test` locally: 61 startup timeouts, incl. `test_upgrade`): the cause is this Mac's `syspolicyd` (busy at ~37% CPU, 11 days up) taking ~96 s on the first exec of each newly written unsigned binary; the second exec is instant and Linux CI is green. A machine fix (Developer Tools exemption for the terminal), not a repo change.
 ## Empty iterations
 
-0 (reset 2026-09-26: `24de58c` landed after the converged mark; the previous run converged at 2cbbe63 on 2026-09-25).
+1 (2026-09-27: Codex review of `24de58c` found only a rollback-compat question, logged). Reset 2026-09-26 when `24de58c` landed after the converged mark at 2cbbe63.
 
 ## Open questions
 
@@ -278,6 +278,27 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
   Recommendation: B for now — A is a storage-layer design change for a
   self-healing seconds-long window; revisit if a failing seed recurs. Cost of
   choosing wrong: low.
+
+- **Should an upload-time repair survive a rollback to the previous release?**
+  `24de58c` moved upload-time repairs onto a new sidecar field
+  (`upload-time-revision`) so they no longer outrank a yank made on another
+  bucket during a partition. Per the format policy (dev/DESIGN.md, "additive
+  field with a safe serde default never bumps"), release 0.0.24 ignores the
+  field. Two sequences (Codex review, modelled, not run) then lose an
+  acknowledged repair: (1) repair on bucket A during a partition, roll back to
+  0.0.24 before healing — its merge sees two equal-epoch sidecars, the
+  digest tie-break can pick the unrepaired one, and both buckets keep the old
+  date; (2) 0.0.24 replicates a repaired sidecar (dropping the revision), the
+  fleet upgrades, and a later repair on the copy is outranked by the stale
+  original's higher revision, restoring the older date. Only upload times are
+  affected (never bytes or yank state), and only for mixed-version fleets with
+  a repair during a partition. Options: (A) accept and note in the release
+  notes that a rollback across this change can revert upload-time repairs made
+  during a partition — rerun `sync --repair-upload-times`; (B) make repairs also
+  bump the yank epoch — reintroduces the bug `24de58c` fixed;
+  (C) a format bump so 0.0.24 refuses to start — kills rollback for a
+  metadata-only edge. Recommendation: A — rare, metadata-only, and repairable by
+  rerunning the repair. Cost of choosing wrong: low.
 
 ## Leads (not yet adjudicated)
 

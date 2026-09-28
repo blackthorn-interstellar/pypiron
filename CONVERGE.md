@@ -96,6 +96,14 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 
 ## Open questions
 
+- **Push `master` to turn nightly Fuzz and Simulation green.** Both went red
+  on 2026-09-27 against `origin/master`, which lacks 12 local commits. The
+  `fuzz_coremeta` crash (`crash-c9afe6e8…`, NUL inside a `Project-URL` key)
+  passes the harness at `4673497`; the two-bucket vopr seeds (e.g.
+  24723002062, 1036150841; wrong upload-time in a rebuilt view) pass at
+  `0fcaf2a`. Nothing to fix in code. Recommendation: push. Cost of waiting:
+  low — nightly stays red and hides any new failure until then.
+
 - **Should the transparency chain stop treating a later checkpoint as
   permission for a committed file to disappear?** `verify-chain` replays the
   chain last-write-wins (`replay`, `src/transparency.rs`), so a newer link that

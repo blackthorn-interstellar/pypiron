@@ -92,17 +92,9 @@ echo "$(cat $(find src -name '*.rs') | wc -l) - <non-test count> + $(find tests 
 - 2026-09-26 Warm fresh binaries in the test fixtures (`make test` locally: 61 startup timeouts, incl. `test_upgrade`): the cause is this Mac's `syspolicyd` (busy at ~37% CPU, 11 days up) taking ~96 s on the first exec of each newly written unsigned binary; the second exec is instant and Linux CI is green. A machine fix (Developer Tools exemption for the terminal), not a repo change.
 ## Empty iterations
 
-3 consecutive (2026-09-27; third pass: a 5-minute partitioned three-bucket vopr run from seed 7100000000, ~40k seeds, 0 failed). Converged at 3e1cd38 on 2026-09-27. Earlier: Codex review of `24de58c` found only a rollback-compat question (logged); a 10-minute rotating `make vopr-soak` at `5676b3d` ran ~222k seeds, 0 failed. Previous convergence: 2cbbe63 on 2026-09-25, reset when `24de58c` landed.
+3 consecutive (2026-09-27; third pass: a 5-minute partitioned three-bucket vopr run from seed 7100000000, ~40k seeds, 0 failed). Converged at 3e1cd38 on 2026-09-27. Earlier: Codex review of `24de58c` found only a rollback-compat question (logged); a 10-minute rotating `make vopr-soak` at `5676b3d` ran ~222k seeds, 0 failed. Previous convergence: 2cbbe63 on 2026-09-25, reset when `24de58c` landed. Red nightly Fuzz/Simulation on 2026-09-27 ran against pre-fix `origin/master`; pushed `7e079be` on 2026-09-27.
 
 ## Open questions
-
-- **Push `master` to turn nightly Fuzz and Simulation green.** Both went red
-  on 2026-09-27 against `origin/master`, which lacks 12 local commits. The
-  `fuzz_coremeta` crash (`crash-c9afe6e8…`, NUL inside a `Project-URL` key)
-  passes the harness at `4673497`; the two-bucket vopr seeds (e.g.
-  24723002062, 1036150841; wrong upload-time in a rebuilt view) pass at
-  `0fcaf2a`. Nothing to fix in code. Recommendation: push. Cost of waiting:
-  low — nightly stays red and hides any new failure until then.
 
 - **Should the transparency chain stop treating a later checkpoint as
   permission for a committed file to disappear?** `verify-chain` replays the

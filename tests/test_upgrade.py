@@ -156,6 +156,28 @@ def _yank(server: Dict, name: str, filename: str, reason: bytes) -> None:
     raise TimeoutError(f"yank of {filename} never reached the index")
 
 
+def _set_project_status(server: Dict, name: str, status: Dict) -> None:
+    """POST the marker and wait until the worker has rendered it into the index.
+
+    The endpoint returns 200 as soon as the sidecar is written; `verify-index`
+    compares the materialized view to truth, so stopping the binary before the
+    rebuild lands is a stale-view, not an upgrade failure.
+    """
+    code, body, _ = http_request_auth(
+        "POST",
+        f"{server['base_url']}/project/{name}/status",
+        data=json.dumps(status).encode(),
+        **ADMIN,
+    )
+    assert code == 200, (code, body)
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        if get_index_json(server["simple"], name).get("project-status") == status:
+            return
+        time.sleep(0.2)
+    raise TimeoutError(f"project-status {status} never reached the index for {name}")
+
+
 def _verify_index(bin_path: Path, store: Dict) -> None:
     cp = subprocess.run(
         [str(bin_path), "verify-index"],
@@ -216,13 +238,7 @@ def test_upgrade_then_rollback_serves_everything(
         add(old, "upgrade-beta", make_wheel("upgrade-beta", "0.1.0", dists))
         _yank(old, "upgrade-alpha", "upgrade_alpha-1.1.0-py3-none-any.whl", b"broken build")
         yanked["upgrade_alpha-1.1.0-py3-none-any.whl"] = "broken build"
-        code, _, _ = http_request_auth(
-            "POST",
-            f"{old['base_url']}/project/upgrade-beta/status",
-            data=b'{"status":"archived","reason":"superseded"}',
-            **ADMIN,
-        )
-        assert code == 200, code
+        _set_project_status(old, "upgrade-beta", {"status": "archived", "reason": "superseded"})
         _assert_serves(old, published, yanked)  # also records downloads
 
     # 2. The binary under test takes over the same store.

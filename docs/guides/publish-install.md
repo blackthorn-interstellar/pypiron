@@ -112,7 +112,8 @@ uvx twine upload \
 ```
 
 Do not run both publish commands for the same files: pypiron refuses to replace
-an existing filename.
+an existing filename. It also refuses a wheel it can't open or that has no
+package metadata inside, so a broken build fails at upload, not at install.
 
 ## Add production credentials
 

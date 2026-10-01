@@ -21,35 +21,49 @@ pub(crate) const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 /// headroom and no honest publisher can reach it.
 pub(crate) const MAX_WHEEL_ENTRIES: usize = 262_144;
 
-/// Extract `METADATA` from a wheel on disk without loading the wheel into
-/// memory — zip needs only the central directory plus the one entry.
-pub fn extract_metadata_from_file(path: &Path) -> Option<Vec<u8>> {
-    extract_metadata_from_reader(std::fs::File::open(path).ok()?)
+/// Why a wheel yielded no `METADATA`. The split matters to the uploader: a
+/// broken wheel is refused, while an oversized-but-valid one is stored and only
+/// loses its PEP 658 fast path.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WheelError {
+    /// Not a readable zip, or no `<dist>.dist-info/METADATA` at its top level.
+    Invalid,
+    /// Over [`MAX_WHEEL_ENTRIES`] or [`MAX_METADATA_BYTES`]; never walked or read.
+    TooLarge,
 }
 
-pub(crate) fn extract_metadata_from_reader<R: Read + Seek>(reader: R) -> Option<Vec<u8>> {
-    let mut zip = ZipArchive::new(reader).ok()?;
+/// Extract `METADATA` from a wheel on disk without loading the wheel into
+/// memory — zip needs only the central directory plus the one entry.
+pub fn extract_metadata_from_file(path: &Path) -> Result<Vec<u8>, WheelError> {
+    extract_metadata_from_reader(std::fs::File::open(path).map_err(|_| WheelError::Invalid)?)
+}
+
+pub(crate) fn extract_metadata_from_reader<R: Read + Seek>(
+    reader: R,
+) -> Result<Vec<u8>, WheelError> {
+    let mut zip = ZipArchive::new(reader).map_err(|_| WheelError::Invalid)?;
     if zip.len() > MAX_WHEEL_ENTRIES {
-        return None;
+        return Err(WheelError::TooLarge);
     }
     let name = zip
         .file_names()
         .find(|n| n.ends_with(".dist-info/METADATA") && n.matches('/').count() == 1)
-        .map(str::to_string)?;
-    let entry = zip.by_name(&name).ok()?;
+        .map(str::to_string)
+        .ok_or(WheelError::Invalid)?;
+    let entry = zip.by_name(&name).map_err(|_| WheelError::Invalid)?;
     if entry.size() > MAX_METADATA_BYTES {
-        return None;
+        return Err(WheelError::TooLarge);
     }
     let mut out = Vec::new();
     // take() guards against central directories that lie about the size.
     entry
         .take(MAX_METADATA_BYTES + 1)
         .read_to_end(&mut out)
-        .ok()?;
+        .map_err(|_| WheelError::Invalid)?;
     if out.len() as u64 > MAX_METADATA_BYTES {
-        return None;
+        return Err(WheelError::TooLarge);
     }
-    Some(out)
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -76,7 +90,7 @@ mod tests {
         let wheel = fake_wheel(Some(md));
         assert_eq!(
             extract_metadata_from_reader(Cursor::new(&wheel)).as_deref(),
-            Some(md.as_slice())
+            Ok(md.as_slice())
         );
     }
 
@@ -85,7 +99,7 @@ mod tests {
     /// Built at the cap rather than at a hostile 14M so the test stays fast; the
     /// blackbox counterpart is `tests/test_zip_bounds.py`.
     #[test]
-    fn over_entry_cap_is_none() {
+    fn over_entry_cap_is_too_large() {
         let md = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
         let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
         let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
@@ -95,18 +109,21 @@ mod tests {
             zip.start_file(format!("demo/f{i}"), opts).unwrap();
         }
         let wheel = zip.finish().unwrap().into_inner();
-        assert_eq!(extract_metadata_from_reader(Cursor::new(&wheel)), None);
+        assert_eq!(
+            extract_metadata_from_reader(Cursor::new(&wheel)),
+            Err(WheelError::TooLarge)
+        );
     }
 
     #[test]
-    fn missing_metadata_and_garbage_are_none() {
+    fn missing_metadata_and_garbage_are_invalid() {
         assert_eq!(
             extract_metadata_from_reader(Cursor::new(&fake_wheel(None))),
-            None
+            Err(WheelError::Invalid)
         );
         assert_eq!(
             extract_metadata_from_reader(Cursor::new(b"not a zip" as &[u8])),
-            None
+            Err(WheelError::Invalid)
         );
     }
 
@@ -125,7 +142,7 @@ mod tests {
         );
         assert_eq!(
             extract_metadata_from_file(Path::new("/nonexistent.whl")),
-            None
+            Err(WheelError::Invalid)
         );
         let _ = std::fs::remove_dir_all(&dir);
     }

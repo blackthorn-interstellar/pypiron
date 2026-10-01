@@ -15,7 +15,7 @@ use std::io::Cursor;
 mod wheel;
 
 fuzz_target!(|data: &[u8]| {
-    let out = wheel::extract_metadata_from_reader(Cursor::new(data));
+    let out = wheel::extract_metadata_from_reader(Cursor::new(data)).ok();
     // Whatever it returns, the 16 MiB size guard must hold.
     if let Some(md) = out {
         assert!(

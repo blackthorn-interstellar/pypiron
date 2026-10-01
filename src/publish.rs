@@ -348,7 +348,7 @@ pub(crate) async fn legacy_upload(
     // I/O + CPU bound, so off the async runtime.
     let is_wheel = filename.ends_with(".whl");
     let sha256 = spooled.sha256.clone();
-    let wheel_metadata = if is_wheel {
+    let wheel_parse = if is_wheel {
         let path = spooled.path.path().to_path_buf();
         // Bound how many central directories are resident at once (see
         // PARSE_SLOTS). Held across the parse, and taken here rather than
@@ -363,7 +363,8 @@ pub(crate) async fn legacy_upload(
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "Metadata extraction task failed".to_string(),
                 )
-            })?
+            })
+            .map(Some)?
     } else {
         None
     };
@@ -479,6 +480,25 @@ pub(crate) async fn legacy_upload(
             ),
         ));
     }
+
+    // A wheel with no readable METADATA can't be installed, and an immutable
+    // upload can't be fixed in place — refuse it here, as PyPI does, instead of
+    // failing every installer later. An oversized-but-valid wheel is still
+    // stored; it only loses its PEP 658 metadata file. Mirror and migration
+    // uploads relay what another index already published, broken or not.
+    let wheel_metadata = match wheel_parse {
+        Some(Err(wheel::WheelError::Invalid)) if !is_mirror && !is_migration => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "'{filename}' is not a valid wheel: expected a zip with a \
+                     <name>-<version>.dist-info/METADATA file"
+                ),
+            ));
+        }
+        Some(parsed) => parsed.ok(),
+        None => None,
+    };
 
     let upload_time = match fields.get("upload_time") {
         Some(ts) => {

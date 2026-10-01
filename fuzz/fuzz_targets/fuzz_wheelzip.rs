@@ -80,7 +80,7 @@ fuzz_target!(|data: &[u8]| {
         .find(|(matches, _)| *matches)
         .map(|(_, content)| content.clone());
 
-    let got = wheel::extract_metadata_from_reader(Cursor::new(bytes));
+    let got = wheel::extract_metadata_from_reader(Cursor::new(bytes)).ok();
     assert_eq!(
         got, expected,
         "wheel METADATA selection diverged from first-matching-member"

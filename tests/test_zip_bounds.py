@@ -121,3 +121,47 @@ def test_concurrent_uploads_all_get_metadata(disk_server, tmp_path):
         code, body, _ = http_get(f"{disk_server['base_url']}/files/{name}/{wheel.name}.metadata")
         assert code == 200, f"{name} lost its metadata under concurrency"
         assert f"Name: {name}".encode() in body
+
+
+def _assert_refused(server, wheel_path, package):
+    code, body = upload_legacy(
+        server["legacy"],
+        wheel_path,
+        username=server["user"],
+        password=server["password"],
+        expect_status=400,
+    )
+    assert b"is not a valid wheel" in body
+    code, _, _ = http_get(f"{server['base_url']}/files/{package}/{wheel_path.name}")
+    assert code == 404
+
+
+def test_non_zip_wheel_is_refused(disk_server, tmp_path):
+    """A `.whl` that isn't a zip can never install; it must not reach the index."""
+    wheel = tmp_path / "notzip-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"this is not a zip archive")
+    _assert_refused(disk_server, wheel, "notzip")
+
+
+def test_wheel_without_metadata_is_refused(disk_server, tmp_path):
+    """A real zip with no `.dist-info/METADATA` is just as uninstallable."""
+    wheel = tmp_path / "nometa-1.0-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as zf:
+        zf.writestr("nometa/__init__.py", b"")
+    _assert_refused(disk_server, wheel, "nometa")
+
+
+def test_mirror_upload_relays_a_broken_wheel(disk_server, tmp_path):
+    """Mirroring copies what upstream already serves — broken history included."""
+    wheel = tmp_path / "mirrorjunk-1.0-py3-none-any.whl"
+    wheel.write_bytes(b"this is not a zip archive")
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+        fields={"mirror": "true"},
+    )
+    index = wait_for_file_in_index(disk_server["simple"], "mirrorjunk", wheel.name)
+    (entry,) = index["files"]
+    assert "core-metadata" not in entry

@@ -208,6 +208,7 @@ pub trait ObjectStoreSelector: Send + Sync {
 /// *transient* failure — the engine relies on that distinction to never freeze a
 /// day from a failed read.
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait emits #[must_use] on already-must-use Future returns
 pub trait ObjectStore: Send + Sync {
     /// This handle's bucket identity — see [`bucket_tag`]. Stable across
     /// restarts: it is written into every rollup key this store authors.
@@ -237,6 +238,7 @@ pub trait ObjectStore: Send + Sync {
 /// one, a flush writes exactly what was recorded and costs exactly what it
 /// always did.
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait emits #[must_use] on already-must-use Future returns
 pub trait KeyVerifier: Send + Sync {
     /// `Some(true)` it exists, `Some(false)` it genuinely does not, `None` the
     /// check could not be made (a transient storage failure).

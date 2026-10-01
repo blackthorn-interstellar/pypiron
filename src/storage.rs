@@ -1005,6 +1005,7 @@ pub const SHARD_CHARS: &[char] = &[
 ];
 
 #[async_trait]
+#[allow(clippy::double_must_use)] // async_trait emits #[must_use] on already-must-use Future returns
 pub trait Storage: Send + Sync {
     /// Check if an object exists.
     async fn head_exists(&self, key: &str) -> Result<bool>;

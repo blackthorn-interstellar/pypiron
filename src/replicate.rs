@@ -5647,7 +5647,7 @@ mod tests {
             if key.starts_with(REPL_PREFIX)
                 && self
                     .refusals
-                    .fetch_update(
+                    .try_update(
                         std::sync::atomic::Ordering::SeqCst,
                         std::sync::atomic::Ordering::SeqCst,
                         |n| (n > 0).then_some(n.saturating_sub(1)),

@@ -3257,11 +3257,16 @@ def test_single_survivor_every_state_class_serves_from_one_bucket(
 
     # --- The whole service runs from bucket B alone ---
     # All three package kinds install from B's index (private, snapshot, cache).
+    # `simple/` is derived-per-bucket: selection switches immediately, then the
+    # worker rebuilds B's views from the truth it already holds. Installing
+    # before that rebuild is a 404 (`no such index`) — the same wait the
+    # /audit and /stats checks below already do.
     for pkg, wheel in (
         ("survivorpriv", priv),
         ("survivorsnap", snap),
         ("survivorcache", cached),
     ):
+        wait_for_file_in_index(server["simple"], pkg, wheel.name)
         rc, out, err = _uv_install(uv_path, uv_venv, server["simple"], f"{pkg}==1.0")
         assert rc == 0, f"{pkg} did not install from the surviving bucket:\n{out}\n{err}"
 

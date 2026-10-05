@@ -317,7 +317,7 @@ pub struct MirrorArgs {
     )]
     pub include_format: Vec<String>,
 
-    /// Include wheels whose python tag matches any of these (e.g. py3, cp311). Comma-separated or repeatable.
+    /// Include wheels whose python tag matches any of these (e.g. py3, cp311). Comma-separated or repeatable. Tag filters never drop sdists; use --include-format wheel for that.
     #[arg(
         long = "include-python-tag",
         env = "PYPIRON_INCLUDE_PYTHON_TAG",
@@ -344,7 +344,7 @@ pub struct MirrorArgs {
     )]
     pub include_platform_tag: Vec<String>,
 
-    /// Exclude wheels whose python tag matches any of these (e.g. pp* drops PyPy). Supports '*' wildcard.
+    /// Exclude wheels whose python tags all match these (e.g. pp* drops PyPy; py2 keeps py2.py3). Supports '*' wildcard.
     #[arg(
         long = "exclude-python-tag",
         env = "PYPIRON_EXCLUDE_PYTHON_TAG",
@@ -353,7 +353,7 @@ pub struct MirrorArgs {
     )]
     pub exclude_python_tag: Vec<String>,
 
-    /// Exclude wheels whose ABI tag matches any of these (e.g. pypy* drops PyPy). Supports '*' wildcard.
+    /// Exclude wheels whose ABI tags all match these (e.g. pypy* drops PyPy). Supports '*' wildcard.
     #[arg(
         long = "exclude-abi-tag",
         env = "PYPIRON_EXCLUDE_ABI_TAG",
@@ -362,7 +362,7 @@ pub struct MirrorArgs {
     )]
     pub exclude_abi_tag: Vec<String>,
 
-    /// Exclude wheels whose platform tag matches any of these (supports '*' wildcard).
+    /// Exclude wheels whose platform tags all match these: a universal2 or manylinux+musllinux wheel survives while one of its tags does. Supports '*' wildcard.
     #[arg(
         long = "exclude-platform-tag",
         env = "PYPIRON_EXCLUDE_PLATFORM_TAG",
@@ -907,7 +907,7 @@ pub struct ResolvedMirror {
     pub(crate) include_abi_tag: Vec<String>,
     pub(crate) include_platform_tag: Vec<String>,
     /// Exclusion-only wheel-tag gates (PyPy lives at python tag `pp*` / ABI
-    /// `pypy*`). Like `exclude_platform_tag`, they never gate sdists.
+    /// `pypy*`). Tag filters, include or exclude, never gate sdists.
     pub(crate) exclude_python_tag: Vec<String>,
     pub(crate) exclude_abi_tag: Vec<String>,
     pub(crate) exclude_platform_tag: Vec<String>,
@@ -1455,6 +1455,10 @@ type Cursors = HashMap<String, CursorEntry>;
 fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
     let m = &resolved.mirror;
     let mut h = Sha256::new();
+    // Bump when the *meaning* of a filter changes, so cursors keyed on the old
+    // semantics re-fetch instead of 304-skipping files they now select. v2: tag
+    // excludes need every tag on an axis to match; tag filters never gate sdists.
+    h.update(b"filters-v2\0");
     h.update(resolved.src_base.as_bytes());
     h.update([0]);
     h.update([match resolved.source_kind {
@@ -3372,42 +3376,35 @@ fn matches_mirror_inner(file: &SimpleFile, m: &ResolvedMirror, lift: Lift) -> bo
         }
     }
 
-    // Only *inclusion* filters gate non-wheels (sdists have no tags). An
-    // exclusion-only filter (e.g. --exclude-platform-tag win*) must not silently
-    // drop every sdist — an sdist can't match a platform exclusion.
-    let has_inclusion_filters = !(m.include_python_tag.is_empty()
-        && m.include_abi_tag.is_empty()
-        && m.include_platform_tag.is_empty());
-
+    // Tag filters gate wheels only: an sdist has no tags, so whether sdists are
+    // mirrored is `include_format`'s call alone. An unparseable wheel can't be
+    // shown to match an include filter, so it's dropped when one is set.
     if !is_wheel {
         // A non-wheel can still be a Windows installer (.exe/.msi/.winXX) — those
         // carry no wheel tags, so platform exclusion can't reach them.
-        if m.exclude_windows && is_windows_installer_filename(&fname) {
-            return false;
-        }
-        return !has_inclusion_filters;
+        return !(m.exclude_windows && is_windows_installer_filename(&fname));
     }
 
     let tags = match parse_wheel_tags(&file.filename) {
         Some(t) => t,
         None => {
             warn!(filename=%file.filename, "Could not parse wheel tags; skipping if inclusion filters present");
-            return !has_inclusion_filters;
+            return m.include_python_tag.is_empty()
+                && m.include_abi_tag.is_empty()
+                && m.include_platform_tag.is_empty();
         }
     };
 
-    // Exclusions first
+    // Exclusions first. A wheel installs anywhere its compressed tag set
+    // (`py2.py3`, `macosx_x86_64.macosx_arm64`) reaches, so it's dropped only
+    // when *every* tag on some axis is excluded — `macosx_*_x86_64` must not take
+    // the only universal2 wheel away from arm64 Macs.
     if m.exclude_windows && is_windows_wheel_platform(&tags) {
         return false;
     }
-    if !m.exclude_python_tag.is_empty() && tokens_match_any(&tags.python, &m.exclude_python_tag) {
-        return false;
-    }
-    if !m.exclude_abi_tag.is_empty() && tokens_match_any(&tags.abi, &m.exclude_abi_tag) {
-        return false;
-    }
-    if !m.exclude_platform_tag.is_empty()
-        && tokens_match_any(&tags.platform, &m.exclude_platform_tag)
+    if tokens_all_excluded(&tags.python, &m.exclude_python_tag)
+        || tokens_all_excluded(&tags.abi, &m.exclude_abi_tag)
+        || tokens_all_excluded(&tags.platform, &m.exclude_platform_tag)
     {
         return false;
     }
@@ -3459,6 +3456,15 @@ fn held_back_by_newer(file: &SimpleFile, m: &ResolvedMirror) -> Option<OffsetDat
     .then_some(uploaded)
 }
 
+/// True when `filters` is set and matches every token — no tag on this axis
+/// survives the exclusion.
+fn tokens_all_excluded(tokens: &[String], filters: &[String]) -> bool {
+    !filters.is_empty()
+        && tokens
+            .iter()
+            .all(|t| tokens_match_any(std::slice::from_ref(t), filters))
+}
+
 fn tokens_match_any(tokens: &[String], filters: &[String]) -> bool {
     let tokens_lc: Vec<String> = tokens.iter().map(|t| t.to_ascii_lowercase()).collect();
     for f in filters {
@@ -3499,14 +3505,14 @@ fn glob_like_contains(haystack: &str, pattern: &str) -> bool {
     true
 }
 
-/// True if a wheel's platform tags are Windows. Wheel platform tags are a fixed
+/// True if every one of a wheel's platform tags is Windows. Wheel platform tags are a fixed
 /// vocabulary (any / manylinux* / musllinux* / macosx* / win*), so a `win`
 /// prefix is unambiguous here — unlike a raw filename, where a package name can
 /// start with "win" (windrose, winnow).
 fn is_windows_wheel_platform(tags: &WheelTags) -> bool {
     tags.platform
         .iter()
-        .any(|p| p.to_ascii_lowercase().starts_with("win"))
+        .all(|p| p.to_ascii_lowercase().starts_with("win"))
 }
 
 /// True if a non-wheel filename is a Windows installer: `.exe`/`.msi` (always
@@ -3979,6 +3985,81 @@ mod tests {
             &by_abi
         ));
         assert!(matches_mirror(&named_file("foo-1.0.tar.gz"), &by_abi));
+    }
+
+    #[test]
+    fn tag_excludes_keep_multi_tag_wheels_a_kept_platform_installs() {
+        let universal2 = named_file(
+            "nh3-0.3.4-cp38-abi3-macosx_10_12_x86_64.macosx_11_0_arm64.macosx_10_12_universal2.whl",
+        );
+        let glibc_musl = named_file(
+            "maturin-0.13.7-py3-none-manylinux_2_12_x86_64.manylinux2010_x86_64.musllinux_1_1_x86_64.whl",
+        );
+        let six = named_file("six-1.16.0-py2.py3-none-any.whl");
+
+        let no_intel_mac = ResolvedMirror {
+            exclude_platform_tag: vec!["macosx_*_x86_64".into()],
+            ..base_filter()
+        };
+        assert!(matches_mirror(&universal2, &no_intel_mac));
+        assert!(!matches_mirror(
+            &named_file("foo-1.0-cp311-cp311-macosx_10_12_x86_64.whl"),
+            &no_intel_mac
+        ));
+
+        let no_mac = ResolvedMirror {
+            exclude_platform_tag: vec!["macosx_*".into()],
+            ..base_filter()
+        };
+        assert!(!matches_mirror(&universal2, &no_mac));
+
+        let no_musl = ResolvedMirror {
+            exclude_platform_tag: vec!["musllinux*".into()],
+            ..base_filter()
+        };
+        assert!(matches_mirror(&glibc_musl, &no_musl));
+
+        let no_py2 = ResolvedMirror {
+            exclude_python_tag: vec!["py2".into()],
+            ..base_filter()
+        };
+        assert!(matches_mirror(&six, &no_py2));
+        let no_py = ResolvedMirror {
+            exclude_python_tag: vec!["py2".into(), "py3".into()],
+            ..base_filter()
+        };
+        assert!(!matches_mirror(&six, &no_py));
+
+        // A Windows tag compressed with a non-Windows one still installs off Windows.
+        let no_windows = ResolvedMirror {
+            exclude_windows: true,
+            ..base_filter()
+        };
+        assert!(matches_mirror(
+            &named_file("foo-1.0-py3-none-win_amd64.manylinux_2_17_x86_64.whl"),
+            &no_windows
+        ));
+    }
+
+    #[test]
+    fn include_tag_filters_never_gate_sdists() {
+        let manylinux_only = ResolvedMirror {
+            include_platform_tag: vec!["manylinux*".into()],
+            ..base_filter()
+        };
+        assert!(matches_mirror(
+            &named_file("foo-1.0.tar.gz"),
+            &manylinux_only
+        ));
+        assert!(!matches_mirror(
+            &named_file("foo-1.0-py3-none-any.whl"),
+            &manylinux_only
+        ));
+        let wheels_only = ResolvedMirror {
+            include_format: vec![Format::Wheel],
+            ..manylinux_only
+        };
+        assert!(!matches_mirror(&named_file("foo-1.0.tar.gz"), &wheels_only));
     }
 
     #[test]

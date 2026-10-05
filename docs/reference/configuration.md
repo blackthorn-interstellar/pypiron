@@ -347,7 +347,11 @@ Rules:
   layer.
 - Excludes win.
 - `include-format` accepts `wheel`, `sdist`, and `other`.
-- Tag filters match wheel tags and support `*`.
+- Tag filters match wheel tags and support `*`. They never drop sdists; use
+  `include-format = ["wheel"]` for a wheels-only mirror.
+- An exclude tag filter drops a wheel only when none of its tags survive. A
+  universal2 macOS wheel stays under `exclude-platform-tag = ["macosx_*_x86_64"]`
+  because arm64 Macs still install it.
 - `exclude-platform-tag = ["win*", "macosx_*"]` is the usual Linux CI filter.
 - `exclude-python-below = "3.9"` drops wheels built only for older Pythons but
   keeps sdists, `py3`, and `abi3`.

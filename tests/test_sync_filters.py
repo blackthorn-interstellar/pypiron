@@ -261,25 +261,57 @@ def test_exclude_only_platform_tag_keeps_sdists(disk_server, pypiron_bin, tmp_pa
 
 
 def test_exclude_python_tag_drops_wheels_keeps_sdists(disk_server, pypiron_bin, tmp_path):
-    """--exclude-python-tag drops matching wheels (this is the `no-pypy` recipe,
-    pp*) yet leaves sdists — they carry no tag, so an exclusion can't reach them.
-    six's only wheel is py2.py3, so excluding py3 drops it and keeps the sdist."""
+    """--exclude-python-tag drops a wheel only when every python tag matches, and
+    never touches sdists. six's only wheel is py2.py3: excluding py2 alone keeps
+    it (py3 still installs it); excluding both drops it and keeps the sdist."""
+    pkg_list = _packages_list(tmp_path, f"{PACKAGE}==1.16.0")
+    common = ("--include-packages-from", str(pkg_list), "--dry-run")
+    rc, out, err = sync_to(pypiron_bin, disk_server, *common, "--exclude-python-tag", "py2")
+    assert rc == 0, f"sync failed:\n{out}\n{err}"
+    assert "would copy six-1.16.0-py2.py3-none-any.whl" in out
+
+    rc, out, err = sync_to(pypiron_bin, disk_server, *common, "--exclude-python-tag", "py2,py3")
+    assert rc == 0, f"sync failed:\n{out}\n{err}"
+    assert ".whl" not in out, "the py2.py3 wheel must be excluded"
+    assert "would copy six-1.16.0.tar.gz" in out, "the sdist must survive a tag exclusion"
+
+
+def test_exclude_platform_tag_keeps_universal2_wheel(disk_server, pypiron_bin):
+    """A wheel tagged x86_64.arm64.universal2 is the only arm64 wheel; excluding
+    Intel Macs must not take it away from Apple Silicon (issue #45)."""
+    rc, out, err = sync_to(
+        pypiron_bin,
+        disk_server,
+        "--include-package",
+        "nh3==0.3.4",
+        "--exclude-platform-tag",
+        "macosx_*_x86_64",
+        "--exclude-newer",
+        "",
+        "--dry-run",
+    )
+    assert rc == 0, f"sync failed:\n{out}\n{err}"
+    assert (
+        "would copy nh3-0.3.4-cp38-abi3-macosx_10_12_x86_64.macosx_11_0_arm64"
+        ".macosx_10_12_universal2.whl" in out
+    )
+
+
+def test_include_platform_tag_keeps_sdists(disk_server, pypiron_bin, tmp_path):
+    """Tag filters gate wheels only; sdists are include-format's call."""
     pkg_list = _packages_list(tmp_path, f"{PACKAGE}==1.16.0")
     rc, out, err = sync_to(
         pypiron_bin,
         disk_server,
         "--include-packages-from",
         str(pkg_list),
-        "--exclude-python-tag",
-        "py3",
+        "--include-platform-tag",
+        "manylinux*",
+        "--dry-run",
     )
     assert rc == 0, f"sync failed:\n{out}\n{err}"
-    pkg_dir = disk_server["data_dir"] / "packages" / PACKAGE
-    files = sorted(p.name for p in pkg_dir.iterdir() if not p.name.startswith("."))
-    assert not any(f.endswith(".whl") for f in files), "the py2.py3 wheel must be excluded"
-    assert any(f.endswith(".tar.gz") for f in files), (
-        "the sdist must survive an exclusion-only filter"
-    )
+    assert "would copy six-1.16.0.tar.gz" in out
+    assert ".whl" not in out, "the `any` wheel isn't in a manylinux allowlist"
 
 
 def test_include_format_sdist_keeps_sdists_only(disk_server, pypiron_bin, tmp_path):

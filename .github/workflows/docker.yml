@@ -108,7 +108,7 @@ jobs:
             {id:"arm64",   platform:"linux/arm64",   triple:"aarch64-unknown-linux-musl",     base:"scratch", max_mb:12},
             {id:"armv7",   platform:"linux/arm/v7",  triple:"armv7-unknown-linux-musleabihf", base:"scratch", max_mb:12},
             {id:"386",     platform:"linux/386",     triple:"i686-unknown-linux-musl",        base:"scratch", max_mb:12},
-            {id:"armv6",   platform:"linux/arm/v6",  triple:"arm-unknown-linux-musleabihf",   base:"scratch", max_mb:12},
+            {id:"armv6",   platform:"linux/arm/v6",  triple:"arm-unknown-linux-musleabihf",   base:"scratch", max_mb:12, toolchain:"1.98.1"},
             {id:"ppc64le", platform:"linux/ppc64le", triple:"powerpc64le-unknown-linux-gnu",  base:$nossl,    max_mb:18},
             {id:"s390x",   platform:"linux/s390x",   triple:"s390x-unknown-linux-gnu",        base:$nossl,    max_mb:18},
             {id:"riscv64", platform:"linux/riscv64", triple:"riscv64gc-unknown-linux-gnu",    base:$nossl,    max_mb:18}
@@ -152,8 +152,12 @@ jobs:
         shell: bash
         run: echo "PYPIRON_GIT_HASH=${GITHUB_SHA::7}" >> "$GITHUB_ENV"
 
+      # armv6 is held at 1.98.1: Rust 1.99.0's std references `__aeabi_uread4`,
+      # which nothing in the zig musl link provides on ARMv6. Retry stable on
+      # each Rust release (and drop the pin in ci.yml's binary-armv6 with it).
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
+          toolchain: ${{ matrix.toolchain || 'stable' }}
           targets: ${{ matrix.triple }}
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:

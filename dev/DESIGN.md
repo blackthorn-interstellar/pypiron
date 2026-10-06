@@ -110,6 +110,11 @@ requests instead of ~$11 of GETs per old-style sweep. `pypiron rebuild-index` is
 same pass with fingerprints ignored — the rebuild-the-world button. `pypiron
 verify` is its read-only twin: recompute everything, diff, exit nonzero.
 
+The fingerprint is salted with `render::RENDER_VERSION`. A change to the bytes
+a package view renders to bumps it (a unit test pins the output), so the boot
+audit after an upgrade or rollback re-renders every package once. Without the
+salt an unchanged package would keep the previous binary's render forever.
+
 ## Tamper-evident checkpoints
 
 Every integrity check the server runs — audit fingerprints, `verify-index`,

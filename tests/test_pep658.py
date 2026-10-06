@@ -58,7 +58,8 @@ def test_metadata_file_served(metadata_server):
 def test_index_advertises_core_metadata_and_requires_python(metadata_server):
     (entry,) = metadata_server["package_index"]["files"]
     assert entry["core-metadata"] is True
-    assert entry["dist-info-metadata"] is True
+    # PEP 714: JSON drops the old name, which pip 22.3–23.1 crash on.
+    assert "dist-info-metadata" not in entry
     assert entry["requires-python"] == ">=2.7"
 
     _, body, _ = http_get(f"{metadata_server['simple']}{PACKAGE}/")

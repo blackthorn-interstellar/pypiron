@@ -93,6 +93,21 @@ def _store_env(store: Dict, bind: str) -> Dict[str, str]:
     return _s3_env(store["minio"], bind)
 
 
+def _wait_first_sweep(metrics_url: str) -> None:
+    """Views are a regenerable render of truth, and the render may differ
+    between releases. The startup reconcile re-renders them in this binary's
+    shape, so `verify-index` holds once a binary has booted and swept, not
+    before; wait for that sweep so every leg ends converged."""
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        _, body, _ = http_get(metrics_url)
+        for line in body.decode().splitlines():
+            if line.startswith("pypiron_reconcile_sweeps_total ") and float(line.split()[1]) >= 1:
+                return
+        time.sleep(0.2)
+    raise TimeoutError(f"no reconcile sweep completed within 30s ({metrics_url})")
+
+
 @contextlib.contextmanager
 def _serve(bin_path: Path, store: Dict) -> Iterator[Dict]:
     port = find_free_port()
@@ -122,6 +137,7 @@ def _serve(bin_path: Path, store: Dict) -> Iterator[Dict]:
         try:
             wait_http_responding(f"http://{bind}/simple/index.json", timeout=30.0)
             assert proc.poll() is None, f"server exited at startup; log: {log_path}"
+            _wait_first_sweep(f"http://{bind}/metrics")
             yield {
                 "base_url": f"http://{bind}",
                 "legacy": f"http://{bind}/legacy/",
@@ -240,9 +256,13 @@ def test_upgrade_then_rollback_serves_everything(
         yanked["upgrade_alpha-1.1.0-py3-none-any.whl"] = "broken build"
         _set_project_status(old, "upgrade-beta", {"status": "archived", "reason": "superseded"})
         _assert_serves(old, published, yanked)  # also records downloads
+    # Reboot once so the boot sweep fingerprints every package, as on any server
+    # that has been up a while: an upgrade must re-render views a sweep would
+    # otherwise skip as unchanged.
+    with _serve(old_bin, store):
+        pass
 
     # 2. The binary under test takes over the same store.
-    _verify_index(pypiron_bin, store)
     with _serve(pypiron_bin, store) as new:
         _assert_serves(new, published, yanked)
         assert get_index_json(new["simple"], "upgrade-beta")["project-status"] == {
@@ -278,9 +298,9 @@ def test_upgrade_then_rollback_serves_everything(
     _verify_index(pypiron_bin, store)
 
     # 3. Rollback: the released binary reads everything the new one wrote.
-    _verify_index(old_bin, store)
     with _serve(old_bin, store) as rolled_back:
         _assert_serves(rolled_back, published, yanked)
+    _verify_index(old_bin, store)
     if store["minio"] is not None:
         return
     assert not (store["data_dir"] / "_format").exists(), (

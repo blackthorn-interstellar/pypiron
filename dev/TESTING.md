@@ -69,6 +69,15 @@ Markers (`pyproject.toml`): `integration`, `s3` (needs Docker/MinIO), `azure`
 Tests that prove behavior through a real client binary carry
 `@pytest.mark.compat(client, feature)`. Run `make compat` to execute those tests.
 
+pip gets a wider net on every PR: `test_pip_versions_install` runs the official
+`python:X.Y-slim` images and installs from the server with every CPython from
+2.7 to 3.14, three ways: the pip a fresh `python -m venv` bundles (what most
+users run; 3.7–3.10 still bundle 23.0.1), the newest pip that Python supports,
+and every pip minor since 9.0 (Nov 2016).
+Old pips speak only the HTML simple API and must honor `Requires-Python`
+there; pip 22.3–23.1 crash on a JSON `dist-info-metadata` key (PEP 714).
+It needs Docker and skips without it.
+
 ## Key scenarios
 
 - **Round trip**: upload a real wheel → appears in package + global index →

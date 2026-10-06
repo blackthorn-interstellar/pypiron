@@ -625,14 +625,16 @@ def make_wheel(
     metadata_extra: str = "",
     description: str = "",
     payload_bytes: int = 0,
+    python_tag: str = "py3",
 ) -> Path:
     """A minimal valid wheel. `payload_bytes` pads it with that many bytes of
     incompressible data, for tests that need a wheel of a realistic size (the
-    proxy's streaming threshold, for one) without downloading a real one."""
+    proxy's streaming threshold, for one) without downloading a real one.
+    `python_tag` is the wheel's compressed python tag (`py2.py3` installs on 2.7)."""
     safe_name = re.sub(r"[^A-Za-z0-9.]+", "_", name).strip("_")
     module_name = re.sub(r"\W+", "_", name).strip("_").lower()
     dist_info = f"{safe_name}-{version}.dist-info"
-    wheel_path = dest_dir / f"{safe_name}-{version}-py3-none-any.whl"
+    wheel_path = dest_dir / f"{safe_name}-{version}-{python_tag}-none-any.whl"
     metadata = (
         "Metadata-Version: 2.1\n"
         f"Name: {name}\n"
@@ -654,7 +656,7 @@ def make_wheel(
             "Wheel-Version: 1.0\n"
             "Generator: pypiron-tests\n"
             "Root-Is-Purelib: true\n"
-            "Tag: py3-none-any\n"
+            + "".join(f"Tag: {tag}-none-any\n" for tag in python_tag.split("."))
         ).encode(),
     }
 

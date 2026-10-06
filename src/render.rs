@@ -15,6 +15,13 @@ use crate::status::ProjectStatusDoc;
 /// status markers.
 const API_VERSION: &str = "1.4";
 
+/// Bump whenever the bytes the per-package renderers emit change. The audit
+/// sweep salts its stored fingerprints with this, so the first sweep after an
+/// upgrade (or a rollback) re-renders every package instead of skipping the
+/// unchanged ones and serving the old shape forever. `render_version_tracks_output`
+/// fails until the bump is made. 2: JSON drops `dist-info-metadata` (PEP 714).
+pub const RENDER_VERSION: u32 = 2;
+
 /// PEP 691 JSON simple-API content type (response, outgoing/incoming Accept).
 pub const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 /// PEP 503 HTML simple-API content type.
@@ -184,10 +191,12 @@ struct Pep691File {
     yanked: Yanked,
     #[serde(rename = "requires-python", skip_serializing_if = "Option::is_none")]
     requires_python: Option<String>,
+    // PEP 714: JSON carries only the new name. pip 22.3–23.1 read the old
+    // `dist-info-metadata` key as a string and crash on anything else, so
+    // emitting it breaks them; HTML keeps both names because there the value
+    // is a string every pip parses.
     #[serde(rename = "core-metadata", skip_serializing_if = "Option::is_none")]
     core_metadata: Option<bool>,
-    #[serde(rename = "dist-info-metadata", skip_serializing_if = "Option::is_none")]
-    dist_info_metadata: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<String>,
 }
@@ -244,7 +253,6 @@ pub fn pep691_project_json(
                 yanked: f.yanked.clone(),
                 requires_python: f.requires_python.clone(),
                 core_metadata: f.core_metadata.then_some(true),
-                dist_info_metadata: f.core_metadata.then_some(true),
                 provenance: f
                     .provenance
                     .then(|| format!("/files/{package}/{}.provenance", f.filename)),
@@ -456,7 +464,7 @@ mod tests {
             serde_json::from_str(&pep691_project_json("six", &[m], &active())).unwrap();
         assert_eq!(doc["files"][0]["requires-python"], ">=3.9");
         assert_eq!(doc["files"][0]["core-metadata"], true);
-        assert_eq!(doc["files"][0]["dist-info-metadata"], true);
+        assert!(doc["files"][0].get("dist-info-metadata").is_none());
 
         let plain = meta(None);
         let doc: serde_json::Value =
@@ -580,5 +588,34 @@ mod tests {
         let doc: serde_json::Value =
             serde_json::from_str(&pep691_project_json("six", &[m], &active())).unwrap();
         assert_eq!(doc["files"][0]["upload-time"], "2026-06-11T00:00:00Z");
+    }
+
+    #[test]
+    fn render_version_tracks_output() {
+        use sha2::{Digest, Sha256};
+        let mut m = meta(Some("1.16.0"));
+        m.requires_python = Some(">=3.9".into());
+        m.core_metadata = true;
+        m.provenance = true;
+        m.yanked = Yanked::Reason("broken".into());
+        let status = ProjectStatusDoc {
+            status: crate::status::ProjectStatus::Archived,
+            reason: Some("superseded".into()),
+        };
+        let files = [m, meta(None)];
+        let mut hasher = Sha256::new();
+        for page in [&active(), &status].map(|status| {
+            pep503_project_html("six", &files, status) + &pep691_project_json("six", &files, status)
+        }) {
+            hasher.update(page);
+        }
+        // Changed the package-view renderers? Bump RENDER_VERSION, then this digest.
+        assert_eq!(
+            (RENDER_VERSION, format!("{:x}", hasher.finalize())),
+            (
+                2,
+                "bfca8a9501801b4a2d29aadb7cbbe7b7428db69a206dd0ef70d6a0e2b7ee3c09".into()
+            )
+        );
     }
 }

@@ -18,6 +18,11 @@ uv, pip, and twine run on every pull request. The
 [weekly compatibility matrix](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#client-compatibility-matrix)
 runs all eight clients against disk and records their exact versions.
 
+Old pip gets its own check on every pull request: an install with every pip
+release line since 9.0 (2016), and on every Python from 2.7 to 3.14 with both
+the pip a fresh virtual environment ships and the newest pip that Python
+supports.
+
 ## Every PyPI filename
 
 The parser corpus contains all 17,130,626 filenames published to PyPI when the

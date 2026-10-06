@@ -2415,9 +2415,11 @@ fn key_package<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
 /// Hash of everything a package's views are derived from, as observed in a
 /// flat listing: truth objects (artifacts decide membership, sidecar etags
 /// carry yank/metadata changes) plus the view objects themselves (so
-/// out-of-band view deletion or tampering is also caught).
+/// out-of-band view deletion or tampering is also caught). Salted with the
+/// render version: a binary that renders differently must not trust another's.
 fn fingerprint(truth: &[&ObjectMeta], views: &[&ObjectMeta]) -> String {
     let mut hasher = Sha256::new();
+    hasher.update(crate::render::RENDER_VERSION.to_le_bytes());
     for obj in truth.iter().chain(views.iter()) {
         hasher.update(&obj.key);
         hasher.update(obj.size.to_le_bytes());

@@ -122,6 +122,12 @@ who signed those bytes; it does not prove that the publisher is trustworthy or
 the package is safe. pypiron relays public provenance but does not mint
 attestations for private uploads.
 
+### Clients check what they download
+
+Every package listing carries the SHA-256 of each file and of each wheel's
+metadata file, the same way PyPI does. pip and uv check both, so a file altered
+in storage after it was listed is refused at install time.
+
 ## Vulnerability audit
 
 Malware is blocked. Ordinary vulnerabilities are reported because refusing an

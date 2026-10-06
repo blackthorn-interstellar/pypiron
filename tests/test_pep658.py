@@ -6,6 +6,7 @@ The end-to-end proof: uv resolves dependencies by fetching
 
 from __future__ import annotations
 
+import hashlib
 import re
 
 import pytest
@@ -56,16 +57,21 @@ def test_metadata_file_served(metadata_server):
 
 
 def test_index_advertises_core_metadata_and_requires_python(metadata_server):
+    wheel_name = metadata_server["wheel_path"].name
+    _, served, _ = http_get(f"{metadata_server['base_url']}/files/{PACKAGE}/{wheel_name}.metadata")
+    digest = hashlib.sha256(served).hexdigest()
+
     (entry,) = metadata_server["package_index"]["files"]
-    assert entry["core-metadata"] is True
+    # The digest of the exact bytes served, as PyPI publishes it.
+    assert entry["core-metadata"] == {"sha256": digest}
     # PEP 714: JSON drops the old name, which pip 22.3–23.1 crash on.
     assert "dist-info-metadata" not in entry
     assert entry["requires-python"] == ">=2.7"
 
     _, body, _ = http_get(f"{metadata_server['simple']}{PACKAGE}/")
     html = body.decode("utf-8")
-    assert 'data-core-metadata="true"' in html
-    assert 'data-dist-info-metadata="true"' in html
+    assert f'data-core-metadata="sha256={digest}"' in html
+    assert f'data-dist-info-metadata="sha256={digest}"' in html
     assert 'data-requires-python="&gt;=2.7"' in html
 
 

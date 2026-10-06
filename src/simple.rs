@@ -79,6 +79,9 @@ impl SimpleFile {
             yanked: self.yanked.clone(),
             requires_python: self.requires_python.clone(),
             core_metadata: self.has_core_metadata(),
+            // Passed through: the proxy fetches exactly these bytes and checks
+            // them against this digest before serving them.
+            core_metadata_sha256: self.core_metadata_sha256().map(str::to_ascii_lowercase),
             provenance: self.provenance.is_some(),
         }
     }

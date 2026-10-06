@@ -20,7 +20,8 @@ const API_VERSION: &str = "1.4";
 /// upgrade (or a rollback) re-renders every package instead of skipping the
 /// unchanged ones and serving the old shape forever. `render_version_tracks_output`
 /// fails until the bump is made. 2: JSON drops `dist-info-metadata` (PEP 714).
-pub const RENDER_VERSION: u32 = 2;
+/// 3: core metadata publishes its sha256.
+pub const RENDER_VERSION: u32 = 3;
 
 /// PEP 691 JSON simple-API content type (response, outgoing/incoming Accept).
 pub const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
@@ -43,19 +44,23 @@ pub struct FileMetadata {
     pub requires_python: Option<String>,
     /// Whether a PEP 658 `<filename>.metadata` companion exists.
     pub core_metadata: bool,
+    /// SHA-256 of that companion's bytes, published so clients can check it the
+    /// way PyPI lets them. `None` with `core_metadata` renders the bare `true`.
+    pub core_metadata_sha256: Option<String>,
     /// Whether a PEP 740 `<filename>.provenance` companion exists.
     pub provenance: bool,
 }
 
 impl FileMetadata {
-    /// Build an index entry from an artifact's sidecar. `core_metadata` and
-    /// `provenance` are whether the `<filename>.metadata` / `.provenance`
-    /// companions exist. The worker and `verify` both derive index entries this
-    /// exact way — keep them in lockstep by routing through here.
+    /// Build an index entry from an artifact's sidecar. `core_metadata_sha256`
+    /// is the hash of the `<filename>.metadata` companion, if one exists;
+    /// `provenance` is whether `.provenance` does. The worker and `verify` both
+    /// derive index entries this exact way — keep them in lockstep by routing
+    /// through here.
     pub fn from_sidecar(
         filename: &str,
         sc: Sidecar,
-        core_metadata: bool,
+        core_metadata_sha256: Option<String>,
         provenance: bool,
     ) -> Self {
         Self {
@@ -70,7 +75,8 @@ impl FileMetadata {
             version: Some(sc.version).filter(|v| !v.is_empty()),
             yanked: sc.yanked,
             requires_python: sc.requires_python,
-            core_metadata,
+            core_metadata: core_metadata_sha256.is_some(),
+            core_metadata_sha256,
             provenance,
         }
     }
@@ -135,7 +141,13 @@ pub fn pep503_project_html(
         }
         if f.core_metadata {
             // PEP 714 name plus the original PEP 658 name for older clients.
-            attrs.push_str(r#" data-core-metadata="true" data-dist-info-metadata="true""#);
+            let value = match &f.core_metadata_sha256 {
+                Some(sha) => encode_double_quoted_attribute(&format!("sha256={sha}")).into_owned(),
+                None => "true".to_string(),
+            };
+            attrs.push_str(&format!(
+                r#" data-core-metadata="{value}" data-dist-info-metadata="{value}""#
+            ));
         }
         if f.provenance {
             // PEP 740: point at the provenance companion served next to the
@@ -196,7 +208,7 @@ struct Pep691File {
     // emitting it breaks them; HTML keeps both names because there the value
     // is a string every pip parses.
     #[serde(rename = "core-metadata", skip_serializing_if = "Option::is_none")]
-    core_metadata: Option<bool>,
+    core_metadata: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     provenance: Option<String>,
 }
@@ -252,7 +264,10 @@ pub fn pep691_project_json(
                 upload_time: f.upload_time.clone(),
                 yanked: f.yanked.clone(),
                 requires_python: f.requires_python.clone(),
-                core_metadata: f.core_metadata.then_some(true),
+                core_metadata: f.core_metadata.then(|| match &f.core_metadata_sha256 {
+                    Some(sha) => serde_json::json!({ "sha256": sha }),
+                    None => serde_json::Value::Bool(true),
+                }),
                 provenance: f
                     .provenance
                     .then(|| format!("/files/{package}/{}.provenance", f.filename)),
@@ -356,6 +371,7 @@ mod tests {
             yanked: Yanked::Flag(false),
             requires_python: None,
             core_metadata: false,
+            core_metadata_sha256: None,
             provenance: false,
         }
     }
@@ -474,6 +490,25 @@ mod tests {
     }
 
     #[test]
+    fn core_metadata_publishes_its_sha256() {
+        let mut m = meta(Some("1.16.0"));
+        m.core_metadata = true;
+        m.core_metadata_sha256 = Some("5620".into());
+
+        let html = pep503_project_html("six", &[m.clone()], &active());
+        assert!(html.contains(r#"data-core-metadata="sha256=5620""#));
+        assert!(html.contains(r#"data-dist-info-metadata="sha256=5620""#));
+
+        let doc: serde_json::Value =
+            serde_json::from_str(&pep691_project_json("six", &[m], &active())).unwrap();
+        assert_eq!(
+            doc["files"][0]["core-metadata"],
+            serde_json::json!({"sha256": "5620"})
+        );
+        assert!(doc["files"][0].get("dist-info-metadata").is_none());
+    }
+
+    #[test]
     fn provenance_renders_in_html_and_json() {
         let mut m = meta(Some("1.16.0"));
         m.provenance = true;
@@ -565,7 +600,7 @@ mod tests {
             let m = FileMetadata::from_sidecar(
                 "six-1.16.0-py2.py3-none-any.whl",
                 sidecar(blank),
-                false,
+                None,
                 false,
             );
             assert_eq!(m.upload_time, None);
@@ -582,7 +617,7 @@ mod tests {
         let m = FileMetadata::from_sidecar(
             "six-1.16.0-py2.py3-none-any.whl",
             sidecar("2026-06-11T00:00:00Z"),
-            false,
+            None,
             false,
         );
         let doc: serde_json::Value =
@@ -596,6 +631,7 @@ mod tests {
         let mut m = meta(Some("1.16.0"));
         m.requires_python = Some(">=3.9".into());
         m.core_metadata = true;
+        m.core_metadata_sha256 = Some("5620".into());
         m.provenance = true;
         m.yanked = Yanked::Reason("broken".into());
         let status = ProjectStatusDoc {
@@ -613,8 +649,8 @@ mod tests {
         assert_eq!(
             (RENDER_VERSION, format!("{:x}", hasher.finalize())),
             (
-                2,
-                "bfca8a9501801b4a2d29aadb7cbbe7b7428db69a206dd0ef70d6a0e2b7ee3c09".into()
+                3,
+                "1e7d56cc3bb38161dbc438ed8f572e9f1351b23a55fb501430264261cfde600a".into()
             )
         );
     }

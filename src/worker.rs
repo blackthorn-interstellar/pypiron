@@ -4048,8 +4048,15 @@ async fn list_artifacts_for_claim(
             Some((filename, e.etag.as_deref()?))
         })
         .collect();
+    let metadata_etags: HashMap<&str, &str> = entries
+        .iter()
+        .filter_map(|e| {
+            let filename = e.key.strip_prefix(&prefix)?.strip_suffix(METADATA_SUFFIX)?;
+            Some((filename, e.etag.as_deref()?))
+        })
+        .collect();
     let memo = sidecars.take(storage, pkg);
-    let fresh = Mutex::new(PackageSidecars::with_capacity(sidecar_etags.len()));
+    let fresh = Mutex::new(PackageSidecars::default());
     // Read the package claim once. Besides typing a legacy sidecar backfill, it
     // suppresses a typed mirror record that finished after the claim became
     // private. Such bytes remain inert until replication quarantines them; they
@@ -4058,6 +4065,7 @@ async fn list_artifacts_for_claim(
     for chunk in artifacts.chunks(SIDECAR_READ_CONCURRENCY) {
         let loaded = futures::future::join_all(chunk.iter().map(|(entry, filename)| {
             let etag = sidecar_etags.get(filename).copied();
+            let metadata_etag = metadata_etags.get(filename).copied();
             load_file_metadata(
                 storage,
                 entry,
@@ -4068,9 +4076,17 @@ async fn list_artifacts_for_claim(
                 SidecarMemo {
                     etag,
                     known: etag.and_then(|etag| {
-                        memo.get(*filename)
+                        memo.sidecars
+                            .get(*filename)
                             .filter(|(seen, _)| seen == etag)
                             .map(|(_, sc)| sc)
+                    }),
+                    metadata_etag,
+                    known_metadata: metadata_etag.and_then(|etag| {
+                        memo.metadata
+                            .get(*filename)
+                            .filter(|(seen, _)| seen == etag)
+                            .map(|(_, sha)| sha.as_str())
                     }),
                     fresh: &fresh,
                 },
@@ -4100,6 +4116,9 @@ async fn list_artifacts_for_claim(
 struct SidecarMemo<'a> {
     etag: Option<&'a str>,
     known: Option<&'a Sidecar>,
+    /// The same pair for the `.metadata` companion's sha256.
+    metadata_etag: Option<&'a str>,
+    known_metadata: Option<&'a str>,
     fresh: &'a Mutex<PackageSidecars>,
 }
 
@@ -4137,6 +4156,7 @@ async fn load_file_metadata(
             memo.fresh
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
+                .sidecars
                 .insert(filename.to_string(), (etag.to_string(), sc.clone()));
         }
         sc
@@ -4158,14 +4178,48 @@ async fn load_file_metadata(
         warn!(key=%entry.key, "quarantined mirror artifact remains non-private; omitting from index");
         return Ok(None);
     }
-    let core_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
+    let core_metadata_sha256 = if names.contains(format!("{filename}{METADATA_SUFFIX}").as_str()) {
+        match memo.known_metadata {
+            Some(sha) => Some(sha.to_string()),
+            None => read_metadata_sha256(storage, &entry.key).await?,
+        }
+    } else {
+        None
+    };
+    if let (Some(etag), Some(sha)) = (memo.metadata_etag, &core_metadata_sha256) {
+        memo.fresh
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .metadata
+            .insert(filename.to_string(), (etag.to_string(), sha.clone()));
+    }
     let provenance = names.contains(format!("{filename}{PROVENANCE_SUFFIX}").as_str());
     Ok(Some(FileMetadata::from_sidecar(
         filename,
         sc,
-        core_metadata,
+        core_metadata_sha256,
         provenance,
     )))
+}
+
+/// The sha256 of an artifact's listed `.metadata` companion — the PEP 658/714
+/// digest the index publishes. Hashed from the bytes clients will fetch, so the
+/// two can never disagree. `Ok(None)`: the companion vanished between listing
+/// and read, so the index must not advertise it; `Err`: an availability
+/// failure, which fails the rebuild like a sidecar read does.
+pub(crate) async fn read_metadata_sha256(
+    storage: &dyn Storage,
+    artifact_key: &str,
+) -> Result<Option<String>> {
+    let key = crate::sidecar::metadata_key(artifact_key);
+    match storage.get_bytes(&key).await {
+        Ok(bytes) => Ok(Some(crate::hash::sha256_hex(&bytes))),
+        Err(e) if is_not_found(&e) => {
+            warn!(key=%artifact_key, "metadata companion vanished before read; not advertising it");
+            Ok(None)
+        }
+        Err(e) => Err(e).with_context(|| format!("reading {key}")),
+    }
 }
 
 /// Read a sidecar a listing said exists, distinguishing the outcomes a rebuild

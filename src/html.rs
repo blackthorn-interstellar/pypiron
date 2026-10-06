@@ -1403,6 +1403,7 @@ mod tests {
             yanked: Yanked::Flag(false),
             requires_python: None,
             core_metadata: false,
+            core_metadata_sha256: None,
             provenance: false,
         }
     }

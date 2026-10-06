@@ -27,6 +27,10 @@
 //!   the reads the memo would have saved.
 //! - **RAM only**: nothing is persisted, so upgrades and rollbacks start cold
 //!   and there is no format to migrate.
+//!
+//! The same memo holds the sha256 of each `.metadata` companion, which the
+//! index publishes (PEP 658/714). It is derived from the companion's bytes, not
+//! stored, so it is memoized the same way: keyed by the companion's detector.
 
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -34,8 +38,25 @@ use std::sync::Mutex;
 use crate::sidecar::Sidecar;
 use crate::storage::Storage;
 
-/// Artifact filename → (listing change detector of its sidecar, parsed sidecar).
-pub type PackageSidecars = HashMap<String, (String, Sidecar)>;
+/// One package's memo. Each entry is keyed by artifact filename and holds the
+/// listing change detector its value was read under.
+#[derive(Default)]
+pub struct PackageSidecars {
+    /// (sidecar's detector, parsed sidecar).
+    pub sidecars: HashMap<String, (String, Sidecar)>,
+    /// (`.metadata` companion's detector, sha256 of its bytes).
+    pub metadata: HashMap<String, (String, String)>,
+}
+
+impl PackageSidecars {
+    pub fn len(&self) -> usize {
+        self.sidecars.len() + self.metadata.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
 
 /// Files memoized across all packages before the memo is dropped. A sidecar
 /// parses to a few hundred bytes, so this is tens of MB at worst — and it holds
@@ -72,7 +93,7 @@ impl SidecarCache {
                 inner.files -= memo.len();
                 memo
             }
-            None => PackageSidecars::new(),
+            None => PackageSidecars::default(),
         }
     }
 
@@ -105,9 +126,12 @@ mod tests {
             r#"{"sha256":"ab","size":1,"version":"1","upload-time":"2026-01-01T00:00:00Z"}"#,
         )
         .unwrap();
-        (0..n)
-            .map(|i| (format!("f{i}"), (format!("e{i}"), sc.clone())))
-            .collect()
+        PackageSidecars {
+            sidecars: (0..n)
+                .map(|i| (format!("f{i}"), (format!("e{i}"), sc.clone())))
+                .collect(),
+            metadata: HashMap::new(),
+        }
     }
 
     #[test]

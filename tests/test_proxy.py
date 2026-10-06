@@ -281,6 +281,8 @@ def test_metadata_passthrough_does_not_cache_the_wheel(proxy_pair, tmp_path):
     code, body, _ = http_get(f"{proxy['base_url']}/files/mdpass/{wheel.name}.metadata")
     assert code == 200
     assert b"Metadata-Version" in body
+    # The upstream's digest passes through, and it names the bytes served.
+    assert entry["core-metadata"] == {"sha256": hashlib.sha256(body).hexdigest()}
     pkg_dir = proxy["data_dir"] / "packages" / "mdpass"
     assert not (pkg_dir / wheel.name).exists()
     assert not (pkg_dir / f"{wheel.name}.metadata").exists()

@@ -9,6 +9,7 @@ this is the blackbox proof over real HTTP.
 
 from __future__ import annotations
 
+import hashlib
 import zipfile
 from concurrent.futures import ThreadPoolExecutor
 
@@ -85,9 +86,9 @@ def test_wheel_at_the_cap_still_yields_metadata(disk_server, tmp_path):
     index = _publish(disk_server, wheel, "capfine")
 
     (entry,) = index["files"]
-    assert entry["core-metadata"] is True
     code, body, _ = http_get(f"{disk_server['base_url']}/files/capfine/{wheel.name}.metadata")
     assert code == 200
+    assert entry["core-metadata"] == {"sha256": hashlib.sha256(body).hexdigest()}
     assert b"Name: capfine" in body
 
 
@@ -97,9 +98,9 @@ def test_ordinary_wheel_is_untouched(disk_server, tmp_path):
     index = _publish(disk_server, wheel, "capplain")
 
     (entry,) = index["files"]
-    assert entry["core-metadata"] is True
     code, body, _ = http_get(f"{disk_server['base_url']}/files/capplain/{wheel.name}.metadata")
     assert code == 200
+    assert entry["core-metadata"] == {"sha256": hashlib.sha256(body).hexdigest()}
     assert b"Name: capplain" in body
 
 

@@ -292,10 +292,20 @@ async fn check_package(
     for chunk in artifacts.chunks(SIDECAR_READ_CONCURRENCY) {
         let reads = chunk.iter().map(|(_, filename)| {
             let key = format!("{prefix}{filename}{SIDECAR_SUFFIX}");
-            async move { storage.get_bytes(&key).await }
+            let artifact = format!("{prefix}{filename}");
+            let has_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
+            async move {
+                let sidecar = storage.get_bytes(&key).await;
+                let metadata = if has_metadata {
+                    crate::worker::read_metadata_sha256(storage, &artifact).await
+                } else {
+                    Ok(None)
+                };
+                (sidecar, metadata)
+            }
         });
         let loaded = futures::future::join_all(reads).await;
-        for ((meta, filename), bytes) in chunk.iter().zip(loaded) {
+        for ((meta, filename), (bytes, core_metadata_sha256)) in chunk.iter().zip(loaded) {
             let bytes = match bytes {
                 Ok(b) => b,
                 Err(e) if is_not_found(&e) => {
@@ -358,12 +368,12 @@ async fn check_package(
                 suppressed += 1;
                 continue;
             }
-            let core_metadata = names.contains(format!("{filename}{METADATA_SUFFIX}").as_str());
+            let core_metadata_sha256 = core_metadata_sha256?;
             let provenance = names.contains(format!("{filename}{PROVENANCE_SUFFIX}").as_str());
             files.push(FileMetadata::from_sidecar(
                 filename,
                 sc,
-                core_metadata,
+                core_metadata_sha256,
                 provenance,
             ));
         }

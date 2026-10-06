@@ -310,8 +310,9 @@ ENDPOINTS: list = [
         expect=(200, 201),
         mutates=True,
         target="probe",
-        cold_ops={"read": 11, "write": 11, "list": 2, "delete": 1},
-        warm_ops={"read": 11, "write": 11, "list": 2, "delete": 1},
+        # +1 read: the rebuild hashes the new wheel's `.metadata` for the index.
+        cold_ops={"read": 12, "write": 11, "list": 2, "delete": 1},
+        warm_ops={"read": 12, "write": 11, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(

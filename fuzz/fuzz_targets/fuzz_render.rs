@@ -99,6 +99,8 @@ fn carve(u: &mut Unstructured) -> (String, FileMetadata) {
         yanked,
         requires_python: Option::<String>::arbitrary(u).unwrap_or(None),
         core_metadata: bool::arbitrary(u).unwrap_or(false),
+        // Proxied listings pass an upstream digest through into an attribute.
+        core_metadata_sha256: Option::<String>::arbitrary(u).unwrap_or(None),
         provenance: bool::arbitrary(u).unwrap_or(false),
     };
     (pkg, fm)

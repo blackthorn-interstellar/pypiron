@@ -101,7 +101,7 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
-      - uses: trufflesecurity/trufflehog@6f3c981e7b77f235fd2702dd74af25fc4b72bf11 # v3.96.0
+      - uses: trufflesecurity/trufflehog@363923b901c911a9164f50b6c423f47c15372b1c # v3.97.4
         with:
           # The action defaults `version:` to `latest`, which means the engine
           # this job runs changes under it with no commit here. Pin it: a scanner
@@ -149,7 +149,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: 0.12.6
           enable-cache: false
@@ -175,7 +175,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Scan lockfiles
-        uses: google/osv-scanner-action/osv-scanner-action@9a498708959aeaef5ef730655706c5a1df1edbc2 # v2.3.8
+        uses: google/osv-scanner-action/osv-scanner-action@6e4298ebc4db23e847df9b2e2de2939d6f066c67 # v2.5.1
         with:
           # Cargo.lock, fuzz/Cargo.lock, and uv.lock. v2 dropped --skip-git and
           # already excludes .git by default.
@@ -235,7 +235,7 @@ jobs:
       # scan itself still runs and still gates via `exit-code: 1`.
       - name: Upload Trivy SARIF
         if: ${{ always() && !github.event.repository.private && hashFiles('trivy.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           sarif_file: trivy.sarif
           category: trivy
@@ -268,7 +268,7 @@ jobs:
         with:
           persist-credentials: false
       - name: Initialize CodeQL
-        uses: github/codeql-action/init@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        uses: github/codeql-action/init@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           languages: ${{ matrix.language }}
           # security-extended catches more of what commercial SAST reports.
@@ -278,9 +278,9 @@ jobs:
           # Excludes tests/ — harness noise, not shipped code. See the file.
           config-file: ./.github/codeql/codeql-config.yml
       - name: Autobuild
-        uses: github/codeql-action/autobuild@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        uses: github/codeql-action/autobuild@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
       - name: Analyze
-        uses: github/codeql-action/analyze@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        uses: github/codeql-action/analyze@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           category: '/language:${{ matrix.language }}'
 
@@ -365,7 +365,7 @@ jobs:
       # Fork PRs skip the upload — read-only token, see the Trivy note above.
       - name: Upload Semgrep SARIF
         if: ${{ always() && !github.event.repository.private && hashFiles('semgrep.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           sarif_file: semgrep.sarif
           category: semgrep
@@ -381,7 +381,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           version: 0.12.6
           enable-cache: false
@@ -509,7 +509,7 @@ jobs:
           # this job's rights should change only when this line does. Leading
           # `v` required: the action builds the download URL from it verbatim.
           snyk-version: v1.1307.0
-      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         if: env.SNYK_CONFIGURED == 'true'
         with:
           version: 0.12.6
@@ -595,13 +595,13 @@ jobs:
       # security events. The scans above still gate in both cases.
       - name: Upload Snyk OSS SARIF
         if: ${{ always() && env.SNYK_CONFIGURED == 'true' && !github.event.repository.private && hashFiles('snyk-oss.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           sarif_file: snyk-oss.sarif
           category: snyk-oss
       - name: Upload Snyk Code SARIF
         if: ${{ always() && env.SNYK_CONFIGURED == 'true' && !github.event.repository.private && hashFiles('snyk-code.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository) }}
-        uses: github/codeql-action/upload-sarif@f205ea1c3313d32999d8d6a48b4f6530d4437b38 # v4.37.4
+        uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           sarif_file: snyk-code.sarif
           category: snyk-code

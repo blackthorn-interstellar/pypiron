@@ -1202,11 +1202,20 @@ wheels = [
 
 [[package]]
 name = "wcwidth"
-version = "0.8.4"
+version = "0.9.0"
 source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/3d/7a/f98d4ada7c499565ab0c0fcef28a4e54fafa72b8228a6309803c80493c92/wcwidth-0.8.4.tar.gz", hash = "sha256:2dae09efa25253ae2874188e86d6861af3b1652aef4118cdf3f0bda288a957fb", size = 414609, upload-time = "2026-09-17T23:31:45.287Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/cc/9c0adc5861020de426ec71716b6c1bef8d90694b7d6d0a16202cdb1647f5/wcwidth-0.8.4-py3-none-any.whl", hash = "sha256:2097bb1d28a0ba8fe177c2eb607317f9b1627b03f33ebebfd3da670b337a65ba", size = 299474, upload-time = "2026-09-17T23:31:43.816Z" },
+    { url = "https://files.pythonhosted.org/packages/e6/82/e59847cba534fe8d6c1bf539a30a91140c19b05f56ce1e701ada56dcbb5a/wcwidth-0.9.0-cp310-abi3-macosx_10_9_x86_64.whl", hash = "sha256:d5fd98bd30785ecdb6a9a37d632c2f557e37dec7b7b3b76397842e03e891d3fb", size = 599248, upload-time = "2026-09-23T15:44:34.245Z" },
+    { url = "https://files.pythonhosted.org/packages/f5/00/1c60d2c047f0e9ca207deb25547ca57c746ea6b92c83d1d61224227cfa3c/wcwidth-0.9.0-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:1bd6e3ea20382288c4d1eac079d775742a788f16bdecd92d957ecdb941b40870", size = 606184, upload-time = "2026-09-23T15:44:37.009Z" },
+    { url = "https://files.pythonhosted.org/packages/d3/fc/0a410777214f640ec0d68b74596e47b0edcac79c137acf03754d5a41e97a/wcwidth-0.9.0-cp310-abi3-manylinux1_i686.manylinux2014_i686.manylinux_2_17_i686.manylinux_2_5_i686.whl", hash = "sha256:5a20a031f744881e4f895e0ea9494e41c0d4a7320e6405fa7dce5e062d1f0545", size = 749579, upload-time = "2026-09-23T15:44:44.558Z" },
+    { url = "https://files.pythonhosted.org/packages/2e/5e/c806c5b41ee2701fda27ad73e9d717d0b767de353d9d4a75714ccea4b090/wcwidth-0.9.0-cp310-abi3-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:532eba871fb5c93ae492e5bd5ed3cab0d4805fd3a3e9d60a7aa92892f814a958", size = 758562, upload-time = "2026-09-23T15:44:39.939Z" },
+    { url = "https://files.pythonhosted.org/packages/7f/8d/e293019bfd94b1373421aedcb7be55089c19b5bd5a0a0fb3476d5a4e336e/wcwidth-0.9.0-cp310-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:d095384f4d99261c8de74f025a2b7b13fde0188cbb3f83807e9015825e914f42", size = 755540, upload-time = "2026-09-23T15:44:45.974Z" },
+    { url = "https://files.pythonhosted.org/packages/95/7b/8087dc19bb6bf2909a29c07568cb115af762346c07760d736b5cd74880b1/wcwidth-0.9.0-cp310-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:e2e3425dcb46b0f29f65ed0236e8c64d9ba53473a9b895d9435d64a9a2b70af1", size = 768333, upload-time = "2026-09-23T15:44:41.128Z" },
+    { url = "https://files.pythonhosted.org/packages/fa/91/e288a2b54dd7125db8da70e85c2bf9bb07c81dc8c48aaee8c1b81089a52e/wcwidth-0.9.0-cp310-abi3-musllinux_1_2_i686.whl", hash = "sha256:326cbf3503ec676d4c4d413cf8cc96d8b2591c23dc860c273ef1f8740e36befc", size = 769430, upload-time = "2026-09-23T15:44:47.795Z" },
+    { url = "https://files.pythonhosted.org/packages/4d/d3/05962a2d2195c231d1c5b820a6023b61e7be55c7a8eb32c91f2a721caa5e/wcwidth-0.9.0-cp314-cp314t-macosx_10_15_x86_64.whl", hash = "sha256:c9ad6463bd15ee57c4178849fdaa29acb828052e3971d1e86028cc5dc1d58c72", size = 599614, upload-time = "2026-09-23T15:44:35.687Z" },
+    { url = "https://files.pythonhosted.org/packages/87/64/32a8cf2aeef513bd813d4a86318fb221c6f16984e176e36e8c9b47056239/wcwidth-0.9.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:4a7f533babe32007c2781e438973213a45bd07370f6cb272ee18f56135dc5703", size = 606366, upload-time = "2026-09-23T15:44:38.544Z" },
+    { url = "https://files.pythonhosted.org/packages/4f/f2/216542761f8f2be07d398c58c5ba72d802219b803eb46c0dcfd6a7514b96/wcwidth-0.9.0-cp314-cp314t-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:ae8503058d68483b37e533f54f964510bbf73daa30637fbf60bb224084254f7c", size = 762651, upload-time = "2026-09-23T15:44:43.166Z" },
+    { url = "https://files.pythonhosted.org/packages/88/50/c979c311f1ecd497fc7459cd6df86a8ad5c6e9517a01f5985542e272711b/wcwidth-0.9.0-py3-none-any.whl", hash = "sha256:8ccbb76076a4e6db0b4bf3a9a19181ed2f777340966638a49267989f93acc242", size = 300656, upload-time = "2026-09-23T15:44:32.836Z" },
 ]
 
 [[package]]

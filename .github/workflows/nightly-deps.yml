@@ -11,8 +11,7 @@
 # attempt -> the PR is labeled needs-human.
 #
 # Scope is uv.lock and Cargo.lock. The actions pins stay with dependabot (see
-# .github/dependabot.yml, where cargo's monthly entry remains as a backstop);
-# this lane owns the two lockfiles and nothing else, and it refuses to touch
+# .github/dependabot.yml); this lane owns the two lockfiles and nothing else, and it refuses to touch
 # anything that runs in a credentialed job — see GUARDED_PATHS below. The
 # machinery is not self-editable.
 #
@@ -171,9 +170,9 @@ jobs:
           [ -n "$cooldown" ] || { echo "::error::no exclude-newer window in pyproject.toml [tool.uv]"; exit 1; }
           echo "release-age cooldown: $cooldown days"
           uv lock --upgrade 2>&1 | tee "$RUNNER_TEMP/deps/uv-lock.log"
-          # Cargo has no exclude-newer: bump everything, then the script reverts
-          # any crate published inside the window (checking crates.io publish
-          # dates, failing closed) and writes the two-ecosystem PR report.
+          # Cargo has no exclude-newer: bump everything, then the script keeps
+          # only the bumps published outside the window (checking crates.io
+          # publish dates, failing closed) and writes the two-ecosystem PR report.
           cargo update 2>&1 | tee "$RUNNER_TEMP/deps/cargo-update.log"
           python3 dev/scripts/bump_deps.py cooldown --days "$cooldown" --report "$RUNNER_TEMP/deps/report.md"
           stray=$(git diff --name-only | grep -vE '^(Cargo\.lock|uv\.lock)$' || true)

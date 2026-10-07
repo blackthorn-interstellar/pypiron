@@ -1,7 +1,7 @@
 """Unit tests for the nightly cargo-cooldown planner (dev/scripts/bump_deps.py).
 
-Pure-function coverage only: `plan`/`moves`/`versions` decide which bumps
-revert, and a wrong decision either installs a fresh (cooldown-violating)
+Pure-function coverage only: `plan`/`moves`/`versions`/`newest_aged` decide
+which bumps land, and a wrong decision either installs a fresh (cooldown-violating)
 crate or silently abandons a legitimate bump. The cargo/crates.io side runs
 blackbox in the nightly lane itself.
 """
@@ -16,6 +16,7 @@ from bump_deps import (  # noqa: E402
     deps,
     markdown_moves,
     moves,
+    newest_aged,
     only_metadata_changed,
     plan,
     versions,
@@ -294,3 +295,27 @@ def test_markdown_moves_renders_table_and_empty_case():
     assert "| serde | 1.0.100 | 1.0.200 |" in md
     assert "| brandnew | — | 0.1.0 |" in md
     assert markdown_moves([], []) == "nothing to bump\n"
+
+
+def test_newest_aged_steps_back_to_the_newest_release_outside_the_window():
+    published = {
+        "1.52.3": OLD_AGE,
+        "1.52.4": OLD_AGE,
+        "1.53.0": OLD_AGE,
+        "1.53.1-rc.1": OLD_AGE,
+        "1.53.1": YOUNG_AGE,
+        "1.53.2": YOUNG_AGE,
+        "1.60.0": OLD_AGE,  # beyond what cargo update chose
+    }
+    assert newest_aged("1.52.3", "1.53.2", published, CUTOFF) == "1.53.0"
+
+
+def test_newest_aged_compares_numerically_and_ignores_build_metadata():
+    published = {"0.9.0": OLD_AGE, "0.10.0+spec-1.1": OLD_AGE, "0.10.1": YOUNG_AGE}
+    assert newest_aged("0.8.0", "0.10.1", published, CUTOFF) == "0.10.0+spec-1.1"
+
+
+def test_newest_aged_holds_when_nothing_in_range_has_aged():
+    published = {"2.0.0": OLD_AGE, "2.0.1": YOUNG_AGE}
+    assert newest_aged("2.0.0", "2.0.1", published, CUTOFF) is None
+    assert newest_aged("2.0.0-beta", "2.0.1", published, CUTOFF) is None  # unparseable fails closed

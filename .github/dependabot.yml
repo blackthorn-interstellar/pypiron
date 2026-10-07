@@ -1,30 +1,19 @@
-# Python deps are deliberately absent here: the nightly deps lane
-# (.github/workflows/nightly-deps.yml) owns them, running `uv lock --upgrade`
-# every night behind pyproject.toml's 14-day release-age cooldown and landing
-# one self-merging lockfile PR instead of a stream of them. A "uv"/"pip"
-# ecosystem below would duplicate that and fight over uv.lock. The same lane
-# bumps Cargo.lock nightly (dev/scripts/bump_deps.py enforces the same window
-# against crates.io publish dates), so the cargo entry below is a monthly
-# backstop; the actions pins are dependabot's alone.
+# Only the actions pins live here. Both lockfiles belong to the nightly deps
+# lane (.github/workflows/nightly-deps.yml): `uv lock --upgrade` and
+# `cargo update` every night behind a 14-day release-age cooldown (pyproject's
+# exclude-newer for uv, dev/scripts/bump_deps.py against crates.io publish
+# dates for cargo), landing one self-merging lockfile PR. A "cargo" or "uv"
+# ecosystem here would fight it over the same lockfiles. Semver-major crate
+# upgrades are deliberate code migrations, done by hand; cargo-audit in CI
+# flags any advisory that makes one urgent.
 version: 2
 updates:
-  - package-ecosystem: "cargo"
-    directory: "/"
-    schedule:
-      interval: "monthly"
-    # A freshly published crate is where a supply-chain compromise is caught, so
-    # wait a month before proposing it. One grouped PR a month, not a stream.
-    cooldown:
-      default-days: 30
-    groups:
-      all-cargo:
-        patterns:
-          - "*"
-
   - package-ecosystem: "github-actions"
     directory: "/"
     schedule:
       interval: "monthly"
+    # A freshly published release is where a supply-chain compromise is caught,
+    # so wait a month before proposing it. One grouped PR a month, not a stream.
     cooldown:
       default-days: 30
     groups:

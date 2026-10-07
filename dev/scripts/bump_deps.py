@@ -3,11 +3,15 @@
 Freshly published releases are where supply-chain compromises live; an
 unattended nightly bump should never be the first installer. pyproject.toml's
 `[tool.uv] exclude-newer` enforces the cooldown natively for Python, but cargo
-has no equivalent, so `cooldown` post-processes a `cargo update`: every crate
-whose new version was published inside the window is reverted to the version
-HEAD pins (`cargo update -p crate@<new> --precise <old>`), and so is any
-freshly bumped dependent that would just pin it forward again. Anything the
-rule cannot decide — a crate new to the tree with no bumped dependent to
+has no equivalent, so `cooldown` post-processes a `cargo update`. When any
+bump is young, Cargo.lock is rebuilt from HEAD by replaying only the aged
+bumps (`cargo update -p crate@<old> --precise <new>`), stepping a young one
+back to its newest aged release where there is one. Families that pin each
+other with `=` (wasm-bindgen and friends) cannot be reverted one crate at a
+time, but left untouched they simply stay put. Any young crate an aged bump
+drags in is then reverted to the version HEAD pins, and so is any freshly
+bumped dependent that would just pin it forward again. Anything the rule
+cannot decide — a crate new to the tree with no bumped dependent to
 withdraw it, a multi-version shuffle, a version crates.io does not report —
 fails closed: Cargo.lock is restored wholesale and the bump waits for a
 cleaner night.
@@ -147,36 +151,107 @@ def plan(
     return reverts, pinned, blockers
 
 
-def crates_io_ages(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], datetime | None]:
-    """Publication times from crates.io, one request per crate name."""
-    ages: dict[tuple[str, str], datetime | None] = {}
-    for name in sorted({name for name, _ in pairs}):
+def _semver(v: str) -> tuple[int, ...] | None:
+    """`1.2.3` (build metadata ignored) as a sortable tuple; None for a prerelease."""
+    core = v.split("+")[0]
+    if "-" in core:
+        return None
+    try:
+        return tuple(int(p) for p in core.split("."))
+    except ValueError:
+        return None
+
+
+def newest_aged(old: str, new: str, published: dict[str, datetime], cutoff: datetime) -> str | None:
+    """The newest stable version in (old, new] published outside the window, if any.
+
+    `cargo update` always reaches for the newest release, so a crate that ships
+    every week or two would never age into a bump; stepping to an older release
+    in the same range keeps it moving.
+    """
+    lo, hi = _semver(old), _semver(new)
+    if lo is None or hi is None:
+        return None
+    aged = [
+        (key, v)
+        for v, ts in published.items()
+        if ts <= cutoff and (key := _semver(v)) is not None and lo < key <= hi
+    ]
+    return max(aged)[1] if aged else None
+
+
+def crates_io_published(names: set[str]) -> dict[str, dict[str, datetime]]:
+    """name -> {version: publication time} from crates.io, yanked versions left out."""
+    out: dict[str, dict[str, datetime]] = {}
+    for name in sorted(names):
         url = f"https://crates.io/api/v1/crates/{name}/versions"
         req = urllib.request.Request(
             url, headers={"User-Agent": "pypiron-nightly-deps (CI cooldown check)"}
         )
-        published: dict[str, str] = {}
+        out[name] = {}
         for attempt in (1, 2):
             try:
                 # Fixed https://crates.io registry endpoint; only the crate name,
                 # read from our own Cargo.lock, varies.
                 # nosemgrep: dynamic-urllib-use-detected
                 with urllib.request.urlopen(req, timeout=30) as resp:
-                    published = {v["num"]: v["created_at"] for v in json.load(resp)["versions"]}
+                    out[name] = {
+                        v["num"]: datetime.fromisoformat(v["created_at"])
+                        for v in json.load(resp)["versions"]
+                        if not v.get("yanked")
+                    }
                 break
-            except (OSError, TimeoutError, KeyError, json.JSONDecodeError) as e:
+            except (OSError, TimeoutError, KeyError, ValueError) as e:
                 if attempt == 2:
                     log(
                         f"crates.io lookup failed for {name}: {e} — treating its bumps as unknown age"
                     )
                 else:
                     time.sleep(2)
-        for pname, ver in pairs:
-            if pname == name:
-                raw = published.get(ver)
-                ages[(pname, ver)] = datetime.fromisoformat(raw) if raw else None
         time.sleep(0.2)  # crates.io crawler courtesy
-    return ages
+    return out
+
+
+def crates_io_ages(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], datetime | None]:
+    """Publication times from crates.io, one request per crate name."""
+    published = crates_io_published({name for name, _ in pairs})
+    return {(name, ver): published[name].get(ver) for name, ver in pairs}
+
+
+def replay_aged(cutoff: datetime) -> list[str]:
+    """Rebuild Cargo.lock from HEAD with only aged bumps; return the held-back ones.
+
+    A young bump steps to the newest aged release between its old and new
+    version instead, when there is one.
+    """
+    clean, unclean = lock_moves("Cargo.lock")
+    pairs = [(n, v) for n, _, v in clean] + [(n, v) for n, added in unclean for v in added]
+    published = crates_io_published({n for n, _ in pairs})
+    ages = {(n, v): published[n].get(v) for n, v in pairs}
+    young = {p for p in pairs if _young(p, ages, cutoff)}
+    if not young:
+        return []
+    sh(["git", "checkout", "--", "Cargo.lock"])
+    held: list[str] = []
+    # Stepped-back crates first: once one is pinned at its aged release, a
+    # dependent replayed after it keeps that pin instead of dragging it young.
+    for name, old_v, new_v in sorted(clean, key=lambda m: (m[0], m[2]) not in young):
+        target: str | None = new_v
+        if (name, new_v) in young:
+            target = newest_aged(old_v, new_v, published[name], cutoff)
+            held.append(f"`{name} {new_v}`" + (f" (took {target})" if target else ""))
+        if target is None:
+            continue
+        try:
+            sh(["cargo", "update", "-p", f"{name}@{old_v}", "--precise", target])
+        except subprocess.CalledProcessError:
+            # Usually a sibling's replay already moved it; the revert passes
+            # re-check whatever actually landed.
+            log(
+                f"could not replay {name} {old_v} -> {target} individually — already moved, or blocked"
+            )
+    held += [f"`{n} {v}`" for n, added in unclean for v in sorted(added) if (n, v) in young]
+    return held
 
 
 def lock_moves(path: str) -> tuple[list[Move], list[tuple[str, set[str]]]]:
@@ -212,9 +287,15 @@ def cmd_cooldown(args: argparse.Namespace) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
     cargo_notes: list[str] = []
     last_young: list[str] = []
+    held = replay_aged(cutoff)
+    if held:
+        cargo_notes.append(
+            f"held back, published inside the {args.days}-day cooldown: " + ", ".join(held)
+        )
 
-    # Up to four passes: a precise revert shuffles transitive pins of its own,
-    # and a dependent revert can uncover the next young crate above it.
+    # Sweep up young crates the replay dragged in. Up to four passes: a precise
+    # revert shuffles transitive pins of its own, and a dependent revert can
+    # uncover the next young crate above it.
     for _ in range(4):
         clean, unclean = lock_moves("Cargo.lock")
         if not clean and not unclean:

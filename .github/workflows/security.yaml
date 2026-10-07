@@ -151,7 +151,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: 0.12.6
+          version: 0.12.18
           enable-cache: false
       # The Python side of this repo is the blackbox test suite and dev/scripts —
       # nothing ships to users — but a compromised test dependency runs with the
@@ -383,7 +383,7 @@ jobs:
           persist-credentials: false
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: 0.12.6
+          version: 0.12.18
           enable-cache: false
       # A real gate: zizmor exits non-zero on findings, so no second pass is
       # needed. Deliberate exceptions live in .github/zizmor.yml. Scan all of
@@ -512,7 +512,7 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         if: env.SNYK_CONFIGURED == 'true'
         with:
-          version: 0.12.6
+          version: 0.12.18
           enable-cache: false
       # snyk parses neither Cargo.lock nor uv.lock, so `--all-projects` finds
       # nothing here and the CLI dies with SNYK-CLI-0008 (exit 3). Hand it the

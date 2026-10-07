@@ -32,7 +32,7 @@ jobs:
       - uses: Swatinem/rust-cache@f0d9c3887740aee45f6153b24b3a6b815192ec16 # v2
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
-          version: 0.12.6
+          version: 0.12.18
       - name: Sync dev dependencies
         run: uv sync
       # Exercises poetry/pdm/flit/hatch/pipenv against a real server (fetched on
@@ -155,7 +155,7 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         if: steps.gate.outputs.enabled == 'true'
         with:
-          version: 0.12.6
+          version: 0.12.18
       - name: Sync dev dependencies
         if: steps.gate.outputs.enabled == 'true'
         run: uv sync

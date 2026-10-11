@@ -1748,7 +1748,10 @@ def _probe_feed_server(baseline_records: dict, tmp_path: Path):
     zip_bytes = make_osv_zip(tmp_path / "baseline.zip", baseline_records).read_bytes()
     st = _MutableFeedState(zip_bytes, baseline_records)
     port = find_free_port()
-    httpd = http.server.HTTPServer(("127.0.0.1", port), _ProbeFeedHandler)
+    # HTTP/1.1 keep-alive plus a new reqwest client per probe cycle needs a
+    # threaded server; a single-threaded accept loop deadlocks on overlap.
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _ProbeFeedHandler)
+    httpd.daemon_threads = True
     httpd.state = st  # type: ignore[attr-defined]
     thread = threading.Thread(target=httpd.serve_forever, daemon=True)
     thread.start()

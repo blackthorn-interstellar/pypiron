@@ -384,6 +384,32 @@ def test_resync_skips_files_already_mirrored(source_dest, pypiron_bin, tmp_path)
     assert "- uploading" not in combined, combined
 
 
+def test_private_resync_skips_a_file_deleted_on_the_dest(source_dest, pypiron_bin, tmp_path):
+    """A migrated private file the dest operator deleted is tombstoned, so a
+    re-run's re-offer is refused with a 409. That refusal is the operator's
+    choice, not a failed upload: the run still succeeds."""
+    source, dest = source_dest["source"], source_dest["dest"]
+    pkg = "recondeleted"
+    w1 = _seed(source, pkg, "1.0", tmp_path)
+    wait_for_file_in_index(source["simple"], pkg, w1.name)
+    pkg_list = tmp_path / "packages.txt"
+    pkg_list.write_text(f"{pkg}\n")
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--as-private")
+    assert rc == 0, f"initial migration failed:\n{out}\n{err}"
+    wait_for_file_in_index(dest["simple"], pkg, w1.name)
+
+    code, _, _ = http_request_auth(
+        "DELETE", f"{dest['base_url']}/files/{pkg}/{w1.name}", **_admin(dest)
+    )
+    assert code == 204
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, pkg_list, "--as-private", "--full")
+    combined = out + err
+    assert rc == 0, f"re-run over a dest-deleted file must not fail:\n{combined}"
+    assert f"skipping {w1.name}" in combined, combined
+
+
 def test_relative_duration_exclude_older_still_304s_on_resync(source_dest, pypiron_bin, tmp_path):
     """A relative `--exclude-older` ("1 day") resolves to a fresh instant every
     run, but the sync cursor must still match its own prior config so an

@@ -923,6 +923,7 @@ class BucketFaults:
         self._blackholed: set[str] = set()
         self._dripped: dict[tuple[str, str], float] = {}
         self._dripped_puts: dict[tuple[str, str], float] = {}
+        self._versioning_suspended: set[str] = set()
         self._requests: list[tuple[str, str, str]] = []
         self._lock = threading.Lock()
         #: Per-fixture request log, set by ``_minio_fault_proxy``. On a test
@@ -953,6 +954,16 @@ class BucketFaults:
         """Read one object's PUT body steadily over ``duration`` seconds."""
         with self._lock:
             self._dripped_puts[(bucket, key)] = duration
+
+    def suspend_versioning(self, *buckets: str) -> None:
+        """Answer like a real S3 bucket whose versioning was enabled, then
+        suspended: GET/HEAD carry `x-amz-version-id: null`, PUT carries none."""
+        with self._lock:
+            self._versioning_suspended.update(buckets)
+
+    def is_versioning_suspended(self, bucket: str) -> bool:
+        with self._lock:
+            return bucket in self._versioning_suspended
 
     def is_failed(self, bucket: str) -> bool:
         with self._lock:
@@ -1102,7 +1113,12 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
             drip_duration = (
                 self.server.faults.drip_duration(bucket, key) if self.command == "GET" else None
             )
-            self._send_upstream_response(response, response_body, drip_duration=drip_duration)
+            null_version = self.command in ("GET", "HEAD") and (
+                self.server.faults.is_versioning_suspended(bucket)
+            )
+            self._send_upstream_response(
+                response, response_body, drip_duration=drip_duration, null_version=null_version
+            )
         except (ConnectionError, OSError, http.client.HTTPException) as exc:
             self._log(bucket, received, len(body), f"502-{type(exc).__name__}")
             self._send_error(502, b"MinIO proxy upstream unavailable")
@@ -1161,7 +1177,12 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
             body.extend(chunk)
 
     def _send_upstream_response(
-        self, response, body: bytes, *, drip_duration: float | None = None
+        self,
+        response,
+        body: bytes,
+        *,
+        drip_duration: float | None = None,
+        null_version: bool = False,
     ) -> None:
         hop_by_hop = {
             "connection",
@@ -1185,6 +1206,8 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
                 else:
                     continue
             self.send_header(name, value)
+        if null_version and response.status < 300 and not response.getheader("x-amz-version-id"):
+            self.send_header("x-amz-version-id", "null")
         if self.command == "HEAD":
             if not has_head_length:
                 self.send_header("Content-Length", "0")

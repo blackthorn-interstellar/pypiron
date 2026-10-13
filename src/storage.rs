@@ -3447,11 +3447,14 @@ fn staging_key(key: &str) -> String {
     )
 }
 
+/// S3's literal "null" version id means "no version" — a bucket whose
+/// versioning is suspended sends it on GET/HEAD but omits the header on PUT.
+/// Fold it to absent so a PUT's token equals the next GET's for the same object.
 fn pack_version(e_tag: &Option<String>, version: &Option<String>) -> String {
     format!(
         "{}{VERSION_SEP}{}",
         e_tag.as_deref().unwrap_or(""),
-        version.as_deref().unwrap_or("")
+        version.as_deref().filter(|v| *v != "null").unwrap_or("")
     )
 }
 
@@ -4566,6 +4569,17 @@ mod tests {
         assert_ne!(
             pack_version(&Some("a".into()), &None),
             pack_version(&None, &Some("a".into())),
+        );
+    }
+
+    #[test]
+    fn version_token_folds_s3_null_version() {
+        // Suspended-versioning S3: PUT omits x-amz-version-id, GET/HEAD send
+        // "null". Both describe the same object, so the tokens must match.
+        let etag = Some("\"abc123\"".to_string());
+        assert_eq!(
+            pack_version(&etag, &None),
+            pack_version(&etag, &Some("null".into()))
         );
     }
 

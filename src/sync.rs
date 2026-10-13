@@ -3189,8 +3189,20 @@ async fn upload_via_http(
         let form = upload_form(resolved, pkg, s, &spool, provenance.as_deref()).await?;
         let req = with_admin_auth(client.post(endpoint).multipart(form), resolved);
         let err = match req.send().await {
-            // Already present — or our own earlier attempt landed.
-            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => return Ok(false),
+            Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                let body = error_snippet(resp).await;
+                // Already present (or our own earlier attempt landed), or a
+                // filename the destination deleted on purpose. Any other 409 is
+                // a write the server refused: the file did not land.
+                if body.starts_with("File already exists") {
+                    return Ok(false);
+                }
+                if body.contains("frozen or deleted") {
+                    info!("  - skipping {}: {body}", s.file.filename);
+                    return Ok(false);
+                }
+                return Err(anyhow!("upload refused [409 Conflict]: {body}"));
+            }
             Ok(resp) if resp.status().is_success() => return Ok(true),
             Ok(resp)
                 if resp.status().is_server_error()

@@ -198,12 +198,18 @@ def test_inventory_view_is_persisted_to_storage(disk_server, tmp_path):
     wait_for_project_in_global(server["simple"], "persistpkg")
     _wait_homepage(server, projects=1)
 
+    # The view can be written before the upload is counted; wait for the
+    # rewrite that counts the upload, not just for the file to exist.
     inv_path = server["data_dir"] / "_state" / "inventory.json"
+    data = {}
     deadline = time.time() + 10
-    while time.time() < deadline and not inv_path.exists():
+    while time.time() < deadline:
+        if inv_path.exists():
+            data = json.loads(inv_path.read_text())
+            if data.get("projects", 0) >= 1:
+                break
         time.sleep(0.25)
     assert inv_path.exists(), f"{inv_path} not written"
-    data = json.loads(inv_path.read_text())
     assert data["projects"] >= 1
     assert data["files"] >= 1
     assert data["bytes"] >= 1

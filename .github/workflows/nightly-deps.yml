@@ -1,6 +1,6 @@
 # Nightly dependency bump, end to end.
 #
-# Both lockfiles move, but only onto releases that have been public for a
+# All three lockfiles move, but only onto releases that have been public for a
 # fortnight — a freshly published wheel or crate is where a supply-chain
 # compromise gets caught, so the lane never installs one. `uv lock --upgrade`
 # gets the window natively from pyproject.toml's `[tool.uv] exclude-newer`;
@@ -10,8 +10,8 @@
 # fixes the fallout and a PR carries the fix. Still red after its one
 # attempt -> the PR is labeled needs-human.
 #
-# Scope is uv.lock and Cargo.lock. The actions pins stay with dependabot (see
-# .github/dependabot.yml); this lane owns the two lockfiles and nothing else, and it refuses to touch
+# Scope is uv.lock, Cargo.lock, and fuzz/Cargo.lock. The actions pins stay with dependabot (see
+# .github/dependabot.yml); this lane owns the three lockfiles and nothing else, and it refuses to touch
 # anything that runs in a credentialed job — see GUARDED_PATHS below. The
 # machinery is not self-editable.
 #
@@ -122,7 +122,7 @@ jobs:
             echo "nightly-deps: XAI_API_KEY not configured — repair agent rungs disabled; a broken bump ends the night red with no PR, and a red PR ends at the needs-human label" | tee -a "$GITHUB_STEP_SUMMARY"
           fi
 
-  # Validate lane: bump both lockfiles inside the cooldown and run the checks
+  # Validate lane: bump all three lockfiles inside the cooldown and run the checks
   # with the freshly bumped packages. That runs UNTRUSTED code (package entry
   # points, build backends and pytest plugins from just-bumped wheels; build
   # scripts and proc macros from just-bumped crates), so this job holds NO
@@ -142,6 +142,7 @@ jobs:
       # property — see the digest comment at the end of that step.
       uv_lock_sha: ${{ steps.bump.outputs.uv_lock_sha }}
       cargo_lock_sha: ${{ steps.bump.outputs.cargo_lock_sha }}
+      fuzz_lock_sha: ${{ steps.bump.outputs.fuzz_lock_sha }}
       report_sha: ${{ steps.bump.outputs.report_sha }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -174,13 +175,14 @@ jobs:
           # only the bumps published outside the window (checking crates.io
           # publish dates, failing closed) and writes the two-ecosystem PR report.
           cargo update 2>&1 | tee "$RUNNER_TEMP/deps/cargo-update.log"
+          cargo update --manifest-path fuzz/Cargo.toml 2>&1 | tee "$RUNNER_TEMP/deps/fuzz-update.log"
           python3 dev/scripts/bump_deps.py cooldown --days "$cooldown" --report "$RUNNER_TEMP/deps/report.md"
-          stray=$(git diff --name-only | grep -vE '^(Cargo\.lock|uv\.lock)$' || true)
+          stray=$(git diff --name-only | grep -vE '^(Cargo\.lock|fuzz/Cargo\.lock|uv\.lock)$' || true)
           if [ -n "$stray" ]; then
             echo "::error::the bump touched more than the lockfiles: $stray"
             exit 1
           fi
-          if git diff --quiet -- uv.lock Cargo.lock; then
+          if git diff --quiet -- uv.lock Cargo.lock fuzz/Cargo.lock; then
             echo "changed=false" >> "$GITHUB_OUTPUT"
             echo "no dependency changes tonight (cooldown applied)" >> "$GITHUB_STEP_SUMMARY"
           else
@@ -190,7 +192,9 @@ jobs:
           # Bank the bumped lockfiles for deps-publish and the fix agent before
           # anything can fail.
           cp uv.lock Cargo.lock "$RUNNER_TEMP/deps/"
-          # Digest the three files the privileged jobs act on, here in the step
+          mkdir -p "$RUNNER_TEMP/deps/fuzz"
+          cp fuzz/Cargo.lock "$RUNNER_TEMP/deps/fuzz/"
+          # Digest the four files the privileged jobs act on, here in the step
           # that writes them. The artifact uploads `if: always()`, which is AFTER
           # the bumped packages have had a whole step of this VM to themselves —
           # build scripts, proc macros, package entry points, pytest plugins —
@@ -219,6 +223,7 @@ jobs:
           {
             echo "uv_lock_sha=$(sha256sum "$RUNNER_TEMP/deps/uv.lock" | cut -d' ' -f1)"
             echo "cargo_lock_sha=$(sha256sum "$RUNNER_TEMP/deps/Cargo.lock" | cut -d' ' -f1)"
+            echo "fuzz_lock_sha=$(sha256sum "$RUNNER_TEMP/deps/fuzz/Cargo.lock" | cut -d' ' -f1)"
             echo "report_sha=$(sha256sum "$RUNNER_TEMP/deps/report.md" | cut -d' ' -f1)"
           } >> "$GITHUB_OUTPUT"
       - name: Check with the bumped dependencies
@@ -236,6 +241,7 @@ jobs:
             # legs need Docker fixtures and add nothing a lockfile bump can
             # break that disk does not.
             cargo build --locked
+            cargo check --manifest-path fuzz/Cargo.toml --bins --locked
             uv run -- pytest tests -m "not perf and not stress and not compat and not s3 and not azure" -n 8 --durations=25
           } 2>&1 | tee "$RUNNER_TEMP/deps/check.log"
       - name: The checks left the tree formatted
@@ -247,7 +253,7 @@ jobs:
           # that reddens its own PR for a reason nothing in this job reported.
           # Catch it here, where the reformat is still fallout the fix agent can
           # commit alongside the bump.
-          stray=$(git diff --name-only | grep -vE '^(Cargo\.lock|uv\.lock)$' || true)
+          stray=$(git diff --name-only | grep -vE '^(Cargo\.lock|fuzz/Cargo\.lock|uv\.lock)$' || true)
           if [ -n "$stray" ]; then
             echo "::error::the bumped toolchain reformatted the tree: $stray — the bump needs those edits to ship with it"
             exit 1
@@ -255,7 +261,7 @@ jobs:
       - name: Capture failure context
         if: failure() && steps.bump.outputs.changed == 'true'
         run: |
-          git diff -- uv.lock Cargo.lock > "$RUNNER_TEMP/deps/lock.diff" || true
+          git diff -- uv.lock Cargo.lock fuzz/Cargo.lock > "$RUNNER_TEMP/deps/lock.diff" || true
           git status --porcelain > "$RUNNER_TEMP/deps/status.txt" || true
       - name: Evidence artifact
         if: always()
@@ -296,22 +302,24 @@ jobs:
       # The artifact was uploaded AFTER the bumped packages had their run of the
       # validate VM, so its bytes are not evidence of anything on their own. The
       # digests are: the bump step recorded them before that code ran and no
-      # later step could rewrite them. All three files this job goes on to use
-      # are covered — the two lockfiles it commits, and report.md, which becomes
+      # later step could rewrite them. All four files this job goes on to use
+      # are covered — the three lockfiles it commits, and report.md, which becomes
       # the PR body verbatim. Fail closed on both a mismatch and an unrecorded
       # digest, so a bump step that never got that far cannot publish either.
       - name: The banked lockfiles and report are the ones the bump produced
         env:
           UV_LOCK_SHA: ${{ needs.deps.outputs.uv_lock_sha }}
           CARGO_LOCK_SHA: ${{ needs.deps.outputs.cargo_lock_sha }}
+          FUZZ_LOCK_SHA: ${{ needs.deps.outputs.fuzz_lock_sha }}
           REPORT_SHA: ${{ needs.deps.outputs.report_sha }}
         run: |
           set -euo pipefail
           fail=0
-          for f in uv.lock Cargo.lock report.md; do
+          for f in uv.lock Cargo.lock fuzz/Cargo.lock report.md; do
             case "$f" in
               uv.lock) want=${UV_LOCK_SHA:-} ;;
               Cargo.lock) want=${CARGO_LOCK_SHA:-} ;;
+              fuzz/Cargo.lock) want=${FUZZ_LOCK_SHA:-} ;;
               report.md) want=${REPORT_SHA:-} ;;
             esac
             # A DELETED file is a mismatch like any other, and it has to be
@@ -349,7 +357,8 @@ jobs:
           # from the artifact, and copying first would make the branch switch
           # refuse outright if master's own copies had moved in the meantime.
           cp "$RUNNER_TEMP/deps/uv.lock" "$RUNNER_TEMP/deps/Cargo.lock" .
-          git add uv.lock Cargo.lock
+          cp "$RUNNER_TEMP/deps/fuzz/Cargo.lock" fuzz/Cargo.lock
+          git add uv.lock Cargo.lock fuzz/Cargo.lock
           git commit -m "deps: nightly bump $(date -u +%F)"
           git push -f origin "$BRANCH"
           gh label create nightly-deps --color 1D76DB --description "automated nightly dependency bump" || true
@@ -440,7 +449,7 @@ jobs:
           # cannot ride along in the agent's `git add -A` below.
           path: .local/deps/
       # Same check deps-publish runs, for the same reason: the agent is told to
-      # copy the two lockfiles over the checkout and commit them, it reads
+      # copy the three lockfiles over the checkout and commit them, it reads
       # report.md as its brief, and its commit reaches master through
       # deps-fix-publish. Verify before the agent — and therefore before any
       # bumped code — runs on this VM.
@@ -448,14 +457,16 @@ jobs:
         env:
           UV_LOCK_SHA: ${{ needs.deps.outputs.uv_lock_sha }}
           CARGO_LOCK_SHA: ${{ needs.deps.outputs.cargo_lock_sha }}
+          FUZZ_LOCK_SHA: ${{ needs.deps.outputs.fuzz_lock_sha }}
           REPORT_SHA: ${{ needs.deps.outputs.report_sha }}
         run: |
           set -euo pipefail
           fail=0
-          for f in uv.lock Cargo.lock report.md; do
+          for f in uv.lock Cargo.lock fuzz/Cargo.lock report.md; do
             case "$f" in
               uv.lock) want=${UV_LOCK_SHA:-} ;;
               Cargo.lock) want=${CARGO_LOCK_SHA:-} ;;
+              fuzz/Cargo.lock) want=${FUZZ_LOCK_SHA:-} ;;
               report.md) want=${REPORT_SHA:-} ;;
             esac
             # A DELETED file is a mismatch like any other, and it has to be
@@ -500,19 +511,21 @@ jobs:
             (you hold a read-only token; a push would fail).
 
             Context:
-            - .local/deps/ holds the evidence: uv.lock and Cargo.lock as bumped
+            - .local/deps/ holds the evidence: uv.lock, Cargo.lock, and fuzz/Cargo.lock as bumped
               (copy them over the checked-out ones to reproduce), report.md
               (what moved, and the 14-day release-age cooldown that constrained
               it), check.log (the failing output), lock.diff and status.txt.
             - The bump is lockfile-only: uv.lock carries the blackbox TEST
               SUITE's Python packages (pytest, twine, ruff, requests and
-              friends) and Cargo.lock the shipped binary's crates. Breakage is
+              friends), Cargo.lock the shipped binary's crates, and
+              fuzz/Cargo.lock the standalone fuzz workspace. Breakage is
               therefore either a pytest/plugin behavior change, a client tool
               changing its output, or ruff tightening a rule — or, on the Rust
               side, a bumped crate breaking the build, clippy, or a unit test.
             - The Rust toolchain and uv are already provisioned. Reproduce with
               `uv sync && make check`, then the blackbox gate:
-              `cargo build --locked` followed by
+              `cargo check --manifest-path fuzz/Cargo.toml --bins --locked`,
+              then `cargo build --locked` followed by
               `uv run -- pytest tests -m "not perf and not stress and not compat and not s3 and not azure" -n 8`.
               Both must pass. Don't spend turns re-provisioning or re-deriving
               what .local/deps/ already shows.
@@ -540,7 +553,7 @@ jobs:
               are refused at publish and throw the whole night's work away.
 
             Deliver by committing locally: copy .local/deps/uv.lock and
-            .local/deps/Cargo.lock over the checked-out ones,
+            .local/deps/Cargo.lock and .local/deps/fuzz/Cargo.lock over the checked-out ones,
             `git checkout -B deps/nightly`, and `git commit` the lockfiles plus
             your fixes with a message saying what broke and why. STOP there — do NOT `git push`, do NOT touch a PR, do NOT add
             labels. The publish job captures your commit, opens the PR (body =
@@ -938,7 +951,8 @@ jobs:
                job's log with `gh run view <run-id> --log-failed`.
             2. Diagnose and fix on this branch. The PR carries a nightly
                dependency bump — uv.lock (the blackbox test suite's Python
-               packages) and Cargo.lock (the shipped binary's crates); its body
+               packages), Cargo.lock (the shipped binary's crates), and
+               fuzz/Cargo.lock (the standalone fuzz workspace); its body
                has the report — so failures are usually fallout from the bumped
                versions: fix the code or the tests for the new versions, or
                narrow a genuinely broken package's constraint (pyproject.toml +

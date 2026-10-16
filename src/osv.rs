@@ -326,7 +326,7 @@ pub fn parse_feed(zip_bytes: &[u8]) -> Result<AdvisoryDb> {
         let Ok(entry) = zip.by_index(index) else {
             continue;
         };
-        if !entry.name().ends_with(".json") {
+        if !entry.name().is_ok_and(|name| name.ends_with(".json")) {
             continue;
         }
         let mut buf = Vec::new();
@@ -614,6 +614,24 @@ mod tests {
             .unwrap();
         let db = parse_feed(&zip.finish().unwrap().into_inner()).unwrap();
         assert_eq!(db.block_names(), 1);
+    }
+
+    #[test]
+    fn stored_and_deflated_feeds_keep_unicode_names_and_skip_bad_records() {
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let opts = SimpleFileOptions::default().compression_method(method);
+            zip.start_file("broken.json", opts).unwrap();
+            zip.write_all(b"{truncated").unwrap();
+            zip.start_file("avis-é.json", opts).unwrap();
+            zip.write_all(mal_all("MAL-1", "evil").to_string().as_bytes())
+                .unwrap();
+            let db = parse_feed(&zip.finish().unwrap().into_inner()).unwrap();
+            assert_eq!(db.block_names(), 1, "{method:?}");
+        }
     }
 
     fn mal_exact(id: &str, name: &str, version: &str) -> serde_json::Value {

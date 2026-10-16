@@ -669,7 +669,10 @@ jobs:
         # Pin the gnu host target: recent cargo-fuzz defaults to musl even on a
         # gnu host, and musl's static libc is incompatible with ASan.
         # https://github.com/rust-fuzz/cargo-fuzz/issues/398
-        run: cargo fuzz build --target x86_64-unknown-linux-gnu
+        run: |
+          cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
+          cargo fuzz build --target x86_64-unknown-linux-gnu
+          git diff --exit-code -- fuzz/Cargo.lock
 
   # Branch protection does not cover tags: a pushed vX.Y.Z can point at any
   # commit, and this workflow builds and trusted-publishes from the tagged

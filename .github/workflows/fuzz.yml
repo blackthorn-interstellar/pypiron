@@ -64,10 +64,12 @@ jobs:
       # target's dictionary.
       - name: Fuzz for five minutes
         run: |
+          cargo metadata --manifest-path fuzz/Cargo.toml --locked --format-version 1 > /dev/null
           mkdir -p fuzz/corpus/${{ matrix.target }}
           cargo fuzz run ${{ matrix.target }} --target x86_64-unknown-linux-gnu \
             fuzz/corpus/${{ matrix.target }} fuzz/seeds/${{ matrix.target }} -- \
             -dict=fuzz/dicts/${{ matrix.target }}.dict -max_total_time=300
+          git diff --exit-code -- fuzz/Cargo.lock
       - name: Upload crash reproducers
         if: failure()
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

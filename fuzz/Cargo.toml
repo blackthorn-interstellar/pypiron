@@ -20,7 +20,7 @@ arbitrary = "1"
 # fuzz_targets/*.rs), so these are the only third-party crates those modules
 # reach for.
 pep440_rs = "0.7.3"
-zip = { version = "2", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
 html-escape = "0.2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

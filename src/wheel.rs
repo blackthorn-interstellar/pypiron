@@ -47,9 +47,14 @@ pub(crate) fn extract_metadata_from_reader<R: Read + Seek>(
     }
     let name = zip
         .file_names()
-        .find(|n| n.ends_with(".dist-info/METADATA") && n.matches('/').count() == 1)
-        .map(str::to_string)
-        .ok_or(WheelError::Invalid)?;
+        .find_map(|name| match name {
+            Ok(n) if n.ends_with(".dist-info/METADATA") && n.matches('/').count() == 1 => {
+                Some(Ok(n.into_owned()))
+            }
+            Ok(_) => None,
+            Err(_) => Some(Err(WheelError::Invalid)),
+        })
+        .ok_or(WheelError::Invalid)??;
     let entry = zip.by_name(&name).map_err(|_| WheelError::Invalid)?;
     if entry.size() > MAX_METADATA_BYTES {
         return Err(WheelError::TooLarge);
@@ -91,6 +96,45 @@ mod tests {
         assert_eq!(
             extract_metadata_from_reader(Cursor::new(&wheel)).as_deref(),
             Ok(md.as_slice())
+        );
+    }
+
+    #[test]
+    fn stored_and_deflated_wheels_keep_first_top_level_metadata() {
+        for method in [
+            zip::CompressionMethod::Stored,
+            zip::CompressionMethod::Deflated,
+        ] {
+            let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+            let opts = SimpleFileOptions::default().compression_method(method);
+            for (name, bytes) in [
+                ("nested/demo.dist-info/METADATA", b"nested".as_slice()),
+                ("demo.dist-info/RECORD", b"record".as_slice()),
+                ("café.dist-info/METADATA", b"first".as_slice()),
+                ("other.dist-info/METADATA", b"second".as_slice()),
+            ] {
+                zip.start_file(name, opts).unwrap();
+                zip.write_all(bytes).unwrap();
+            }
+            assert_eq!(
+                extract_metadata_from_reader(zip.finish().unwrap()),
+                Ok(b"first".to_vec()),
+                "{method:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn corrupt_stored_metadata_is_invalid() {
+        let mut wheel = fake_wheel(Some(b"metadata payload"));
+        let offset = wheel
+            .windows(16)
+            .position(|w| w == b"metadata payload")
+            .unwrap();
+        wheel[offset] ^= 1;
+        assert_eq!(
+            extract_metadata_from_reader(Cursor::new(wheel)),
+            Err(WheelError::Invalid)
         );
     }
 

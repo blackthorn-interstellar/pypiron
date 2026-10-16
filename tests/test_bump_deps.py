@@ -319,3 +319,102 @@ def test_newest_aged_holds_when_nothing_in_range_has_aged():
     published = {"2.0.0": OLD_AGE, "2.0.1": YOUNG_AGE}
     assert newest_aged("2.0.0", "2.0.1", published, CUTOFF) is None
     assert newest_aged("2.0.0-beta", "2.0.1", published, CUTOFF) is None  # unparseable fails closed
+
+
+def test_cooldown_updates_both_workspaces_without_admitting_young_fuzz_crates(
+    tmp_path, monkeypatch
+):
+    """A production bump must reach fuzz without admitting its too-young extra dependency."""
+    import argparse
+    import subprocess
+
+    import bump_deps
+
+    def lock(serde, arbitrary):
+        return (
+            f'[[package]]\nname = "serde"\nversion = "{serde}"\n'
+            f'[[package]]\nname = "arbitrary"\nversion = "{arbitrary}"\n'
+            # A previously reviewed exception is a baseline pin, not a new bump.
+            '[[package]]\nname = "zip"\nversion = "9.0.4"\n'
+        )
+
+    baseline = {
+        "Cargo.lock": lock("1.0.100", "1.4.2"),
+        "fuzz/Cargo.lock": lock("1.0.100", "1.4.2"),
+        "uv.lock": UV_LOCK_HEAD,
+    }
+    for path, data in baseline.items():
+        dest = tmp_path / path
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(data)
+    (tmp_path / "Cargo.lock").write_text(lock("1.0.200", "1.4.2"))
+    (tmp_path / "fuzz/Cargo.lock").write_text(lock("1.0.200", "1.5.0"))
+    monkeypatch.setattr(bump_deps, "ROOT", tmp_path)
+    now = datetime.now(timezone.utc)
+    published = {
+        "serde": {"1.0.200": now - timedelta(days=90)},
+        "arbitrary": {"1.5.0": now - timedelta(days=2)},
+    }
+    monkeypatch.setattr(
+        bump_deps, "crates_io_published", lambda names: {n: published[n] for n in names}
+    )
+
+    def shell(cmd, *, capture=False):
+        if cmd[:2] == ["git", "show"]:
+            return subprocess.CompletedProcess(
+                cmd, 0, stdout=baseline[cmd[2].removeprefix("HEAD:")]
+            )
+        if cmd[:3] == ["git", "checkout", "--"]:
+            (tmp_path / cmd[3]).write_text(baseline[cmd[3]])
+        else:
+            assert cmd[:3] == ["cargo", "update", "--manifest-path"]
+            dest = tmp_path / Path(cmd[3]).with_name("Cargo.lock")
+            old = cmd[5].split("@")[1]
+            dest.write_text(dest.read_text().replace(f'version = "{old}"', f'version = "{cmd[7]}"'))
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(bump_deps, "sh", shell)
+    report = tmp_path / "report.md"
+    assert bump_deps.cmd_cooldown(argparse.Namespace(days=14, report=str(report))) == 0
+    assert versions((tmp_path / "Cargo.lock").read_text()) == versions(lock("1.0.200", "1.4.2"))
+    assert versions((tmp_path / "fuzz/Cargo.lock").read_text()) == versions(
+        lock("1.0.200", "1.4.2")
+    )
+    assert "fuzz/Cargo.lock" in report.read_text()
+    assert "held back" in report.read_text()
+    assert "arbitrary 1.5.0" in report.read_text()
+
+
+def test_fuzz_cooldown_abandons_unknown_arrival_without_resetting_root(tmp_path, monkeypatch):
+    """An aged fuzz replay can introduce an unknown transitive; abandon that workspace."""
+    import subprocess
+
+    import bump_deps
+
+    baseline = '[[package]]\nname = "serde"\nversion = "1.0.100"\n'
+    updated = baseline.replace("1.0.100", "1.0.200")
+    unknown = '\n[[package]]\nname = "surprise"\nversion = "0.1.0"\n'
+    (tmp_path / "fuzz").mkdir()
+    (tmp_path / "Cargo.lock").write_text(updated)
+    (tmp_path / "fuzz/Cargo.lock").write_text(updated + unknown)
+    monkeypatch.setattr(bump_deps, "ROOT", tmp_path)
+    published = {"serde": {"1.0.200": OLD_AGE}, "surprise": {}}
+    monkeypatch.setattr(
+        bump_deps, "crates_io_published", lambda names: {n: published[n] for n in names}
+    )
+
+    def shell(cmd, *, capture=False):
+        if cmd[:2] == ["git", "show"]:
+            return subprocess.CompletedProcess(cmd, 0, stdout=baseline)
+        if cmd[:3] == ["git", "checkout", "--"]:
+            (tmp_path / cmd[3]).write_text(baseline)
+        else:
+            dest = tmp_path / Path(cmd[3]).with_name("Cargo.lock")
+            dest.write_text(updated + unknown)
+        return subprocess.CompletedProcess(cmd, 0)
+
+    monkeypatch.setattr(bump_deps, "sh", shell)
+    notes = bump_deps.cooldown_cargo("fuzz/Cargo.lock", CUTOFF, 14)
+    assert (tmp_path / "fuzz/Cargo.lock").read_text() == baseline
+    assert (tmp_path / "Cargo.lock").read_text() == updated
+    assert any("abandoned" in note and "surprise" in note for note in notes)

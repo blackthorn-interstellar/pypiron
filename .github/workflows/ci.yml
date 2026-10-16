@@ -72,7 +72,9 @@ jobs:
       # is to move the dependency. This is the repo's only advisory gate —
       # deny.toml deliberately covers licenses/bans/sources and nothing else.
       - name: Audit dependencies for advisories
-        run: make audit
+        run: |
+          make audit
+          cargo audit --file fuzz/Cargo.lock
 
   test:
     name: tests

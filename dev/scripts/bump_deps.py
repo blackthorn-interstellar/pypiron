@@ -218,20 +218,24 @@ def crates_io_ages(pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dateti
     return {(name, ver): published[name].get(ver) for name, ver in pairs}
 
 
-def replay_aged(cutoff: datetime) -> list[str]:
+def manifest_path(lock_path: str) -> str:
+    return str(Path(lock_path).with_name("Cargo.toml"))
+
+
+def replay_aged(cutoff: datetime, lock_path: str = "Cargo.lock") -> list[str]:
     """Rebuild Cargo.lock from HEAD with only aged bumps; return the held-back ones.
 
     A young bump steps to the newest aged release between its old and new
     version instead, when there is one.
     """
-    clean, unclean = lock_moves("Cargo.lock")
+    clean, unclean = lock_moves(lock_path)
     pairs = [(n, v) for n, _, v in clean] + [(n, v) for n, added in unclean for v in added]
     published = crates_io_published({n for n, _ in pairs})
     ages = {(n, v): published[n].get(v) for n, v in pairs}
     young = {p for p in pairs if _young(p, ages, cutoff)}
     if not young:
         return []
-    sh(["git", "checkout", "--", "Cargo.lock"])
+    sh(["git", "checkout", "--", lock_path])
     held: list[str] = []
     # Stepped-back crates first: once one is pinned at its aged release, a
     # dependent replayed after it keeps that pin instead of dragging it young.
@@ -243,7 +247,18 @@ def replay_aged(cutoff: datetime) -> list[str]:
         if target is None:
             continue
         try:
-            sh(["cargo", "update", "-p", f"{name}@{old_v}", "--precise", target])
+            sh(
+                [
+                    "cargo",
+                    "update",
+                    "--manifest-path",
+                    manifest_path(lock_path),
+                    "-p",
+                    f"{name}@{old_v}",
+                    "--precise",
+                    target,
+                ]
+            )
         except subprocess.CalledProcessError:
             # Usually a sibling's replay already moved it; the revert passes
             # re-check whatever actually landed.
@@ -283,34 +298,34 @@ def markdown_moves(clean: list[Move], unclean: list[tuple[str, set[str]]]) -> st
     return "\n".join(lines) + "\n"
 
 
-def cmd_cooldown(args: argparse.Namespace) -> int:
-    cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+def cooldown_cargo(lock_path: str, cutoff: datetime, days: int) -> list[str]:
+    """Apply the same fail-closed policy to either independent Cargo workspace."""
     cargo_notes: list[str] = []
     last_young: list[str] = []
-    held = replay_aged(cutoff)
+    held = replay_aged(cutoff, lock_path)
     if held:
         cargo_notes.append(
-            f"held back, published inside the {args.days}-day cooldown: " + ", ".join(held)
+            f"held back, published inside the {days}-day cooldown: " + ", ".join(held)
         )
 
     # Sweep up young crates the replay dragged in. Up to four passes: a precise
     # revert shuffles transitive pins of its own, and a dependent revert can
     # uncover the next young crate above it.
     for _ in range(4):
-        clean, unclean = lock_moves("Cargo.lock")
+        clean, unclean = lock_moves(lock_path)
         if not clean and not unclean:
             break
         pairs = [(n, v) for n, _, v in clean] + [(n, v) for n, added in unclean for v in added]
-        graph = deps((ROOT / "Cargo.lock").read_text())
+        graph = deps((ROOT / lock_path).read_text())
         reverts, pinned, blockers = plan(clean, unclean, crates_io_ages(pairs), cutoff, graph)
         last_young = [f"`{n} {v}`" for n, _, v in reverts if n not in pinned]
         last_young += [f"`{n} {v}`" for n, v in blockers]
         if blockers:
-            sh(["git", "checkout", "--", "Cargo.lock"])
+            sh(["git", "checkout", "--", lock_path])
             named = ", ".join(f"`{n} {v}`" for n, v in blockers)
             cargo_notes = [
                 (
-                    f"**Cargo bumps abandoned tonight**: {named} arrived inside the {args.days}-day "
+                    f"**Cargo bumps abandoned tonight**: {named} arrived inside the {days}-day "
                     "cooldown (or with unknown publish age), with no safe revert target and no bumped "
                     "dependent to withdraw it. Tomorrow's run retries."
                 )
@@ -324,7 +339,18 @@ def cmd_cooldown(args: argparse.Namespace) -> int:
             # individual failures — a later pass re-checks, and the for-else
             # abandons wholesale if anything young survives all of them.
             try:
-                sh(["cargo", "update", "-p", f"{name}@{new_v}", "--precise", old_v])
+                sh(
+                    [
+                        "cargo",
+                        "update",
+                        "--manifest-path",
+                        manifest_path(lock_path),
+                        "-p",
+                        f"{name}@{new_v}",
+                        "--precise",
+                        old_v,
+                    ]
+                )
             except subprocess.CalledProcessError:
                 log(
                     f"could not revert {name} {new_v} -> {old_v} individually — will re-check after this pass"
@@ -334,19 +360,27 @@ def cmd_cooldown(args: argparse.Namespace) -> int:
             reason = (
                 "pins young " + ", ".join(f"`{p}`" for p in why)
                 if why
-                else f"published inside the {args.days}-day cooldown"
+                else f"published inside the {days}-day cooldown"
             )
             cargo_notes.append(f"reverted `{name}` {new_v} → {old_v}: {reason}")
     else:
         # Even reverting the dependents did not converge — a young crate is
         # held up by something the name-level graph cannot reach or cannot
         # move. The cooldown cannot be guaranteed piecemeal, so none of it ships.
-        sh(["git", "checkout", "--", "Cargo.lock"])
+        sh(["git", "checkout", "--", lock_path])
         cargo_notes = [
             "**Cargo bumps abandoned tonight**: "
             + ", ".join(last_young)
-            + f" stayed inside the {args.days}-day cooldown after reverts. Tomorrow's run retries."
+            + f" stayed inside the {days}-day cooldown after reverts. Tomorrow's run retries."
         ]
+
+    return cargo_notes
+
+
+def cmd_cooldown(args: argparse.Namespace) -> int:
+    cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+    cargo_notes = cooldown_cargo("Cargo.lock", cutoff, args.days)
+    fuzz_notes = cooldown_cargo("fuzz/Cargo.lock", cutoff, args.days)
 
     # An empty night has to *look* empty: the caller decides whether to open a PR
     # by asking git whether the lockfiles moved, so options-only churn would send
@@ -359,13 +393,14 @@ def cmd_cooldown(args: argparse.Namespace) -> int:
 
     py_clean, py_unclean = lock_moves("uv.lock")
     cargo_clean, cargo_unclean = lock_moves("Cargo.lock")
+    fuzz_clean, fuzz_unclean = lock_moves("fuzz/Cargo.lock")
     report = "\n".join(
         [
             f"## deps: nightly bump {datetime.now(timezone.utc):%Y-%m-%d}",
             "",
             f"Nightly dependency bump with a {args.days}-day release-age cooldown: nothing",
             "published inside the window is eligible, so a fresh release keeps its current",
-            "pin and gets proposed again once it has aged out. Scope is the two lockfiles;",
+            "pin and gets proposed again once it has aged out. Scope is the three lockfiles;",
             "the actions pins belong to dependabot.",
             "",
             f"### Python (uv.lock — the blackbox test suite's packages; cooldown enforced natively by `[tool.uv] exclude-newer`, {args.days} days)",
@@ -375,6 +410,11 @@ def cmd_cooldown(args: argparse.Namespace) -> int:
             "",
             markdown_moves(cargo_clean, cargo_unclean),
             *(f"- {n}" for n in cargo_notes),
+            "",
+            f"### Cargo fuzz (fuzz/Cargo.lock — the standalone fuzz workspace; same {args.days}-day cooldown)",
+            "",
+            markdown_moves(fuzz_clean, fuzz_unclean),
+            *(f"- {n}" for n in fuzz_notes),
             "",
         ]
     )

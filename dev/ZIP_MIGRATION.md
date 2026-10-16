@@ -26,7 +26,10 @@ fuzz-only dependencies. `arbitrary` stays at 1.4.2: 1.5.0 was published on
 October 6 and has not passed the 14-day cooldown. `libfuzzer-sys` 0.4.13 was
 published on June 4. Commit this lockfile. CI validates it with
 `cargo metadata --locked` before cargo-fuzz and checks that cargo-fuzz left it
-unchanged. Refresh the parent and fuzz locks together when updating ZIP.
+unchanged. The nightly dependency lane updates both Cargo workspaces, applies
+the same fail-closed 14-day cooldown to each, and banks, verifies, and publishes
+all three lockfiles. Its validation builds the standalone fuzz targets too.
+Refresh the parent and fuzz locks together when updating ZIP.
 
 ## Reader and writer compatibility
 

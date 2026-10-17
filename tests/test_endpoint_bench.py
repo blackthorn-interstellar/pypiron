@@ -72,7 +72,12 @@ def test_endpoint_op_pins(tmp_path, pypiron_bin):
             cold = eptab.measure_ops(base, ep, ctx, 0)
             warm = eptab.measure_ops(base, ep, ctx, 1)
             warm2 = eptab.measure_ops(base, ep, ctx, 2)
+            rebuilds_before = eptab.index_rebuilds(base) if ep.mutates else 0
             _, _, body = eptab.hit(base, ep, ctx, 3)
+            if ep.mutates:
+                # The bytes-range hit is otherwise unsettled; a delayed
+                # rebuild would leak into the next endpoint's cold window.
+                eptab.settle_write(base, ep, rebuilds_before)
             if ep.cold_ops is not None and cold != ep.cold_ops:
                 failures.append(f"{ep.name}: cold ops {cold} != pinned {ep.cold_ops}")
             if ep.warm_ops is not None:

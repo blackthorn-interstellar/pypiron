@@ -800,12 +800,30 @@ def hit(base: str, ep: Endpoint, ctx: Ctx, i: int) -> tuple:
     return status, ms, data
 
 
-def ops_snapshot(base: str) -> dict:
+_OPS_RE = re.compile(r'^pypiron_storage_ops_total\{op="(\w+)"\} (\d+)$', re.M)
+_REBUILDS_RE = re.compile(r"^pypiron_index_rebuilds_total (\d+)$", re.M)
+
+
+def _metrics(base: str) -> tuple:
+    """(ops dict, index-rebuild counter) from one /metrics fetch."""
     _, _, data = fetch(base, "GET", "/metrics")
-    out = dict.fromkeys(OPS, 0)
-    for m in re.finditer(r'^pypiron_storage_ops_total\{op="(\w+)"\} (\d+)$', data.decode(), re.M):
-        out[m.group(1)] = int(m.group(2))
-    return out
+    text = data.decode()
+    ops = dict.fromkeys(OPS, 0)
+    for m in _OPS_RE.finditer(text):
+        ops[m.group(1)] = int(m.group(2))
+    rebuilds = 0
+    m = _REBUILDS_RE.search(text)
+    if m:
+        rebuilds = int(m.group(1))
+    return ops, rebuilds
+
+
+def ops_snapshot(base: str) -> dict:
+    return _metrics(base)[0]
+
+
+def index_rebuilds(base: str) -> int:
+    return _metrics(base)[1]
 
 
 def ops_delta(before: dict, after: dict) -> dict:
@@ -821,12 +839,12 @@ def ops_settled(base: str, timeout: float = 20.0, quiet: float = 0.15, streak: i
     measurement window (seen as a stray delete on sync-cursors-put). Require
     `streak` consecutive identical snapshots `quiet` apart — sustained silence.
     """
-    last = ops_snapshot(base)
+    last, _ = _metrics(base)
     same = 0
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         time.sleep(quiet)
-        cur = ops_snapshot(base)
+        cur, _ = _metrics(base)
         if cur == last:
             same += 1
             if same >= streak:
@@ -837,6 +855,30 @@ def ops_settled(base: str, timeout: float = 20.0, quiet: float = 0.15, streak: i
     raise TimeoutError("storage ops never settled")
 
 
+def wait_rebuild(base: str, rebuilds_before: int, timeout: float = 20.0) -> None:
+    """Block until the worker has started this mutation's package rebuild.
+
+    `ops_settled` treats silence as "done", so a worker that has not been
+    scheduled yet looks finished. On a loaded CI runner that gap closed
+    before yank-clear's warm2 rebuild ran, and the delta missed the tail's
+    last read/write/delete. Probe mutations always dirty a package; the
+    rebuild counter moving is the start signal silence cannot see.
+    """
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if index_rebuilds(base) > rebuilds_before:
+            return
+        time.sleep(0.05)
+    raise TimeoutError("index rebuild never ran after mutation")
+
+
+def settle_write(base: str, ep: Endpoint, rebuilds_before: int) -> dict:
+    """Settle a mutation: wait for its rebuild (if any), then for ops silence."""
+    if ep.target == "probe":
+        wait_rebuild(base, rebuilds_before)
+    return ops_settled(base)
+
+
 def measure_ops(base: str, ep: Endpoint, ctx: Ctx, i: int) -> dict:
     """Per-request storage-op delta for one serial request (quiesced server).
 
@@ -844,6 +886,7 @@ def measure_ops(base: str, ep: Endpoint, ctx: Ctx, i: int) -> dict:
     cost of the write, which is the number worth pinning.
     """
     before = ops_settled(base)
+    rebuilds_before = index_rebuilds(base) if ep.mutates else 0
     hit(base, ep, ctx, i)
-    after = ops_settled(base) if ep.mutates else ops_snapshot(base)
+    after = settle_write(base, ep, rebuilds_before) if ep.mutates else ops_snapshot(base)
     return ops_delta(before, after)

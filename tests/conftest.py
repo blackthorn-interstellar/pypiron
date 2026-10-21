@@ -799,7 +799,7 @@ def _minio_container() -> Iterator[Dict]:
             "secret_key": "minioadmin",
         }
     finally:
-        run_returncode(["docker", "rm", "-f", name])
+        run_returncode(["docker", "rm", "-f", "-v", name])
 
 
 def _minio_buckets(container: Dict, count: int, label: str) -> Iterator[Dict]:
@@ -905,7 +905,7 @@ def _minio_container_alt() -> Iterator[Dict]:
             "secret_key": "altsecret123",
         }
     finally:
-        run_returncode(["docker", "rm", "-f", name])
+        run_returncode(["docker", "rm", "-f", "-v", name])
 
 
 @pytest.fixture()
@@ -2371,7 +2371,7 @@ def _azurite_container() -> Iterator[Dict]:
         wait_http_responding(f"http://127.0.0.1:{port}/{AZURITE_ACCOUNT}", timeout=60.0)
         yield {"port": port}
     finally:
-        run_returncode(["docker", "rm", "-f", name])
+        run_returncode(["docker", "rm", "-f", "-v", name])
 
 
 def _azurite_delete_container(port: int, container: str) -> None:

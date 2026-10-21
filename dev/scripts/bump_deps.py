@@ -377,8 +377,37 @@ def cooldown_cargo(lock_path: str, cutoff: datetime, days: int) -> list[str]:
     return cargo_notes
 
 
+def expired_exceptions(pyproject_text: str, cutoff: datetime) -> list[str]:
+    """Dated `exclude-newer-package` entries the rolling window has passed.
+
+    A security exception pins one package's cutoff to its fix's release day.
+    Once the window catches up, that date is no longer an exception but a
+    frozen cap holding the package back — so it has to be deleted. Relative
+    spans ("7 days") roll on their own and are never expired.
+    """
+    uv = tomllib.loads(pyproject_text).get("tool", {}).get("uv", {})
+    out = []
+    for name, value in sorted(uv.get("exclude-newer-package", {}).items()):
+        try:
+            when = datetime.fromisoformat(value)
+        except ValueError:
+            continue
+        if when.tzinfo is None:
+            when = when.replace(tzinfo=timezone.utc)
+        if when < cutoff:
+            out.append(name)
+    return out
+
+
 def cmd_cooldown(args: argparse.Namespace) -> int:
     cutoff = datetime.now(timezone.utc) - timedelta(days=args.days)
+    expired = expired_exceptions((ROOT / "pyproject.toml").read_text(), cutoff)
+    if expired:
+        log(
+            "expired cooldown exceptions in pyproject.toml [tool.uv] exclude-newer-package "
+            f"(the {args.days}-day window has passed them; delete them): " + ", ".join(expired)
+        )
+        return 1
     cargo_notes = cooldown_cargo("Cargo.lock", cutoff, args.days)
     fuzz_notes = cooldown_cargo("fuzz/Cargo.lock", cutoff, args.days)
 

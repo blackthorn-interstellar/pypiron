@@ -55,6 +55,11 @@ package = false
 # every resolve. Keep it in sync with COOLDOWN_DAYS in
 # .github/workflows/nightly-deps.yml, which only quotes it in the PR body now.
 exclude-newer = "14 days"
+# Security releases skip the cooldown: pin the package's cutoff to the fix's
+# release day. A dated entry is a frozen cap, so it must go once the rolling
+# window passes it — the nightly lane (bump_deps.py) fails until it does.
+# certifi/uv: CVE-2026-111943 (compromised eMudhra CA keys).
+exclude-newer-package = { certifi = "2026-10-20T23:59:59Z", uv = "2026-10-20T23:59:59Z" }
 
 [dependency-groups]
 dev = [

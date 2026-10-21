@@ -14,6 +14,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "dev" / "scripts
 
 from bump_deps import (  # noqa: E402
     deps,
+    expired_exceptions,
     markdown_moves,
     moves,
     newest_aged,
@@ -349,6 +350,7 @@ def test_cooldown_updates_both_workspaces_without_admitting_young_fuzz_crates(
         dest.write_text(data)
     (tmp_path / "Cargo.lock").write_text(lock("1.0.200", "1.4.2"))
     (tmp_path / "fuzz/Cargo.lock").write_text(lock("1.0.200", "1.5.0"))
+    (tmp_path / "pyproject.toml").write_text("[tool.uv]\n")
     monkeypatch.setattr(bump_deps, "ROOT", tmp_path)
     now = datetime.now(timezone.utc)
     published = {
@@ -418,3 +420,15 @@ def test_fuzz_cooldown_abandons_unknown_arrival_without_resetting_root(tmp_path,
     assert (tmp_path / "fuzz/Cargo.lock").read_text() == baseline
     assert (tmp_path / "Cargo.lock").read_text() == updated
     assert any("abandoned" in note and "surprise" in note for note in notes)
+
+
+def test_expired_exceptions_flags_only_dated_entries_the_window_has_passed():
+    pyproject = """
+[tool.uv]
+exclude-newer = "14 days"
+exclude-newer-package = { certifi = "2026-08-01T00:00:00Z", uv = "2026-08-20", pip = "7 days" }
+"""
+    # certifi's cap is older than the cutoff: now a frozen pin, must go. uv's is
+    # still inside the window, and a relative span never expires.
+    assert expired_exceptions(pyproject, CUTOFF) == ["certifi"]
+    assert expired_exceptions("[tool.uv]\n", CUTOFF) == []

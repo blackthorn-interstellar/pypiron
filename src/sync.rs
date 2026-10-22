@@ -434,6 +434,18 @@ pub struct MirrorArgs {
     /// the filter only gates what a run pulls in.
     #[arg(long = "include-yanked", env = "PYPIRON_INCLUDE_YANKED")]
     pub include_yanked: bool,
+
+    /// Let a release skip a rolling --exclude-newer cooldown when a
+    /// vulnerability advisory in the advisory feed names it as the fix and has
+    /// sat unchanged for an hour. Default true. Only that exact release skips;
+    /// malware blocking still applies, and a fixed-date cutoff is never lifted.
+    #[arg(
+        long = "security-fixes-skip-cooldown",
+        env = "PYPIRON_SECURITY_FIXES_SKIP_COOLDOWN",
+        action = clap::ArgAction::Set,
+        value_name = "BOOL"
+    )]
+    pub security_fixes_skip_cooldown: Option<bool>,
 }
 
 impl MirrorArgs {
@@ -540,6 +552,10 @@ impl MirrorArgs {
             // force-exclude over a file that opted in.
             exclude_yanked: !(self.include_yanked
                 || file.and_then(|f| f.include_yanked).unwrap_or(false)),
+            fixes_skip_cooldown: self
+                .security_fixes_skip_cooldown
+                .or(file.and_then(|f| f.security_fixes_skip_cooldown))
+                .unwrap_or(true),
         })
     }
 
@@ -891,6 +907,10 @@ struct Resolved {
     /// past the cutoff" re-evaluation is driven by the per-package
     /// `next_eligible_at` watermark, not by perturbing this hash every run.
     exclude_newer_raw: Option<String>,
+    /// The advisory snapshot this run ferried, parsed: its security-fix rules
+    /// let advisory-named fix releases skip the cooldown. `None` when no feed
+    /// was obtained.
+    advisories: Option<Arc<crate::advisories::AdvisoryDb>>,
 }
 
 #[derive(Debug, Default)]
@@ -929,6 +949,17 @@ pub struct ResolvedMirror {
     pub(crate) exclude_larger: Option<u64>,
     /// Drop files yanked upstream (PEP 592).
     pub(crate) exclude_yanked: bool,
+    /// Let advisory-named fix releases skip a rolling `exclude_newer`.
+    pub(crate) fixes_skip_cooldown: bool,
+}
+
+impl ResolvedMirror {
+    /// Whether an advisory-named fix release skips the newer bound: only a
+    /// rolling cooldown (`Cutoff::Ago`) is lifted. A fixed date is a snapshot
+    /// the operator pinned, so it holds.
+    pub(crate) fn fix_lifts_cooldown(&self) -> bool {
+        self.fixes_skip_cooldown && matches!(self.exclude_newer, Some(Cutoff::Ago(_)))
+    }
 }
 
 impl Resolved {
@@ -1059,6 +1090,7 @@ impl Resolved {
             repair_upload_times: args.repair_upload_times,
             private,
             advisory_feed,
+            advisories: None,
             src_explicit,
             concurrency,
             package_concurrency,
@@ -1661,21 +1693,24 @@ async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
 /// package sync proceeds. It never returns an error and is never allowed to fail
 /// the run — the packages are the job; the feed is supply-chain metadata riding
 /// along. `""` (the opt-out) skips it entirely, issuing no requests.
-async fn push_advisory_feed(client: &Client, resolved: &Resolved) {
+async fn push_advisory_feed(
+    client: &Client,
+    resolved: &Resolved,
+) -> Option<crate::advisories::AdvisoryDb> {
     if resolved.repair_upload_times {
-        return;
+        return None;
     }
     if resolved.source_kind == SourceKind::Pypicloud && resolved.advisory_feed.is_none() {
         debug!("advisory feed: pypicloud has no pypiron advisory endpoint; skipping relay");
-        return;
+        return None;
     }
     if resolved.dry_run {
         info!("[dry-run] would push the advisory snapshot to the destination (no source fetch, no write)");
-        return;
+        return None;
     }
     let bytes = match resolved.advisory_feed.as_deref().map(str::trim) {
         // Explicit opt-out: no fetch, no push, no requests.
-        Some("") => return,
+        Some("") => return None,
         // Explicit source: a local zip, or a URL fetched through the same
         // SSRF-guarded, proxy-honoring, size-capped client the server's own feed
         // polling uses (never a second client shape).
@@ -1683,7 +1718,7 @@ async fn push_advisory_feed(client: &Client, resolved: &Resolved) {
             Ok(bytes) => bytes,
             Err(e) => {
                 warn!(error = %e, feed, "advisory feed: could not read the configured feed; skipping advisory push (package sync continues)");
-                return;
+                return None;
             }
         },
         // Default: relay the source server's snapshot, but only against an
@@ -1692,31 +1727,31 @@ async fn push_advisory_feed(client: &Client, resolved: &Resolved) {
         None => {
             if !resolved.src_explicit {
                 debug!("advisory feed: no --from source set; skipping the advisory relay");
-                return;
+                return None;
             }
-            match relay_from_source(client, resolved).await {
-                Some(bytes) => bytes,
-                None => return, // relay_from_source already warned
-            }
+            relay_from_source(client, resolved).await? // relay_from_source already warned
         }
     };
 
     // Validate before pushing garbage — the stored copy is what every destination
     // node loads. Parse off the runtime (a real export is ~32 MB).
     let to_parse = bytes.clone();
-    match tokio::task::spawn_blocking(move || crate::advisories::parse_feed(&to_parse)).await {
-        Ok(Ok(_)) => {}
+    let db = match tokio::task::spawn_blocking(move || crate::advisories::parse_feed(&to_parse))
+        .await
+    {
+        Ok(Ok(db)) => db,
         Ok(Err(e)) => {
             warn!(error = %e, "advisory feed: obtained feed did not parse; skipping advisory push (package sync continues)");
-            return;
+            return None;
         }
         Err(e) => {
             warn!(error = %e, "advisory feed: parse task failed; skipping advisory push (package sync continues)");
-            return;
+            return None;
         }
-    }
+    };
 
     push_feed_to_dest(client, resolved, bytes).await;
+    Some(db)
 }
 
 /// Relay the sync source's advisory snapshot: `GET <from>/advisories/feed`
@@ -2181,7 +2216,7 @@ pub async fn run_sync(
     // Ferry the advisory snapshot across the air gap before the package loop. The
     // packages are the job; the feed is best-effort supply-chain metadata riding
     // along, so a missing feed never fails the run (like save_cursors).
-    push_advisory_feed(&client, &resolved).await;
+    resolved.advisories = push_advisory_feed(&client, &resolved).await.map(Arc::new);
 
     // The conditional-fetch memo from the last run; an empty map (first run,
     // --full, or any read error) simply means every project full-fetches.
@@ -2301,6 +2336,10 @@ async fn sync_one_package(
                     .exclude_newer
                     .is_some_and(|cut| cut.instant().unix_timestamp() < w),
             })
+            // Fix gate: a new advisory can make a held-back release eligible
+            // while upstream's ETag stays put, so a package with a fix advisory
+            // younger than the cooldown always re-selects. A handful a week.
+            .filter(|_| !recent_fix(resolved, pkg))
             .map(|c| c.etag.as_str())
     };
     let fetched = match resolved.source_kind {
@@ -2910,7 +2949,14 @@ fn select_from_index(
         if resolved.denylist.file_denied(&spec.name, &file.filename) {
             continue;
         }
-        if matches_mirror(&file, &resolved.mirror) {
+        let security_fix = resolved.mirror.fix_lifts_cooldown()
+            && version.as_deref().is_some_and(|v| {
+                resolved
+                    .advisories
+                    .as_ref()
+                    .is_some_and(|db| db.security_fix(&spec.name, v, crate::clock::now_utc()))
+            });
+        if matches_mirror_fix(&file, &resolved.mirror, security_fix) {
             file.url = resolve(&file.url);
             file.provenance = file.provenance.as_deref().map(resolve);
             selected.push(Selected { version, file });
@@ -2923,6 +2969,17 @@ fn select_from_index(
         warn!("No matching files for package '{}'", spec.name);
     }
     (selected, upstream_status, upstream_files, next_eligible_at)
+}
+
+/// Whether `pkg` has a fix advisory that settled within the rolling cooldown:
+/// a release it names may only now be eligible, unseen by a replayed ETag.
+fn recent_fix(resolved: &Resolved, pkg: &str) -> bool {
+    let (Some(db), Some(Cutoff::Ago(window))) =
+        (&resolved.advisories, resolved.mirror.exclude_newer)
+    else {
+        return false;
+    };
+    resolved.mirror.fixes_skip_cooldown && db.fix_since(pkg, crate::clock::now_utc() - window)
 }
 
 /// Provenance objects are small JSON, and the destination's upload path rejects
@@ -3300,10 +3357,29 @@ struct Lift {
     /// Lift the yank gate — the proxy's *listing* render keeps yanked files
     /// listed (PEP 592) while `exclude-yanked` still gates the fill.
     yanked: bool,
+    /// The file is a release a settled vulnerability advisory names as its fix:
+    /// lift the newer bound when [`ResolvedMirror::fix_lifts_cooldown`].
+    fix: bool,
 }
 
 pub(crate) fn matches_mirror(file: &SimpleFile, m: &ResolvedMirror) -> bool {
     matches_mirror_inner(file, m, Lift::default())
+}
+
+/// [`matches_mirror`] for a file that may be an advisory-named `security_fix`.
+pub(crate) fn matches_mirror_fix(
+    file: &SimpleFile,
+    m: &ResolvedMirror,
+    security_fix: bool,
+) -> bool {
+    matches_mirror_inner(
+        file,
+        m,
+        Lift {
+            fix: security_fix,
+            ..Lift::default()
+        },
+    )
 }
 
 /// The mirror predicate as the proxy's *listing* render needs it: every gate
@@ -3312,12 +3388,17 @@ pub(crate) fn matches_mirror(file: &SimpleFile, m: &ResolvedMirror) -> bool {
 /// reconcile. `exclude-yanked` still gates the fill (see
 /// `Proxy::fill_refused_by_yank`), so listing a yanked file never pulls its
 /// bytes — artifact or companion — from upstream.
-pub(crate) fn matches_mirror_listing(file: &SimpleFile, m: &ResolvedMirror) -> bool {
+pub(crate) fn matches_mirror_listing(
+    file: &SimpleFile,
+    m: &ResolvedMirror,
+    security_fix: bool,
+) -> bool {
     matches_mirror_inner(
         file,
         m,
         Lift {
             yanked: true,
+            fix: security_fix,
             ..Lift::default()
         },
     )
@@ -3369,8 +3450,12 @@ fn matches_mirror_inner(file: &SimpleFile, m: &ResolvedMirror, lift: Lift) -> bo
     // favours completeness, and it sidesteps a sticky empty-mirror trap against
     // upstreams that don't carry PEP 700 `upload-time`). The gates only ever act
     // on files we can place in time. `lift.newer` drops the upper bound for the
-    // watermark probe.
-    let newer = if lift.newer { None } else { m.exclude_newer };
+    // watermark probe; an advisory-named fix drops a rolling one.
+    let newer = if lift.newer || (lift.fix && m.fix_lifts_cooldown()) {
+        None
+    } else {
+        m.exclude_newer
+    };
     if newer.is_some() || m.exclude_older.is_some() {
         if let Some(uploaded) = file
             .upload_time
@@ -3838,6 +3923,7 @@ mod tests {
             exclude_prereleases: false,
             exclude_larger: None,
             exclude_yanked: false,
+            fixes_skip_cooldown: true,
         }
     }
 
@@ -4222,10 +4308,15 @@ mod tests {
 
         // The proxy's listing render lifts only this gate: yanked files stay
         // listed (PEP 592), every other gate still applies.
-        assert!(matches_mirror_listing(&with_yank(Yanked::Flag(true)), &f));
+        assert!(matches_mirror_listing(
+            &with_yank(Yanked::Flag(true)),
+            &f,
+            false
+        ));
         assert!(matches_mirror_listing(
             &with_yank(Yanked::Reason("CVE-2024-1".into())),
-            &f
+            &f,
+            false
         ));
         let wheels_only = ResolvedMirror {
             exclude_yanked: true,
@@ -4237,8 +4328,41 @@ mod tests {
                 yanked: Yanked::Flag(true),
                 ..named_file("foo-1.0.tar.gz")
             },
-            &wheels_only
+            &wheels_only,
+            false
         ));
+    }
+
+    #[test]
+    fn advisory_named_fix_skips_only_a_rolling_cooldown() {
+        let fresh = simple_file(Some(&OffsetDateTime::now_utc().format(&Rfc3339).unwrap()));
+        let rolling = ResolvedMirror {
+            exclude_newer: Some(Cutoff::Ago(Duration::days(7))),
+            ..base_filter()
+        };
+        assert!(!matches_mirror_fix(&fresh, &rolling, false));
+        assert!(matches_mirror_fix(&fresh, &rolling, true));
+        assert!(matches_mirror_listing(&fresh, &rolling, true));
+        // A pinned date is the operator's snapshot: a fix never punches through.
+        let pinned = time_filter(Some("2016-01-01T00:00:00Z"), None);
+        assert!(!matches_mirror_fix(&fresh, &pinned, true));
+        // The opt-out holds the fix like any other release.
+        let off = ResolvedMirror {
+            fixes_skip_cooldown: false,
+            ..rolling
+        };
+        assert!(!matches_mirror_fix(&fresh, &off, true));
+        // Only the cooldown lifts; every other gate still applies.
+        let sdists = ResolvedMirror {
+            include_format: vec![Format::Sdist],
+            exclude_newer: Some(Cutoff::Ago(Duration::days(7))),
+            ..base_filter()
+        };
+        let wheel = SimpleFile {
+            filename: "foo-1.0-py3-none-any.whl".into(),
+            ..fresh
+        };
+        assert!(!matches_mirror_fix(&wheel, &sdists, true));
     }
 
     #[test]
@@ -4520,6 +4644,7 @@ mod tests {
             repair_upload_times: false,
             private: PrivateNames::default(),
             advisory_feed: None,
+            advisories: None,
             src_explicit: false,
             concurrency: 1,
             package_concurrency: 1,

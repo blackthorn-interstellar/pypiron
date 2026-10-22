@@ -1888,3 +1888,182 @@ def test_probe_backfills_new_mal_after_restart(tmp_path_factory, pypiron_bin, tm
             assert mal_id.encode() in blocked[1], blocked
         finally:
             kill_process_tree(proc)
+
+
+# ------------------------ security fixes skip the cooldown --------------------
+#
+# A release a vulnerability advisory names as its fix skips the rolling cooldown
+# once the advisory has sat unchanged for an hour; every other fresh release
+# stays held. The proxy learns fixes from the baseline snapshot and the probe;
+# `sync` from the feed it ferries.
+
+
+def _fix_record(adv_id: str, pkg: str, fixed: str, modified: str) -> dict:
+    return {
+        "id": adv_id,
+        "modified": modified,
+        "summary": f"vulnerability in {pkg} before {fixed}",
+        "affected": [
+            {
+                "package": {"ecosystem": "PyPI", "name": pkg},
+                "ranges": [
+                    {"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": fixed}]}
+                ],
+            }
+        ],
+    }
+
+
+def _iso(seconds_ago: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(time.time() - seconds_ago))
+
+
+def _upstream_upload(upstream, dist: Path) -> None:
+    upload_legacy(
+        upstream["legacy"],
+        dist,
+        username=upstream["uploader_user"],
+        password=upstream["uploader_password"],
+    )
+
+
+def _listed(server, pkg: str) -> set:
+    """Filenames in `pkg`'s PEP 691 listing; a project with nothing listed may 404."""
+    code, body, _ = http_get(
+        f"{server['simple']}{pkg}/", headers={"Accept": "application/vnd.pypi.simple.v1+json"}
+    )
+    if code == 404:
+        return set()
+    assert code == 200, (code, body[:200])
+    return {f["filename"] for f in json.loads(body)["files"]}
+
+
+def test_proxy_lets_advisory_named_fix_skip_cooldown(
+    tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
+):
+    """Under the default 7-day cooldown, every fresh upstream release is held
+    except the exact versions a settled vulnerability advisory names as fixes —
+    from the baseline snapshot and from the probe alike — and uv installs the fix.
+    An advisory changed less than an hour ago exempts nothing yet."""
+    # The probe only reads advisories newer than the baseline's newest one.
+    settled, unsettled = _iso(2 * 3600), _iso(0)
+    baseline = {
+        **_baseline_records(),
+        "PYSEC-2026-1": _fix_record("PYSEC-2026-1", "baselib", "1.0.0", _iso(3 * 3600)),
+    }
+    with _probe_feed_server(baseline, tmp_path) as (feed_url, feed):
+        gen = _start_proxy_pair(
+            tmp_path_factory,
+            pypiron_bin,
+            proxy_extra_args=["--advisory-feed", feed_url, "--malware-probe-secs", "2"],
+            exclude_newer=None,
+            proxy_extra_env=_DIRECT_EGRESS,
+        )
+        pair = next(gen)
+        try:
+            upstream, proxy = pair["upstream"], pair["proxy"]
+            assert _poll_metric(proxy["base_url"], "pypiron_malware_probe_age_seconds") is not None
+            old, fix = (
+                make_wheel("fixlib", "1.0.0", tmp_path),
+                make_wheel("fixlib", "1.0.1", tmp_path),
+            )
+            base_fix = make_wheel("baselib", "1.0.0", tmp_path)
+            pending = make_wheel("waitlib", "3.0.0", tmp_path)
+            for dist in (old, fix, base_fix, pending):
+                _upstream_upload(upstream, dist)
+            wait_for_file_in_index(upstream["simple"], "waitlib", pending.name)
+
+            # Published after startup: only the probe can see these. Wait for
+            # both fetches before the first listing, which the proxy caches.
+            feed.publish(_fix_record("GHSA-fixl-ib00-0001", "fixlib", "1.0.1", settled))
+            feed.publish(_fix_record("GHSA-wait-lib0-0001", "waitlib", "3.0.0", unsettled))
+            deadline = time.time() + 30
+            while time.time() < deadline and not (
+                feed.count("GET", "/GHSA-fixl-ib00-0001.json")
+                and feed.count("GET", "/GHSA-wait-lib0-0001.json")
+            ):
+                time.sleep(0.2)
+            time.sleep(1)  # the cycle applies its overlay right after the fetches
+
+            assert _listed(proxy, "fixlib") == {fix.name}, "only the named fix skips"
+            assert _listed(proxy, "baselib") == {base_fix.name}, "baseline fix not exempt"
+            assert _listed(proxy, "waitlib") == set(), "an unsettled advisory exempted"
+
+            rc, out, err = _uv_install(uv_path, uv_venv, proxy, "fixlib")
+            assert rc == 0, f"fix failed to install:\n{out}\n{err}"
+            got = run_checked([uv_path, "pip", "show", "--python", str(uv_venv), "fixlib"]).stdout
+            assert "Version: 1.0.1" in got, got
+        finally:
+            gen.close()
+
+
+def test_proxy_fix_exemption_can_be_turned_off(tmp_path_factory, pypiron_bin, tmp_path):
+    """`--security-fixes-skip-cooldown false` holds a named fix like any release."""
+    feed = make_osv_zip(
+        tmp_path / "osv.zip",
+        {"PYSEC-2026-2": _fix_record("PYSEC-2026-2", "offlib", "1.0.0", _iso(7200))},
+    )
+    gen = _start_proxy_pair(
+        tmp_path_factory,
+        pypiron_bin,
+        proxy_extra_args=["--advisory-feed", str(feed), "--security-fixes-skip-cooldown", "false"],
+        exclude_newer=None,
+    )
+    pair = next(gen)
+    try:
+        upstream, proxy = pair["upstream"], pair["proxy"]
+        assert _poll_metric(proxy["base_url"], "pypiron_advisory_snapshot_age_seconds") is not None
+        wheel = make_wheel("offlib", "1.0.0", tmp_path)
+        _upstream_upload(upstream, wheel)
+        wait_for_file_in_index(upstream["simple"], "offlib", wheel.name)
+        assert _listed(proxy, "offlib") == set()
+    finally:
+        gen.close()
+
+
+def test_sync_carries_advisory_named_fix_through_cooldown(tmp_path_factory, pypiron_bin, tmp_path):
+    """`sync` under the default cooldown copies only the advisory-named fix — and
+    picks it up on a later run whose feed newly names it, even though the
+    upstream listing (and the cursor's ETag) never changed."""
+    src_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    dst_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    source, dest = next(src_gen), next(dst_gen)
+    try:
+        old, fix = (
+            make_wheel("synclib", "1.0.0", tmp_path),
+            make_wheel("synclib", "1.0.1", tmp_path),
+        )
+        for dist in (old, fix):
+            _mirror_upload(source, dist)
+        wait_for_file_in_index(source["simple"], "synclib", fix.name)
+
+        def sync(feed: str):
+            return sync_to(
+                pypiron_bin,
+                dest,
+                "--include-package",
+                "synclib",
+                "--advisory-feed",
+                feed,
+                source=source["base_url"],
+            )
+
+        # No advisory yet: both releases are inside the cooldown.
+        rc, out, err = sync("")
+        assert rc == 0, f"sync failed:\n{out}\n{err}"
+        assert _listed(dest, "synclib") == set()
+
+        zip_path = make_osv_zip(
+            tmp_path / "osv.zip",
+            {
+                "GHSA-sync-lib0-0001": _fix_record(
+                    "GHSA-sync-lib0-0001", "synclib", "1.0.1", _iso(7200)
+                )
+            },
+        )
+        rc, out, err = sync(str(zip_path))
+        assert rc == 0, f"sync failed:\n{out}\n{err}"
+        assert _listed(dest, "synclib") == {fix.name}
+    finally:
+        dst_gen.close()
+        src_gen.close()

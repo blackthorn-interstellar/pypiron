@@ -92,6 +92,7 @@ when enabled, Prometheus metrics.
 
 - **New public releases wait seven days by default.** This dependency cooldown
   gives maintainers and advisory services time to find a malicious release.
+  A release that an advisory names as a security fix skips the wait.
 - **Known malware is refused.** The binary includes a block set for first boot,
   then checks the OSV PyPI advisory feed for updates.
 - **Private names never resolve from public PyPI.** This blocks the common

@@ -23,7 +23,8 @@ use crate::clock::unix_now_secs;
 use crate::hash::sha256_hex;
 use crate::metrics::Metrics;
 use crate::osv::{
-    advance_watermark, block_hits, mal_rules, parse_modified, MalRule, OsvAdvisory, VersionScope,
+    advance_watermark, block_hits, fix_hit, fix_rules, mal_rules, parse_modified, FixRule, MalRule,
+    OsvAdvisory, VersionScope,
 };
 use crate::ssrf::{guarded_get, guarded_get_with, Guard, SsrfGuardResolver};
 use crate::storage::{self, Storage};
@@ -209,6 +210,15 @@ pub struct AdvisoryState {
     /// snapshot (re)load — the fresh baseline absorbs it and the probe backfills
     /// anything still newer, so there are no coherence states to reason about.
     pub overlay: Arc<HashMap<String, Vec<MalRule>>>,
+    /// Per-node probe overlay of security-fix rules from vulnerability
+    /// advisories newer than the baseline, keyed like the block overlay. Cleared
+    /// with it on every snapshot (re)load.
+    pub fix_overlay: Arc<HashMap<String, Vec<FixRule>>>,
+    /// Advisory ids the probe re-read since the baseline loaded (edited or
+    /// withdrawn). The baseline's fix rules for these ids are stale and ignored;
+    /// the fix overlay holds their current rules, if any. A withdrawn "fix"
+    /// stops exempting within a probe interval, not a day.
+    pub fix_superseded: Arc<HashSet<String>>,
     /// Worker-derived `quarantined` projects (rung 5), consulted by the byte
     /// gate. Carried across feed reloads; swapped by its own etag-gated reload.
     pub quarantined: HashSet<String>,
@@ -263,6 +273,18 @@ impl AdvisoryState {
             }
         }
         ids
+    }
+
+    /// Whether a settled vulnerability advisory names `(name_norm, version)` as
+    /// its fix, across the baseline (minus ids the probe superseded) ∪ the fix
+    /// overlay. Such a release may skip the rolling cooldown.
+    pub fn security_fix(&self, name_norm: &str, version: &str, now: OffsetDateTime) -> bool {
+        let baseline = self.db.as_ref().is_some_and(|db| {
+            fix_hit(db.fixes(), name_norm, version, now, |id| {
+                self.fix_superseded.contains(id)
+            })
+        });
+        baseline || fix_hit(&self.fix_overlay, name_norm, version, now, |_| false)
     }
 
     /// Whether anything can block yet: a loaded baseline, or a non-empty probe
@@ -580,6 +602,8 @@ async fn load_from_storage(storage: &dyn Storage) -> Result<Option<AdvisoryState
         zip: Some(zip),
         storage_etag: Some(etag),
         overlay: Arc::default(),
+        fix_overlay: Arc::default(),
+        fix_superseded: Arc::default(),
         quarantined: loaded.set,
         quarantined_etag: loaded.etag,
         quarantined_epoch: loaded.epoch,
@@ -651,6 +675,8 @@ async fn obtain_from_source(storage: &dyn Storage, feed: &str) -> Option<Advisor
         zip: Some(zip),
         storage_etag: feed_storage_etag(storage).await.unwrap_or(None),
         overlay: Arc::default(),
+        fix_overlay: Arc::default(),
+        fix_superseded: Arc::default(),
         quarantined: loaded.set,
         quarantined_etag: loaded.etag,
         quarantined_epoch: loaded.epoch,
@@ -1032,6 +1058,8 @@ async fn reload(ctx: &RefreshCtx<'_>) -> Result<bool> {
         // A fresh baseline clears the probe overlay: it now covers everything up
         // to its watermark, and the next probe backfills anything still newer.
         overlay: Arc::default(),
+        fix_overlay: Arc::default(),
+        fix_superseded: Arc::default(),
         loaded_unix: unix_now_secs(),
         // Carry the quarantined set + its etag forward (read under this lock).
         ..(**guard).clone()
@@ -1445,6 +1473,12 @@ pub async fn arm_quarantine(
 /// KB, so most polls read this little (and most read nothing — a 304).
 const PROBE_CSV_START_BYTES: u64 = 4096;
 
+/// Most vulnerability advisories one probe cycle fetches individually. Normal
+/// cycles see 0-10; OSV's bulk re-touches run 200-2,000 and, replayed against
+/// history, almost never name a fix still inside a cooldown — so past this the
+/// probe refreshes the whole snapshot instead.
+const PROBE_MAX_FIX_FETCHES: usize = 100;
+
 /// Ceiling on one fetched advisory JSON (OSV records are a few KB); reuses the
 /// zip per-entry bound.
 const MAX_ADVISORY_JSON_BYTES: u64 = crate::osv::MAX_ENTRY_BYTES;
@@ -1475,6 +1509,16 @@ pub struct ProbeMemo {
     csv_etag: Option<String>,
     /// Whether the source was failing last cycle (warn on transition, not per poll).
     source_failing: bool,
+    /// Set when a cycle saw a burst of vulnerability advisories too large to
+    /// fetch one by one; the worker turns it into an early snapshot refresh.
+    reload_requested: bool,
+}
+
+impl ProbeMemo {
+    /// Take (and clear) a pending request for an early snapshot refresh.
+    pub fn take_reload_request(&mut self) -> bool {
+        std::mem::take(&mut self.reload_requested)
+    }
 }
 
 /// One scan of the modified-id CSV head (a pure decision over already-fetched
@@ -1484,6 +1528,9 @@ struct CsvScan {
     /// `(modified, id)` for `MAL-*` lines strictly newer than the watermark, in
     /// file order (newest first).
     fresh_mal: Vec<(OffsetDateTime, String)>,
+    /// Every other (vulnerability) advisory id strictly newer than the
+    /// watermark, in file order — the fix-rule candidates.
+    fresh_other: Vec<String>,
     /// The newest `modified` across ALL fresh lines (MAL or not) — the watermark
     /// advance target, so a non-MAL bump isn't re-walked next cycle.
     max_modified: Option<OffsetDateTime>,
@@ -1500,10 +1547,11 @@ enum CsvWalk {
     Scanned { scan: CsvScan, etag: Option<String> },
 }
 
-/// Whether an id is a safe `MAL-*` advisory id to interpolate into a URL path —
-/// defends the per-advisory fetch against a hostile CSV line (path traversal).
+/// Whether an id is safe to interpolate into a URL path — defends the
+/// per-advisory fetch against a hostile CSV line (path traversal).
 fn is_probe_advisory_id(id: &str) -> bool {
-    id.starts_with("MAL-")
+    !id.is_empty()
+        && !id.starts_with('.')
         && id
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || b"-._".contains(&b))
@@ -1542,8 +1590,13 @@ fn parse_csv_head(text: &str, watermark: Option<OffsetDateTime>, is_full: bool) 
         }
         advance_watermark(&mut scan.max_modified, Some(ts_raw.trim()));
         let id = id.trim();
-        if is_probe_advisory_id(id) {
+        if !is_probe_advisory_id(id) {
+            continue;
+        }
+        if id.starts_with("MAL-") {
             scan.fresh_mal.push((ts, id.to_string()));
+        } else {
+            scan.fresh_other.push(id.to_string());
         }
     }
     scan
@@ -1552,18 +1605,18 @@ fn parse_csv_head(text: &str, watermark: Option<OffsetDateTime>, is_full: bool) 
 /// Upsert probe results into an overlay map: drop every rule whose id is being
 /// re-applied or withdrawn, then add the new rules. Idempotent (a re-applied id
 /// replaces, never duplicates) and order-independent; empty vectors are pruned.
-fn merge_overlay(
-    overlay: &mut HashMap<String, Vec<MalRule>>,
-    added: Vec<(String, MalRule)>,
+fn merge_overlay<R: OverlayRule>(
+    overlay: &mut HashMap<String, Vec<R>>,
+    added: Vec<(String, R)>,
     withdrawn: &HashSet<String>,
 ) {
     let mut stale: HashSet<String> = withdrawn.clone();
     for (_, rule) in &added {
-        stale.insert(rule.id.clone());
+        stale.insert(rule.id().to_string());
     }
     if !stale.is_empty() {
         for rules in overlay.values_mut() {
-            rules.retain(|r| !stale.contains(&r.id));
+            rules.retain(|r| !stale.contains(r.id()));
         }
         overlay.retain(|_, rules| !rules.is_empty());
     }
@@ -1572,8 +1625,42 @@ fn merge_overlay(
     }
 }
 
-/// Swap the probe overlay in the shared slot: upsert `added`, remove `withdrawn`,
-/// carrying the baseline/quarantine forward under the write lock (refcount bumps,
+/// A probe-overlay rule, keyed by the advisory id that contributed it.
+trait OverlayRule {
+    fn id(&self) -> &str;
+}
+
+impl OverlayRule for MalRule {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+impl OverlayRule for FixRule {
+    fn id(&self) -> &str {
+        &self.id
+    }
+}
+
+/// One probe cycle's changes. `fix_seen` is every vulnerability advisory id the
+/// cycle re-read: its baseline rules are superseded and its overlay rules
+/// replaced by `fix_added` (empty for a withdrawal).
+#[derive(Default)]
+struct ProbeDelta {
+    added: Vec<(String, MalRule)>,
+    withdrawn: HashSet<String>,
+    fix_added: Vec<(String, FixRule)>,
+    fix_seen: HashSet<String>,
+}
+
+impl ProbeDelta {
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.withdrawn.is_empty() && self.fix_seen.is_empty()
+    }
+}
+
+/// Swap the probe overlays in the shared slot: upsert `added`, remove `withdrawn`,
+/// replace the fix rules of every `fix_seen` id, carrying the baseline/quarantine forward under the write lock (refcount bumps,
 /// no await, no deep clone of the db). Shared byte-gate reads stay lock-cheap.
 ///
 /// `aligned_sha` is the baseline snapshot sha this cycle's overlay was computed
@@ -1585,17 +1672,22 @@ fn merge_overlay(
 fn apply_probe_overlay(
     slot: &RwLock<Arc<AdvisoryState>>,
     aligned_sha: Option<&str>,
-    added: Vec<(String, MalRule)>,
-    withdrawn: &HashSet<String>,
+    delta: ProbeDelta,
 ) {
     let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
     if guard.zip_sha256.as_deref() != aligned_sha {
         return; // baseline swapped under us; the next cycle re-baselines
     }
     let mut overlay = (*guard.overlay).clone();
-    merge_overlay(&mut overlay, added, withdrawn);
+    merge_overlay(&mut overlay, delta.added, &delta.withdrawn);
+    let mut fix_overlay = (*guard.fix_overlay).clone();
+    merge_overlay(&mut fix_overlay, delta.fix_added, &delta.fix_seen);
+    let mut fix_superseded = (*guard.fix_superseded).clone();
+    fix_superseded.extend(delta.fix_seen);
     *guard = Arc::new(AdvisoryState {
         overlay: Arc::new(overlay),
+        fix_overlay: Arc::new(fix_overlay),
+        fix_superseded: Arc::new(fix_superseded),
         ..(**guard).clone()
     });
 }
@@ -1777,8 +1869,7 @@ async fn probe_once(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) -> R
 
     // Fetch and classify each fresh MAL advisory. All-or-nothing this cycle: a
     // failed fetch bails before the floor advances, so the window is retried.
-    let mut added: Vec<(String, MalRule)> = Vec::new();
-    let mut withdrawn: HashSet<String> = HashSet::new();
+    let mut delta = ProbeDelta::default();
     let mut applied_ids: Vec<String> = Vec::new();
     let mut withdrawn_ids: Vec<String> = Vec::new();
     for (_, csv_id) in &scan.fresh_mal {
@@ -1789,19 +1880,49 @@ async fn probe_once(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) -> R
             adv.id.clone()
         };
         if adv.withdrawn.is_some() {
-            withdrawn.insert(id.clone());
+            delta.withdrawn.insert(id.clone());
             withdrawn_ids.push(id);
         } else {
             let rules = mal_rules(&adv);
             if !rules.is_empty() {
                 applied_ids.push(id);
-                added.extend(rules);
+                delta.added.extend(rules);
             }
         }
     }
 
-    if !added.is_empty() || !withdrawn.is_empty() {
-        apply_probe_overlay(ctx.slot, snap.zip_sha256.as_deref(), added, &withdrawn);
+    // Vulnerability advisories feed the cooldown's security-fix exemption. Best
+    // effort: one that fails to fetch never holds the malware path hostage — it
+    // stays in the cooldown until the daily snapshot. A burst (OSV re-touching
+    // old advisories in bulk) would be thousands of fetches for what is almost
+    // always stale news, so it asks for an early snapshot refresh instead.
+    if scan.fresh_other.len() > PROBE_MAX_FIX_FETCHES {
+        info!(
+            advisories = scan.fresh_other.len(),
+            "advisory burst; refreshing the snapshot early instead of fetching each"
+        );
+        memo.reload_requested = true;
+    } else {
+        for csv_id in &scan.fresh_other {
+            let adv = match source.fetch_advisory(csv_id).await {
+                Ok(adv) => adv,
+                Err(e) => {
+                    debug!(error = %e, id = %csv_id, "fix probe: advisory fetch failed; left to the daily snapshot");
+                    continue;
+                }
+            };
+            let id = if adv.id.is_empty() {
+                csv_id.clone()
+            } else {
+                adv.id.clone()
+            };
+            delta.fix_seen.insert(id);
+            delta.fix_added.extend(fix_rules(&adv));
+        }
+    }
+
+    if !delta.is_empty() {
+        apply_probe_overlay(ctx.slot, snap.zip_sha256.as_deref(), delta);
         if !applied_ids.is_empty() {
             info!(advisories = ?applied_ids, "malware advisory applied ahead of the daily baseline");
         }
@@ -2124,6 +2245,66 @@ mod tests {
         let scan = parse_csv_head("2024-05-01T00:00:00Z,MAL-2024-9\n", wm, true);
         assert!(scan.complete);
         assert_eq!(ids_of(&scan), ["MAL-2024-9"]);
+    }
+
+    #[test]
+    fn csv_scan_splits_malware_from_fix_candidates() {
+        let wm = parse_modified("2024-03-01T00:00:00Z");
+        let csv = "2024-05-01T00:00:00Z,GHSA-aaaa-bbbb-cccc\n\
+                   2024-04-02T00:00:00Z,MAL-2024-9\n\
+                   2024-04-01T00:00:00Z,PYSEC-2024-8\n\
+                   2024-02-01T00:00:00Z,PYSEC-2024-1\n";
+        let scan = parse_csv_head(csv, wm, true);
+        assert_eq!(ids_of(&scan), ["MAL-2024-9"]);
+        assert_eq!(scan.fresh_other, ["GHSA-aaaa-bbbb-cccc", "PYSEC-2024-8"]);
+    }
+
+    #[test]
+    fn probe_edit_or_withdrawal_supersedes_the_baseline_fix() {
+        let mut adv = pysec_fixed("PYSEC-1", "certlib", "2.0");
+        adv["modified"] = "2026-01-01T00:00:00Z".into();
+        let db = parse_feed(&osv_zip(&[("p.json", adv.clone())])).unwrap();
+        let slot = RwLock::new(Arc::new(AdvisoryState {
+            db: Some(Arc::new(db)),
+            ..AdvisoryState::default()
+        }));
+        let now = OffsetDateTime::now_utc();
+        assert!(AdvisoryState::read(&slot).security_fix("certlib", "2.0", now));
+
+        // An edit restarts the settle hour: the baseline copy stops counting
+        // and the overlay's fresh copy hasn't settled yet.
+        adv["modified"] = now
+            .format(&time::format_description::well_known::Rfc3339)
+            .unwrap()
+            .into();
+        let edited: OsvAdvisory = serde_json::from_value(adv.clone()).unwrap();
+        apply_probe_overlay(
+            &slot,
+            None,
+            ProbeDelta {
+                fix_added: fix_rules(&edited),
+                fix_seen: HashSet::from(["PYSEC-1".to_string()]),
+                ..ProbeDelta::default()
+            },
+        );
+        let state = AdvisoryState::read(&slot);
+        assert!(!state.security_fix("certlib", "2.0", now));
+        assert!(state.security_fix("certlib", "2.0", now + crate::osv::FIX_SETTLE));
+
+        // A withdrawal removes it outright.
+        adv["withdrawn"] = adv["modified"].clone();
+        let withdrawn: OsvAdvisory = serde_json::from_value(adv).unwrap();
+        apply_probe_overlay(
+            &slot,
+            None,
+            ProbeDelta {
+                fix_added: fix_rules(&withdrawn),
+                fix_seen: HashSet::from(["PYSEC-1".to_string()]),
+                ..ProbeDelta::default()
+            },
+        );
+        let later = now + crate::osv::FIX_SETTLE;
+        assert!(!AdvisoryState::read(&slot).security_fix("certlib", "2.0", later));
     }
 
     #[test]

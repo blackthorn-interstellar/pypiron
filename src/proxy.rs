@@ -1669,6 +1669,17 @@ impl Proxy {
         // upstream-quarantined project returns no files anyway, so the marker
         // rides along with a naturally empty listing.
         let status = index.project_status.clone().unwrap_or_default();
+        let fixes = self
+            .mirror
+            .fix_lifts_cooldown()
+            .then(|| state.advisory_snapshot());
+        let now = crate::clock::now_utc();
+        let security_fix = |filename: &str| {
+            fixes.as_ref().is_some_and(|snap| {
+                infer_version_from_filename(filename)
+                    .is_some_and(|v| snap.security_fix(pkg, &v, now))
+            })
+        };
         let files: Vec<SimpleFile> = index
             .files
             .into_iter()
@@ -1677,8 +1688,9 @@ impl Proxy {
             // Every mirror gate except the yank one: a file yanked upstream stays
             // listed (with `data-yanked`, PEP 592) so an exact pin against bytes
             // we already cached still resolves. `exclude-yanked` gates the fill
-            // instead — see `fill_refused_by_yank`.
-            .filter(|f| matches_mirror_listing(f, &self.mirror))
+            // instead — see `fill_refused_by_yank`. A release a settled
+            // vulnerability advisory names as its fix skips the cooldown.
+            .filter(|f| matches_mirror_listing(f, &self.mirror, security_fix(&f.filename)))
             // The scope's version axis: a pinned/ranged allowlist entry serves
             // only matching versions, exactly as `sync` mirrors only matching
             // versions. No scope → kept.

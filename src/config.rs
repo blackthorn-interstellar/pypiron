@@ -93,6 +93,8 @@ pub struct UpstreamConfig {
     pub exclude_larger: Option<String>,
     /// Yanked files (PEP 592) are excluded by default; set `true` to mirror them.
     pub include_yanked: Option<bool>,
+    /// Advisory-named fix releases skip a rolling cooldown; default true.
+    pub security_fixes_skip_cooldown: Option<bool>,
 }
 
 /// `[serve]`: the server process. Non-secret knobs only — admin/uploader/read

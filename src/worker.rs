@@ -939,6 +939,10 @@ pub async fn run_worker_until(
                             &mut memo,
                         )
                         .await;
+                        // An advisory burst is cheaper as one snapshot refresh.
+                        if memo.take_reload_request() {
+                            job_state.advisory_reload_asap.store(true, Ordering::SeqCst);
+                        }
                     });
                 }
             }

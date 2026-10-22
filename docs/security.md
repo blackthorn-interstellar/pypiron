@@ -55,6 +55,24 @@ snapshot, or pass an empty value to disable the cooldown.
 
 [Cooldown formats and mirror selection](reference/configuration.md#mirror-selection)
 
+### Security fixes skip the wait
+
+A cooldown that also held back security fixes would leave you exposed for a
+week. When a vulnerability advisory in the OSV feed names a release as the fix,
+pypiron serves that exact release as soon as the advisory has been unchanged
+for an hour. Every other new release still waits, including a later version of
+the same package.
+
+The hour gives a bogus advisory time to be withdrawn. Malware blocking still
+applies to the fix. Replayed against OSV's history, about 2,200 fix releases
+across 770 packages would have arrived a median 6.4 days sooner, and none was
+later flagged as malware.
+
+New advisories arrive within minutes through the same check that picks up
+malware advisories. `sync` uses the advisory feed it carries; without one,
+fixes wait like any other release. A fixed-date `--exclude-newer` is never
+lifted. Set `--security-fixes-skip-cooldown false` to hold fixes too.
+
 ### PyPI withdrawals remain withdrawn
 
 pypiron follows upstream yanks, removed files, and PEP 792 project quarantine.

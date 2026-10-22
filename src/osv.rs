@@ -139,11 +139,29 @@ pub struct AdvisoryRecord {
     pub matcher: VersionScope,
 }
 
+/// How long a vulnerability advisory must sit unchanged before the release it
+/// names as the fix may skip the cooldown. A bogus advisory pointing at a
+/// malicious "fix" gets this long to be withdrawn or flagged as malware, and any
+/// edit restarts the clock.
+pub const FIX_SETTLE: time::Duration = time::Duration::hours(1);
+
+/// One security-fix rule: a vulnerability advisory naming `version` as the
+/// release that fixes it. That exact release may skip the rolling cooldown from
+/// `eligible_at` (the advisory's `modified` plus [`FIX_SETTLE`]).
+#[derive(Debug, Clone)]
+pub struct FixRule {
+    pub id: String,
+    pub version: Version,
+    pub eligible_at: OffsetDateTime,
+}
+
 /// The parsed snapshot: normalized name → rules/records.
 #[derive(Debug, Default)]
 pub struct AdvisoryDb {
     block: HashMap<String, Vec<MalRule>>,
     audit: HashMap<String, Vec<AdvisoryRecord>>,
+    /// Security-fix rules from every non-`MAL-*` advisory.
+    fixes: HashMap<String, Vec<FixRule>>,
     /// The newest `modified` timestamp seen across every entry in the snapshot
     /// (withdrawn/non-PyPI included), the baseline the per-node malware probe
     /// backfills from. `None` when no entry carried a parseable `modified`.
@@ -173,6 +191,45 @@ impl AdvisoryDb {
     pub fn audit_has_name(&self, name_norm: &str) -> bool {
         self.audit.contains_key(name_norm)
     }
+
+    /// The security-fix rules by normalized name.
+    pub(crate) fn fixes(&self) -> &HashMap<String, Vec<FixRule>> {
+        &self.fixes
+    }
+
+    /// Whether an advisory names `name_norm` at `version` as a settled fix.
+    pub fn security_fix(&self, name_norm: &str, version: &str, now: OffsetDateTime) -> bool {
+        fix_hit(&self.fixes, name_norm, version, now, |_| false)
+    }
+
+    /// Whether any fix rule for `name_norm` became (or will become) eligible
+    /// after `since` — a fix release that may still be inside the cooldown.
+    pub fn fix_since(&self, name_norm: &str, since: OffsetDateTime) -> bool {
+        self.fixes
+            .get(name_norm)
+            .is_some_and(|rules| rules.iter().any(|r| r.eligible_at > since))
+    }
+}
+
+/// Whether a fix rule in `fixes` names `name_norm` at `version` and has settled
+/// by `now`. Rules whose id `skip`s are ignored (the probe superseded them).
+/// An unparseable version is never a fix: the exemption fails closed.
+pub(crate) fn fix_hit(
+    fixes: &HashMap<String, Vec<FixRule>>,
+    name_norm: &str,
+    version: &str,
+    now: OffsetDateTime,
+    skip: impl Fn(&str) -> bool,
+) -> bool {
+    let Some(rules) = fixes.get(name_norm) else {
+        return false;
+    };
+    let Ok(version) = version.parse::<Version>() else {
+        return false;
+    };
+    rules
+        .iter()
+        .any(|r| r.version == version && r.eligible_at <= now && !skip(&r.id))
 }
 
 /// The `MAL-*` ids that condemn `name_norm` at `version` (empty = not blocked).
@@ -287,6 +344,9 @@ struct OsvPackage {
 
 #[derive(Deserialize, Default)]
 struct OsvRange {
+    /// `ECOSYSTEM` (PEP 440 versions) or `GIT` (commit hashes).
+    #[serde(default, rename = "type")]
+    kind: String,
     #[serde(default)]
     events: Vec<OsvEvent>,
 }
@@ -391,6 +451,7 @@ fn ingest_advisory(db: &mut AdvisoryDb, adv: &OsvAdvisory) -> bool {
         .map(str::to_string)
         .unwrap_or_default();
     let summary = truncated(&adv.summary, MAX_SUMMARY_BYTES);
+    let fix_eligible_at = fix_eligible_at(adv);
 
     let mut matched_pypi = false;
     for (name, affected) in pypi_clauses(adv) {
@@ -401,6 +462,11 @@ fn ingest_advisory(db: &mut AdvisoryDb, adv: &OsvAdvisory) -> bool {
                 id: adv.id.clone(),
                 scope: scope.clone(),
             });
+        } else if let Some(at) = fix_eligible_at {
+            let rules = clause_fixes(&adv.id, affected, at);
+            if !rules.is_empty() {
+                db.fixes.entry(name.clone()).or_default().extend(rules);
+            }
         }
         db.audit.entry(name).or_default().push(AdvisoryRecord {
             id: adv.id.clone(),
@@ -501,6 +567,51 @@ fn parse_ranges(ranges: &[OsvRange]) -> Vec<(Version, Option<Version>)> {
         }
     }
     pairs
+}
+
+/// When a vulnerability advisory's named fixes may skip the cooldown: its
+/// `modified` plus [`FIX_SETTLE`]. `None` (no readable `modified`) means never.
+fn fix_eligible_at(adv: &OsvAdvisory) -> Option<OffsetDateTime> {
+    adv.modified
+        .as_deref()
+        .and_then(parse_modified)
+        .map(|m| m.saturating_add(FIX_SETTLE))
+}
+
+/// The fix rules one affected clause contributes: each `fixed` event of an
+/// `ECOSYSTEM` range that reads as a PEP 440 version.
+fn clause_fixes(id: &str, affected: &OsvAffected, eligible_at: OffsetDateTime) -> Vec<FixRule> {
+    affected
+        .ranges
+        .iter()
+        .filter(|range| range.kind.eq_ignore_ascii_case("ECOSYSTEM"))
+        .flat_map(|range| range.events.iter().filter_map(|e| e.fixed.as_deref()))
+        .filter_map(|fixed| fixed.parse::<Version>().ok())
+        .map(|version| FixRule {
+            id: id.to_string(),
+            version,
+            eligible_at,
+        })
+        .collect()
+}
+
+/// The fix rules one parsed advisory contributes: `(normalized_name, rule)` per
+/// named fix. Empty for `MAL-*`, withdrawn, or undated advisories. The same
+/// logic [`ingest_advisory`] uses, for the probe's overlay.
+pub(crate) fn fix_rules(adv: &OsvAdvisory) -> Vec<(String, FixRule)> {
+    if adv.withdrawn.is_some() || !usable_id(&adv.id) || adv.id.starts_with("MAL-") {
+        return Vec::new();
+    }
+    let Some(at) = fix_eligible_at(adv) else {
+        return Vec::new();
+    };
+    pypi_clauses(adv)
+        .flat_map(|(name, affected)| {
+            clause_fixes(&adv.id, affected, at)
+                .into_iter()
+                .map(move |rule| (name.clone(), rule))
+        })
+        .collect()
 }
 
 /// The fixed-in versions named across a clause's ranges (raw, for display).
@@ -1006,5 +1117,50 @@ mod tests {
         .unwrap();
         assert!(blocking_advisories(&db, "victim", Some("1.0")).is_empty());
         assert_eq!(db.audit_records(), 0);
+    }
+
+    fn at(ts: &str) -> OffsetDateTime {
+        OffsetDateTime::parse(ts, &Rfc3339).unwrap()
+    }
+
+    #[test]
+    fn named_fix_is_exempt_only_after_the_settle_hour() {
+        let mut adv = pysec_fixed("GHSA-aaaa-bbbb-cccc", "Cert.Lib", "2.0");
+        adv["modified"] = "2026-10-20T19:00:00Z".into();
+        let db = parse_feed(&osv_zip(&[("GHSA.json", adv)])).unwrap();
+        let settled = at("2026-10-20T20:00:00Z");
+        // PEP 440 equality, normalized names, exact version only.
+        assert!(db.security_fix("cert-lib", "2.0.0", settled));
+        assert!(!db.security_fix("cert-lib", "2.0.1", settled));
+        assert!(!db.security_fix("cert-lib", "not a version", settled));
+        // Not before the advisory has sat unchanged for an hour.
+        assert!(!db.security_fix("cert-lib", "2.0", at("2026-10-20T19:59:59Z")));
+        assert!(db.fix_since("cert-lib", at("2026-10-14T00:00:00Z")));
+        assert!(!db.fix_since("cert-lib", settled));
+    }
+
+    #[test]
+    fn malware_withdrawn_undated_and_git_fixes_never_exempt() {
+        let now = at("2030-01-01T00:00:00Z");
+        let mut mal = mal_exact("MAL-2026-1", "evil", "1.0");
+        mal["affected"][0]["ranges"] = serde_json::json!([{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": "1.0"}]}]);
+        mal["modified"] = "2026-01-01T00:00:00Z".into();
+        let mut withdrawn = pysec_fixed("PYSEC-1", "gone", "1.0");
+        withdrawn["modified"] = "2026-01-01T00:00:00Z".into();
+        withdrawn["withdrawn"] = "2026-01-01T00:00:00Z".into();
+        let undated = pysec_fixed("PYSEC-2", "undated", "1.0");
+        let mut git = pysec_fixed("PYSEC-3", "gitonly", "1");
+        git["modified"] = "2026-01-01T00:00:00Z".into();
+        git["affected"][0]["ranges"][0]["type"] = "GIT".into();
+        let db = parse_feed(&osv_zip(&[
+            ("a.json", mal),
+            ("b.json", withdrawn),
+            ("c.json", undated),
+            ("d.json", git),
+        ]))
+        .unwrap();
+        for name in ["evil", "gone", "undated", "gitonly"] {
+            assert!(!db.security_fix(name, "1.0", now), "{name} must not exempt");
+        }
     }
 }

@@ -553,7 +553,11 @@ def disk_server_access_log_clf(tmp_path_factory, pypiron_bin: Path) -> Iterator[
 
 
 def _start_proxy_pair(
-    tmp_path_factory, pypiron_bin: Path, proxy_extra_args=(), exclude_newer: str | None = ""
+    tmp_path_factory,
+    pypiron_bin: Path,
+    proxy_extra_args=(),
+    exclude_newer: str | None = "",
+    proxy_extra_env=None,
 ) -> Iterator[Dict]:
     """An upstream disk server plus a second server proxying it on demand.
 
@@ -577,6 +581,7 @@ def _start_proxy_pair(
             *cooldown,
             *proxy_extra_args,
         ],
+        extra_env=proxy_extra_env,
     )
     proxy = next(proxy_gen)
     try:

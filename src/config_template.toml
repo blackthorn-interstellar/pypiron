@@ -202,6 +202,8 @@
 # timestamp, a date, a day count, or a duration ("30 days"). Set "" to mirror
 # right up to now.
 # exclude-newer = "7"
+# security-fixes-skip-cooldown = true       # a release a vulnerability advisory names
+                                            # as the fix skips a sliding cooldown
 # exclude-older = "2020-01-01"              # keep only files at or after this cutoff
 
 

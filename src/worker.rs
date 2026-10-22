@@ -853,9 +853,21 @@ pub async fn run_worker_until(
         // what left followers holding an empty quarantine set forever whenever
         // the feed was off. With the feed off the tick costs one 1-key LIST per
         // reconcile interval and no fetch.
+        //
+        // A follower never fetches the source, so its tick is just that LIST and
+        // runs on the short quarantine cadence: it adopts the leader's new
+        // snapshot within seconds of the write, instead of whenever its own daily
+        // tick next lands — which, landing just before the leader's write, left
+        // it a day behind (and an advisory burst's early refresh racing the
+        // leader's write never caught up at all).
         let advisory_forced = state.advisory_reload_asap.load(Ordering::SeqCst);
-        let advisory_due = advisory_forced
-            || last_advisory_refresh.is_none_or(|t| t.elapsed() >= state.reconcile_interval);
+        let advisory_every = if is_leader {
+            state.reconcile_interval
+        } else {
+            state.quarantine_poll_interval
+        };
+        let advisory_due =
+            advisory_forced || last_advisory_refresh.is_none_or(|t| t.elapsed() >= advisory_every);
         if advisory_due && !advisory_running.swap(true, Ordering::SeqCst) {
             last_advisory_refresh = Some(Instant::now());
             if advisory_forced {

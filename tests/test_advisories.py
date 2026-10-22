@@ -29,12 +29,12 @@ import subprocess
 import threading
 import time
 import zipfile
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from pathlib import Path
 
 import pytest
 
-from .conftest import _start_disk_server, _start_proxy_pair
+from .conftest import _start_disk_server, _start_proxy_pair, _start_s3_server
 from .helpers import (
     _encode_basic_auth,
     find_free_port,
@@ -2067,3 +2067,50 @@ def test_sync_carries_advisory_named_fix_through_cooldown(tmp_path_factory, pypi
     finally:
         dst_gen.close()
         src_gen.close()
+
+
+@pytest.mark.s3
+def test_follower_adopts_a_new_snapshot_within_seconds(
+    minio, pypiron_bin, tmp_path_factory, tmp_path
+):
+    """A follower never fetches the feed; it loads whatever snapshot the fleet
+    stored. It checks for a new one on the short quarantine cadence, not the
+    daily reconcile tick, so malware blocks (and security fixes) in a snapshot
+    the leader stored reach it within seconds. Before, it waited up to a day."""
+    empty = make_osv_zip(tmp_path / "empty.zip", _baseline_records())
+    args = [
+        "--advisory-feed",
+        str(empty),
+        "--reconcile-interval-secs",
+        "86400",
+        "--quarantine-poll-secs",
+        "1",
+        "--audit-on-boot",
+        "false",
+    ]
+    start = contextmanager(_start_s3_server)
+    with ExitStack() as stack:
+        # A starts first and takes the lease; B joins as the follower under test.
+        node_a = stack.enter_context(start(tmp_path_factory, pypiron_bin, minio, extra_args=args))
+        _wait_log_contains(node_a["log_path"], "lease acquired")
+        node_b = stack.enter_context(start(tmp_path_factory, pypiron_bin, minio, extra_args=args))
+        bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        upload_legacy(
+            node_a["legacy"], bad, username="admin", password="secret", fields={"mirror": "true"}
+        )
+        file_url = f"{node_b['base_url']}/files/{MAL_EXACT_PKG}/{bad.name}"
+        assert _poll_http_status(file_url, {200, 302}), "follower never served the file"
+
+        # The leader stores a snapshot with a malware block for that file.
+        feed = make_osv_zip(tmp_path / "mal.zip", canonical_records()).read_bytes()
+        code, _, _ = http_request_auth(
+            "PUT",
+            f"{node_a['base_url']}/advisories/feed",
+            username="admin",
+            password="secret",
+            data=feed,
+        )
+        assert code == 204
+        blocked = _poll_http_status(file_url, {403}, timeout=15)
+        assert blocked is not None, "the follower never adopted the stored snapshot"
+        assert MAL_EXACT_ID.encode() in blocked[1], blocked

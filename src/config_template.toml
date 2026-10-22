@@ -160,6 +160,7 @@
 # audit-on-boot = true                      # self-heal sweep when a node becomes leader
 # reconcile-interval-secs = 86400           # audit sweep interval (an unchanged corpus is ~free)
 # quarantine-poll-secs = 30                 # max delay before other nodes adopt a project freeze
+                                            # or a new advisory snapshot
 # transparency = true                       # write tamper-evident checkpoints (pypiron verify-chain)
 # repl-sweep-interval-secs = 300             # _repl/ repair-note sweep backstop (also fires on bucket heal)
 # lease-ttl-secs = 30                       # leader lease TTL (multi-node S3)

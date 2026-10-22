@@ -999,8 +999,9 @@ pub struct ServeArgs {
 
     /// Seconds between checks of the shared PEP 792 quarantined set. This is how
     /// long a project frozen on one node takes to be refused by the rest of the
-    /// fleet; the node that received the freeze refuses immediately. One 1-key
-    /// listing per node per interval, so raising it only matters on very large
+    /// fleet; the node that received the freeze refuses immediately. Followers
+    /// also check for a new advisory snapshot on this cadence. Two 1-key
+    /// listings per node per interval, so raising it only matters on very large
     /// fleets. Kept separate from the audit sweep, which runs on
     /// `--reconcile-interval-secs` and can sit behind a 32 MB advisory refetch.
     #[arg(long, env = "PYPIRON_QUARANTINE_POLL_SECS", default_value = "30")]

@@ -240,7 +240,7 @@ backends are supported. With more than one bucket:
 | `--intent-grace-secs N` | `PYPIRON_INTENT_GRACE_SECS` | `900` | Grace for an upload or cross-bucket package operation. Minimum `3`; maximum `9223372036854775807`. |
 | `--audit-on-boot true\|false` | `PYPIRON_AUDIT_ON_BOOT` | `true` | Run the consistency check on boot: indexes against stored files, buckets against each other. |
 | `--reconcile-interval-secs N` | `PYPIRON_RECONCILE_INTERVAL_SECS` | `86400` | How often that check repeats. |
-| `--quarantine-poll-secs N` | `PYPIRON_QUARANTINE_POLL_SECS` | `30` | Maximum delay before other nodes adopt a project freeze. The receiving node refuses immediately. One small listing per node per interval. |
+| `--quarantine-poll-secs N` | `PYPIRON_QUARANTINE_POLL_SECS` | `30` | Maximum delay before other nodes adopt a project freeze or a new advisory snapshot. The receiving node refuses immediately. Two small listings per node per interval. |
 | `--transparency true\|false` | `PYPIRON_TRANSPARENCY` | `true` | Record each audit's file hashes under `_transparency/`; `pypiron verify-chain` reads the records. Off stops new records only. |
 | `--lease-ttl-secs N` | `PYPIRON_LEASE_TTL_SECS` | `30` | Multi-node leader lease TTL. |
 | `--download-stats true\|false` | `PYPIRON_DOWNLOAD_STATS` | `true` | Count package downloads. |

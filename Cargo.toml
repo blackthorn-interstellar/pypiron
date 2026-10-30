@@ -42,13 +42,13 @@ md-5 = "0.11"
 # ECDSA-P256/SHA-256). p384: the Fulcio cert chain (ECDSA-P384/SHA-384).
 # ed25519-dalek: the Rekor "Log2025" SET. x509-cert: parse/re-encode Fulcio
 # certs. See src/attest.rs; the trust root is embedded (src/assets/).
-p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
-p384 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8"] }
+p384 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8"] }
 ed25519-dalek = { version = "2", default-features = false }
-ecdsa = { version = "0.16", default-features = false, features = ["der"] }
+ecdsa = { version = "0.17", default-features = false, features = ["der"] }
 signature = { version = "2", default-features = false }
 x509-cert = { version = "0.2", default-features = false, features = ["pem"] }
-zip = { version = "9.0.4", default-features = false, features = ["deflate"] }
+zip = { version = "9.0.5", default-features = false, features = ["deflate"] }
 # gzip handles upstream Simple-index/JSON responses; wheels are already
 # compressed, so brotli/zstd buy nothing but two C/Rust codec dependency trees.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "multipart", "gzip", "stream"] }
@@ -58,7 +58,7 @@ toml = "1.1.2"
 # IP literal vs a name in the SSRF guard.
 url = "2"
 object_store = { version = "0.14.1", features = ["aws", "gcp", "azure"] }
-pulldown-cmark = { version = "0.13.4", default-features = false }
+pulldown-cmark = { version = "0.13.5", default-features = false }
 
 # mimalloc on every arch except s390x/ppc64le: their manylinux2014 cross-GCC is too
 # old to accept the `-Wno-error=date-time` flag libmimalloc-sys passes, so the C

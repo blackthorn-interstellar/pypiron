@@ -33,7 +33,7 @@ CLIENT_PINS = {
     "pip": "venv-seeded",
     "uv": "system",
     "poetry": "2.4.1",
-    "pdm": "2.27.0",
+    "pdm": "2.29.5",
     "twine": "dev-dependency",
     "flit": "4.0.2",
     "hatch": "1.17.0",

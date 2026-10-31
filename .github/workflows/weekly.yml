@@ -1,12 +1,18 @@
-name: Weekly
+name: Scheduled checks
 
-# Slow quality checks that are too heavy for a per-PR merge gate: the full
-# multi-client compatibility matrix, the full-PyPI corpus check (hits the public
-# ClickHouse metadata mirror), and a Rust unit-test coverage summary. Runs weekly
-# and on demand.
+# Slow quality checks kept out of the per-PR merge gate: the multi-client
+# compatibility matrix, the full-PyPI corpus check, a Rust unit-test coverage
+# summary, and the real-S3 blackbox leg.
+#
+# The compat matrix and corpus check run daily, but only when master moved since
+# their last green run; Mondays and manual dispatches run them regardless,
+# because the compat matrix also breaks on third-party releases with no commit
+# of ours (unearth 0.19.0 broke every PDM through 2.27.0). Coverage and real-S3
+# stay weekly.
 on:
   schedule:
-    - cron: '0 6 * * 1' # Mondays, 06:00 UTC
+    - cron: '0 6 * * 1' # Mondays, 06:00 UTC: everything
+    - cron: '0 6 * * 0,2-6' # other days, 06:00 UTC: compat + corpus, if master moved
   workflow_dispatch:
 
 env:
@@ -20,8 +26,43 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  gate:
+    name: what to run
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read # list this workflow's earlier runs
+    outputs:
+      weekly: ${{ steps.decide.outputs.weekly }}
+      changed: ${{ steps.decide.outputs.changed }}
+    steps:
+      - name: Decide
+        id: decide
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EVENT: ${{ github.event_name }}
+          CRON: ${{ github.event.schedule }}
+        run: |
+          if [ "$EVENT" != schedule ] || [ "$CRON" = '0 6 * * 1' ]; then
+            echo "weekly=true" >> "$GITHUB_OUTPUT"
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "weekly=false" >> "$GITHUB_OUTPUT"
+          last=$(gh run list --repo "$GITHUB_REPOSITORY" --workflow weekly.yml \
+            --branch "$GITHUB_REF_NAME" --event schedule --status success \
+            --limit 1 --json headSha --jq '.[0].headSha // ""')
+          if [ "$last" = "$GITHUB_SHA" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "master unchanged since the last green run ($last) — skipping."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          fi
+
   compat:
     name: client compat matrix
+    needs: gate
+    if: needs.gate.outputs.changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
@@ -42,6 +83,8 @@ jobs:
 
   corpus:
     name: full-PyPI corpus check
+    needs: gate
+    if: needs.gate.outputs.changed == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     steps:
@@ -71,6 +114,8 @@ jobs:
 
   coverage:
     name: coverage (llvm-cov)
+    needs: gate
+    if: needs.gate.outputs.weekly == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
@@ -120,7 +165,10 @@ jobs:
     # stops a convenient `gh workflow run weekly.yml --ref <branch>` from being
     # the exploit. Branch and tag refs deliberately lose the real-S3 leg and get
     # it back on the next scheduled master run.
-    if: github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main'
+    needs: gate
+    if: >-
+      needs.gate.outputs.weekly == 'true' &&
+      (github.ref == 'refs/heads/master' || github.ref == 'refs/heads/main')
     runs-on: ubuntu-latest
     timeout-minutes: 30
     # Repo config (Settings → Secrets and variables → Actions):

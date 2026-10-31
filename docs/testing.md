@@ -15,7 +15,7 @@ resolve, download, and install real packages against local disk and object
 storage.
 
 uv, pip, and twine run on every pull request. The
-[weekly compatibility matrix](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#client-compatibility-matrix)
+[daily compatibility matrix](https://github.com/blackthorn-interstellar/pypiron/blob/master/dev/TESTING.md#client-compatibility-matrix)
 runs all eight clients against disk and records their exact versions.
 
 Old pip gets its own check on every pull request: an install with every pip
@@ -26,7 +26,7 @@ supports.
 ## Every PyPI filename
 
 The parser corpus contains all 17,130,626 filenames published to PyPI when the
-corpus was built. Weekly CI checks package names, versions, wheel tags, and file
+corpus was built. Daily CI checks package names, versions, wheel tags, and file
 types against that corpus so unusual historical packages do not become parser
 bugs.
 

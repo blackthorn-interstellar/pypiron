@@ -2462,8 +2462,12 @@ execution, working `-s`, and pdb.
 | Every PR (CI) | fmt, clippy `-D warnings`, Rust unit, model checking (bounded configs) + conformance suites, VOPR smoke (fault + crash-only + rotating + delist profiles), blackbox on disk + S3 (MinIO) + Azure (Azurite), `cargo-audit`, fuzz-target build smoke |
 | Push to `master` (CI) | all of the above, plus the real-GCS blackbox (when the bucket secret is configured) |
 | Nightly | coverage-guided fuzzing (all six targets); deterministic simulation at volume + deep model configs (simulation.yml, counters and the oracle-reach gate published per run) |
-| Weekly | client compat matrix, full-PyPI corpus check, unit-test coverage, real-S3 blackbox (when the bucket secret is configured) |
+| Daily, when `master` moved (always on Mondays) | client compat matrix, full-PyPI corpus check |
+| Weekly | unit-test coverage, real-S3 blackbox (when the bucket secret is configured) |
 | Local / opt-in | `perf` and `stress` (release binary, excluded from default runs) |
+
+`make ci-status` prints the latest `master` run of every scheduled workflow, with
+the failed jobs of any red one.
 
 ## Performance testing
 

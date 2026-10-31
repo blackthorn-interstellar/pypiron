@@ -504,7 +504,7 @@ jobs:
     # run their own selection against MinIO/Azurite (Docker is preinstalled on the
     # runner, so the fixtures find it instead of skipping). The multi-client compat
     # matrix (poetry/pdm/flit/hatch via uvx) and the full-PyPI corpus check are too
-    # slow for a merge gate and run in the weekly workflow, not here.
+    # slow for a merge gate and run in the scheduled workflow (weekly.yml), not here.
     name: blackbox (${{ matrix.backend }})
     runs-on: ubuntu-latest
     timeout-minutes: 25

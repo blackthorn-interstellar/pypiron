@@ -39,7 +39,7 @@ on:
       - master
   schedule:
     # Weekly Monday 09:17 UTC. The repo spaces its crons on purpose: fuzz 03:00
-    # daily, simulation 03:30 daily, weekly 06:00 Monday. This lands clear of all
+    # daily, simulation 03:30 daily, scheduled checks 06:00 daily. This lands clear of all
     # three so a slow scan never contends with them for runner minutes.
     - cron: '17 9 * * 1'
   workflow_dispatch:

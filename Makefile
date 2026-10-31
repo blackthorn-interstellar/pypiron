@@ -1,4 +1,4 @@
-.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf microbench compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve docs-truth build-wheel release-notes fuzz fuzz-build vopr-soak dr-drill viz help
+.PHONY: init init-rust init-python build dev run test test-rust test-python test-s3-real test-gcs-real perf microbench ci-status compat check cargo-check af fmt lint audit coverage clean doc docs docs-serve docs-truth build-wheel release-notes fuzz fuzz-build vopr-soak dr-drill viz help
 
 SHELL := /bin/bash
 
@@ -49,6 +49,9 @@ perf:  ## Run performance benchmarks (builds release binary)
 
 microbench: build  ## Tracked per-endpoint latencies at the 50k-package tier (dev/bench/MICROBENCH.md)
 	python3 dev/bench/microbench.py run --packages $(or $(PACKAGES),50000)
+
+ci-status:  ## Latest master run of each scheduled workflow (fuzz, simulation, nightly deps, scheduled checks, security)
+	bash dev/scripts/ci-status.sh
 
 compat:  ## Run the real-client compatibility tests (poetry, pdm, flit, hatch, pipenv, ...)
 	uv run -- pytest tests -m "compat and not perf and not stress"

@@ -37,7 +37,7 @@ name: Nightly deps
 on:
   schedule:
     # 08:41 UTC. The repo spaces its crons on purpose: fuzz 03:00 daily,
-    # simulation 03:30 daily, weekly Mondays 06:00, security Mondays 09:17.
+    # simulation 03:30 daily, scheduled checks 06:00 daily, security Mondays 09:17.
     # This lands clear of all four, and clear of the 09:17 scan in particular —
     # the PR this lane opens dispatches its own Security run, and two full scans
     # contending for runner minutes on a Monday morning helps nobody.

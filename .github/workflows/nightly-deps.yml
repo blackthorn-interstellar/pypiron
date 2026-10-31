@@ -361,7 +361,7 @@ jobs:
           git add uv.lock Cargo.lock fuzz/Cargo.lock
           git commit -m "deps: nightly bump $(date -u +%F)"
           git push -f origin "$BRANCH"
-          gh label create nightly-deps --color 1D76DB --description "automated nightly dependency bump" || true
+          gh label create nightly-deps --repo "$GITHUB_REPOSITORY" --color 1D76DB --description "automated nightly dependency bump" || true
           if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq length)" = "0" ]; then
             gh pr create --base master --head "$BRANCH" \
               --title "deps: nightly bump $(date -u +%F)" \
@@ -711,8 +711,8 @@ jobs:
           # agent has no token to explain itself on the PR, so its notes ride
           # along here.
           cat "$RUNNER_TEMP/deps/report.md" "$RUNNER_TEMP/fix/fix-notes.md" > "$RUNNER_TEMP/pr-body.md"
-          gh label create nightly-deps --color 1D76DB --description "automated nightly dependency bump" || true
-          gh label create agent-fixed --color B60205 --description "build repaired by the nightly agent" || true
+          gh label create nightly-deps --repo "$GITHUB_REPOSITORY" --color 1D76DB --description "automated nightly dependency bump" || true
+          gh label create agent-fixed --repo "$GITHUB_REPOSITORY" --color B60205 --description "build repaired by the nightly agent" || true
           if [ "$(gh pr list --head "$BRANCH" --state open --json number --jq length)" = "0" ]; then
             gh pr create --base master --head "$BRANCH" \
               --title "deps: nightly bump $(date -u +%F)" \
@@ -1104,7 +1104,7 @@ jobs:
           git commit -F "$RUNNER_TEMP/msg.md"
           git push origin HEAD:"$BRANCH"
           echo "head_sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          gh label create agent-fixed --color B60205 --description "build repaired by the nightly agent" || true
+          gh label create agent-fixed --repo "$GITHUB_REPOSITORY" --color B60205 --description "build repaired by the nightly agent" || true
           gh pr view "$BRANCH" --repo "$GITHUB_REPOSITORY" --json body --jq .body > "$RUNNER_TEMP/pr-body.md"
           { printf '\n\n---\n\n### Check remediation %s\n\n' "$(date -u +%F)"; cat "$RUNNER_TEMP/remedy/fix-notes.md"; } >> "$RUNNER_TEMP/pr-body.md"
           gh pr edit "$BRANCH" --repo "$GITHUB_REPOSITORY" \
@@ -1165,7 +1165,7 @@ jobs:
         env:
           FAILED: ${{ needs['deps-watch'].outputs.security_failed }}
         run: |
-          gh label create needs-human --color B60205 --description "automation stopped — needs a human" || true
+          gh label create needs-human --repo "$GITHUB_REPOSITORY" --color B60205 --description "automation stopped — needs a human" || true
           gh pr edit "$BRANCH" --repo "$GITHUB_REPOSITORY" --add-label needs-human
           {
             printf 'The **Security** scan is red on this dependency bump — failing jobs: %s\n\n' "${FAILED:-unknown}"
@@ -1248,7 +1248,7 @@ jobs:
       - name: One attempt was the budget
         if: steps.rewait.outputs.still_red == 'true'
         run: |
-          gh label create needs-human --color B60205 --description "automation stopped — needs a human" || true
+          gh label create needs-human --repo "$GITHUB_REPOSITORY" --color B60205 --description "automation stopped — needs a human" || true
           gh pr edit "$BRANCH" --repo "$GITHUB_REPOSITORY" --add-label needs-human
           gh pr comment "$BRANCH" --repo "$GITHUB_REPOSITORY" --body-file - <<'EOF'
           The nightly remediation agent had its one attempt at these checks and they are still red.
@@ -1343,7 +1343,7 @@ jobs:
             echo "$BRANCH already labeled needs-human — the deciding job said why"
             exit 1
           fi
-          gh label create needs-human --color B60205 --description "automation stopped — needs a human" || true
+          gh label create needs-human --repo "$GITHUB_REPOSITORY" --color B60205 --description "automation stopped — needs a human" || true
           gh pr edit "$BRANCH" --repo "$GITHUB_REPOSITORY" --add-label needs-human
           gh pr comment "$BRANCH" --repo "$GITHUB_REPOSITORY" --body "The nightly deps lane ended without merging this PR — see [run ${{ github.run_id }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}). The branch is as the pipeline left it: fix and merge, or close it and let tomorrow retry from master."
           echo "labeled $BRANCH needs-human (lane ended without merging)" >> "$GITHUB_STEP_SUMMARY"

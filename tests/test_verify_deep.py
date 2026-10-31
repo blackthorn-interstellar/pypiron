@@ -20,7 +20,13 @@ from pathlib import Path
 
 import pytest
 
-from .helpers import kill_process_tree, make_wheel, upload_legacy, wait_for_file_in_index
+from .helpers import (
+    kill_process_tree,
+    make_wheel,
+    upload_legacy,
+    wait_for_file_in_index,
+    wait_storage_ops_quiet,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -46,6 +52,9 @@ def _upload_one(server, tmp_path: Path, version: str) -> Path:
         password=server["password"],
     )
     wait_for_file_in_index(server["simple"], PACKAGE, wheel.name)
+    # verify-index reads the whole tree, and the global index lands after the
+    # package one — let the worker finish writing or race it.
+    wait_storage_ops_quiet(server["base_url"])
     stored = Path(server["data_dir"]) / "packages" / PACKAGE / wheel.name
     assert stored.exists(), f"{stored} was not written"
     return stored

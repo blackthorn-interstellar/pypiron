@@ -14,6 +14,11 @@ updates:
       interval: "monthly"
     # A freshly published release is where a supply-chain compromise is caught,
     # so wait a month before proposing it. One grouped PR a month, not a stream.
+    # The cooldown binds version updates only: Dependabot security updates
+    # (enabled in repo settings) open a fix PR as soon as an advisory names a
+    # pinned action — GHSA-5xjx-3w67-w9x9 sat out this window until zizmor
+    # turned master red. They can also land on a lockfile ahead of the nightly
+    # lane; the lane rebuilds its branch from master each night, so it absorbs them.
     cooldown:
       default-days: 30
     groups:

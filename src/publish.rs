@@ -689,16 +689,14 @@ pub async fn publish_record(
     // name appearing) to the worker. Dropping it before touching truth — and
     // refusing the write if it fails — keeps the audit a safety net for external
     // change, never a substitute for pypiron's own bookkeeping.
-    let intent_nonce = Some(
-        markers::mark_intent(storage, &pkg_norm)
-            .await
-            .map_err(|e| {
-                (
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    format!("failed to reserve package write: {e}"),
-                )
-            })?,
-    );
+    let intent = markers::Intent::open(state, &pinned.storage, &pkg_norm)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to reserve package write: {e}"),
+            )
+        })?;
     // A claimed package's owner already matched `desired_origin` above.
     if first_claim {
         // First write claims the package — atomically, so racing private
@@ -721,7 +719,7 @@ pub async fn publish_record(
             )
         })?;
         if claim.owner != desired_origin {
-            if let Err(e) = markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await {
+            if let Err(e) = intent.commit().await {
                 warn!(error=?e, "legacy: failed to close refused-claim intent marker");
             }
             return Err((
@@ -772,9 +770,7 @@ pub async fn publish_record(
             {
                 Some(observed) => observed,
                 None => {
-                    if let Err(e) =
-                        markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await
-                    {
+                    if let Err(e) = intent.commit().await {
                         warn!(error=?e, "legacy: failed to close refused-claim intent marker");
                     }
                     return Err((
@@ -792,9 +788,7 @@ pub async fn publish_record(
         match origin::read_origin_observation(storage, &pkg_norm).await {
             Ok(Some(current)) if current == *expected => {}
             Ok(_) => {
-                if let Err(e) =
-                    markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await
-                {
+                if let Err(e) = intent.commit().await {
                     warn!(error=?e, "legacy: failed to close abandoned intent marker");
                 }
                 return Err((
@@ -842,7 +836,7 @@ pub async fn publish_record(
     match store_result {
         Ok(true) => {}
         Ok(false) => {
-            if let Err(e) = markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await {
+            if let Err(e) = intent.commit().await {
                 warn!(error=?e, "legacy: failed to close duplicate-upload intent marker");
             }
             return Err((
@@ -999,9 +993,7 @@ pub async fn publish_record(
         match post_publish_mirror_claim_is_current(state, storage, &pkg_norm, expected).await {
             Ok(true) => {}
             Ok(false) => {
-                if let Err(e) =
-                    markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await
-                {
+                if let Err(e) = intent.commit().await {
                     warn!(error=?e, "legacy: failed to close post-publish origin race");
                 }
                 return Err((
@@ -1039,7 +1031,7 @@ pub async fn publish_record(
             if !state.buckets.is_multi() {
                 let _ = storage.delete_keys(std::slice::from_ref(&key)).await;
             }
-            if let Err(e) = markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await {
+            if let Err(e) = intent.commit().await {
                 warn!(error=?e, "legacy: failed to close fenced upload intent");
             }
             return Err((
@@ -1070,9 +1062,7 @@ pub async fn publish_record(
         // A freed name, by contrast, is permanent. Traced on vopr seed
         // 2519159830454370605.
         Err(e) => {
-            if let Err(commit_error) =
-                markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await
-            {
+            if let Err(commit_error) = intent.commit().await {
                 warn!(error=?commit_error, "legacy: failed to close filename-fence upload intent");
             }
             return Err((
@@ -1141,7 +1131,7 @@ pub async fn publish_record(
     // Commit marker: truth changed, rebuild now. Pairs with the intent above
     // so the worker consumes both; if this write fails the intent still goes
     // stale and heals the package.
-    if let Err(e) = markers::commit_marker(state, storage, &pkg_norm, intent_nonce).await {
+    if let Err(e) = intent.commit().await {
         warn!(error=?e, "legacy: failed to write commit marker");
     }
 
@@ -1361,12 +1351,14 @@ pub async fn delete_record(
     // that carries that removal to the worker. Fail the delete before touching
     // truth if the marker can't be written, rather than mutate truth with no
     // breadcrumb and leave the prune to the external-change audit.
-    let intent_nonce = Some(markers::mark_intent(storage, pkg).await.map_err(|e| {
-        (
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("failed to reserve delete: {e}"),
-        )
-    })?);
+    let intent = markers::Intent::open(state, &pinned.storage, pkg)
+        .await
+        .map_err(|e| {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("failed to reserve delete: {e}"),
+            )
+        })?;
 
     // Multi-bucket mirror-cache eviction stays refused, now doubly so. It never
     // could be made atomic with a concurrent mirror->private demotion (claim and
@@ -1402,7 +1394,7 @@ pub async fn delete_record(
         }
     };
     if state.buckets.is_multi() && origin_before.state == origin::OriginState::Mirror {
-        let _ = markers::commit_marker(state, storage, pkg, intent_nonce).await;
+        let _ = intent.commit().await;
         return Err((
             StatusCode::CONFLICT,
             "Mirror cache eviction is disabled with multiple buckets".into(),
@@ -1423,7 +1415,7 @@ pub async fn delete_record(
                 )
             })?;
         if current.as_ref() != Some(&origin_before) {
-            let _ = markers::commit_marker(state, storage, pkg, intent_nonce).await;
+            let _ = intent.commit().await;
             return Err((
                 StatusCode::CONFLICT,
                 format!("Package '{pkg}' changed origin during delete"),
@@ -1481,7 +1473,7 @@ pub async fn delete_record(
         .await;
 
     // Worker confirms from truth and prunes global membership if needed.
-    if let Err(e) = markers::commit_marker(state, storage, pkg, intent_nonce).await {
+    if let Err(e) = intent.commit().await {
         warn!(error=?e, "delete: failed to write commit marker");
     }
     // A private delete carries a tombstone. Fan it out to every healthy bucket
@@ -1907,15 +1899,17 @@ async fn write_project_status(
 
     let pinned = state.pin();
     let storage = pinned.storage.as_ref();
-    let intent_nonce = if state.buckets.is_multi() {
-        Some(markers::mark_intent(storage, &pkg).await.map_err(|e| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to reserve status write: {e}"),
-            )
-        })?)
+    let intent = if state.buckets.is_multi() {
+        markers::Intent::open(state, &pinned.storage, &pkg)
+            .await
+            .map_err(|e| {
+                (
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("failed to reserve status write: {e}"),
+                )
+            })?
     } else {
-        markers::mark_intent(storage, &pkg).await.ok()
+        markers::Intent::open_best_effort(state, &pinned.storage, &pkg).await
     };
     let status_origin = if state.buckets.is_multi() {
         let observed = origin::read_origin_observation(storage, &pkg)
@@ -1962,7 +1956,7 @@ async fn write_project_status(
     )
     .await;
 
-    if let Err(e) = markers::commit_marker(state, storage, &pkg, intent_nonce).await {
+    if let Err(e) = intent.commit().await {
         warn!(error=?e, "status: failed to write commit marker");
     }
     if replicate_private {

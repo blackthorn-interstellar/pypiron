@@ -1113,14 +1113,7 @@ impl Proxy {
     ) -> Result<bool> {
         let key = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
         let out = self
-            .fill_and_commit(
-                &state,
-                storage.as_ref(),
-                &pkg,
-                &filename,
-                &key,
-                progress.as_ref(),
-            )
+            .fill_and_commit(&state, &storage, &pkg, &filename, &key, progress.as_ref())
             .await;
         // Anything that ended this fill short of releasing the tail is a failure
         // for whoever is teeing: an early `Ok(false)` served no bytes at all, and
@@ -1144,12 +1137,13 @@ impl Proxy {
     async fn fill_and_commit(
         &self,
         state: &AppState,
-        storage: &dyn Storage,
+        owned_storage: &Arc<dyn Storage>,
         pkg: &str,
         filename: &str,
         key: &str,
         progress: Option<&Progress>,
     ) -> Result<bool> {
+        let storage = owned_storage.as_ref();
         if storage.head_exists(key).await? {
             return Ok(false);
         }
@@ -1234,10 +1228,10 @@ impl Proxy {
 
         // Intent before truth, commit after (see worker.rs): a crash between
         // the artifact landing and the commit marker heals via stale intent.
-        let intent_nonce = if state.buckets.is_multi() {
-            Some(crate::markers::mark_intent(storage, pkg).await?)
+        let intent = if state.buckets.is_multi() {
+            crate::markers::Intent::open(state, owned_storage, pkg).await?
         } else {
-            crate::markers::mark_intent(storage, pkg).await.ok()
+            crate::markers::Intent::open_best_effort(state, owned_storage, pkg).await
         };
 
         let sidecar = Sidecar {
@@ -1279,7 +1273,7 @@ impl Proxy {
         {
             let existing = storage.get_bytes(&sidecar_key).await?;
             if existing != sidecar_bytes {
-                crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
+                intent.commit().await?;
                 return Ok(false);
             }
         }
@@ -1298,7 +1292,7 @@ impl Proxy {
             Some(observed) if observed == claim_observation => {}
             _ => {
                 info!(%pkg, %filename, "proxy: origin claim changed mid-download; abandoning fill");
-                crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
+                intent.commit().await?;
                 return Ok(false);
             }
         }
@@ -1322,7 +1316,7 @@ impl Proxy {
                 .release_refused(state, storage, pkg, filename, key)
                 .await?
             {
-                crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
+                intent.commit().await?;
                 return Ok(false);
             }
             progress.verified(spool.size);
@@ -1337,7 +1331,7 @@ impl Proxy {
             // Another mirror writer won the immutable filename. Its own
             // sidecar protocol completes the record; never overwrite it with
             // metadata paired to our stale observation.
-            crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
+            intent.commit().await?;
             return Ok(false);
         }
         // Multi-bucket demotion can still win after the pre-PUT read. The
@@ -1353,7 +1347,7 @@ impl Proxy {
         .await
         .context("re-check mirror claim after artifact publish")?
         {
-            crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
+            intent.commit().await?;
             info!(%pkg, %filename, "proxy: origin changed after artifact publish; leaving typed mirror loser");
             return Ok(false);
         }
@@ -1361,7 +1355,7 @@ impl Proxy {
             // The marker suppresses the filename immediately. Leave the typed
             // body for freeze recovery; deleting here would create another
             // cross-object race with staged private promotion.
-            crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
+            intent.commit().await?;
             return Ok(false);
         }
         if filename.ends_with(".whl") && file.has_core_metadata() {
@@ -1391,7 +1385,7 @@ impl Proxy {
                     .await;
             }
         }
-        crate::markers::commit_marker(state, storage, pkg, intent_nonce).await?;
+        intent.commit().await?;
         state
             .metrics
             .proxy_artifacts_cached

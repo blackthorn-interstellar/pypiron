@@ -8,8 +8,10 @@
 
 use std::collections::hash_map::RandomState;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::Arc;
 
 use anyhow::Result;
+use tracing::warn;
 
 use crate::app::{AppState, DIRTY_PREFIX};
 use crate::storage::{FileEntry, Storage};
@@ -152,6 +154,87 @@ pub(crate) async fn commit_marker(
     }
     state.worker_nudge.notify_one();
     Ok(())
+}
+
+/// A writer's open intent, closed on every exit. An unpaired intent is the
+/// crashed-writer signal: the worker defers the package's rebuilds for the whole
+/// intent grace (15 min by default) before healing it. A writer that bails out
+/// with an error, or whose request is cancelled, has not crashed — truth is
+/// whatever it left — so dropping an uncommitted `Intent` pairs it in the
+/// background. Only a dead process leaves one for the stale-intent healer.
+pub(crate) struct Intent {
+    storage: Arc<dyn Storage>,
+    nudge: Arc<tokio::sync::Notify>,
+    pkg: String,
+    /// `None` once committed, or when a best-effort open could not write it.
+    nonce: Option<String>,
+}
+
+impl Intent {
+    /// Declare the intent, failing if its marker can't be written.
+    pub(crate) async fn open(
+        state: &AppState,
+        storage: &Arc<dyn Storage>,
+        pkg: &str,
+    ) -> Result<Self> {
+        let nonce = mark_intent(storage.as_ref(), pkg).await?;
+        Ok(Self::new(state, storage, pkg, Some(nonce)))
+    }
+
+    /// Declare the intent if the marker can be written; the commit then falls
+    /// back to a bare dirty marker.
+    pub(crate) async fn open_best_effort(
+        state: &AppState,
+        storage: &Arc<dyn Storage>,
+        pkg: &str,
+    ) -> Self {
+        let nonce = mark_intent(storage.as_ref(), pkg).await.ok();
+        Self::new(state, storage, pkg, nonce)
+    }
+
+    fn new(state: &AppState, storage: &Arc<dyn Storage>, pkg: &str, nonce: Option<String>) -> Self {
+        Self {
+            storage: Arc::clone(storage),
+            nudge: Arc::clone(&state.worker_nudge),
+            pkg: pkg.to_string(),
+            nonce,
+        }
+    }
+
+    /// [`commit_marker`] for this intent. A failed write leaves the intent to go
+    /// stale and heal the package, as before.
+    pub(crate) async fn commit(mut self) -> Result<()> {
+        match self.nonce.take() {
+            Some(nonce) => mark_commit(self.storage.as_ref(), &self.pkg, &nonce).await?,
+            None => mark_dirty(self.storage.as_ref(), &self.pkg).await?,
+        }
+        self.nudge.notify_one();
+        Ok(())
+    }
+}
+
+impl Drop for Intent {
+    fn drop(&mut self) {
+        let Some(nonce) = self.nonce.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let storage = Arc::clone(&self.storage);
+        let nudge = Arc::clone(&self.nudge);
+        let pkg = std::mem::take(&mut self.pkg);
+        handle.spawn(async move {
+            match mark_commit(storage.as_ref(), &pkg, &nonce).await {
+                Ok(()) => nudge.notify_one(),
+                Err(error) => warn!(
+                    package = %pkg,
+                    error = ?error,
+                    "could not close an abandoned write intent; it heals after the intent grace"
+                ),
+            }
+        });
+    }
 }
 
 #[cfg(test)]

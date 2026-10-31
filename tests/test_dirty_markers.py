@@ -6,7 +6,7 @@ import time
 
 import pytest
 
-from .helpers import download_pypi_wheel, upload_legacy, wait_for_file_in_index
+from .helpers import download_pypi_wheel, make_wheel, upload_legacy, wait_for_file_in_index
 
 PACKAGE = "six"
 OLD_VERSION = "1.16.0"
@@ -75,4 +75,29 @@ def test_refused_reupload_does_not_stall_the_next_release(disk_server, tmp_path)
     new_wheel = download_pypi_wheel(PACKAGE, NEW_VERSION, tmp_path)
     upload_legacy(disk_server["legacy"], new_wheel, **creds)
     wait_for_file_in_index(disk_server["simple"], PACKAGE, new_wheel.name, timeout=10.0)
+    _wait_dirty_empty(disk_server["data_dir"])
+
+
+def test_failed_store_does_not_stall_the_next_release(disk_server, tmp_path):
+    """An upload that dies on a storage error after declaring its intent must
+    still close it. `sync` retries such a 5xx and succeeds, so nothing looks
+    wrong — but a dangling intent defers the package's index rebuilds for the
+    whole intent grace (15 min), hiding every file that lands meanwhile."""
+    creds = {"username": disk_server["user"], "password": disk_server["password"]}
+    pkg = "storefail"
+    first = make_wheel(pkg, "1.0", tmp_path)
+    upload_legacy(disk_server["legacy"], first, **creds)
+    wait_for_file_in_index(disk_server["simple"], pkg, first.name)
+
+    # A directory squatting on the sidecar key fails the write after the bytes
+    # landed — a storage error, not a 409 — without root-sensitive permissions.
+    broken = make_wheel(pkg, "2.0", tmp_path)
+    squat = disk_server["data_dir"] / "packages" / pkg / f"{broken.name}.meta.json"
+    squat.mkdir()
+    upload_legacy(disk_server["legacy"], broken, expect_status=500, **creds)
+    squat.rmdir()
+
+    nxt = make_wheel(pkg, "3.0", tmp_path)
+    upload_legacy(disk_server["legacy"], nxt, **creds)
+    wait_for_file_in_index(disk_server["simple"], pkg, nxt.name, timeout=10.0)
     _wait_dirty_empty(disk_server["data_dir"])

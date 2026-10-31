@@ -2063,6 +2063,8 @@ def test_sync_carries_advisory_named_fix_through_cooldown(tmp_path_factory, pypi
         )
         rc, out, err = sync(str(zip_path))
         assert rc == 0, f"sync failed:\n{out}\n{err}"
+        # The upload returns before dest's worker rewrites the listing.
+        wait_for_file_in_index(dest["simple"], "synclib", fix.name)
         assert _listed(dest, "synclib") == {fix.name}
     finally:
         dst_gen.close()

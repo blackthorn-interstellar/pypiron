@@ -46,7 +46,6 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use signature::Verifier;
 use x509_cert::der::{Decode, Encode};
 
 /// OID 1.3.6.1.5.5.7.3.3 — id-kp-codeSigning (the EKU Fulcio leaf certs carry).
@@ -705,7 +704,9 @@ struct SetPayload<'a> {
 /// P-256 (SHA-256) then P-384 (SHA-384) — the curve's own default digest, which
 /// matches every Fulcio/Rekor/CT usage here. Any parse failure is a non-verify.
 fn ecdsa_verify(spki_der: &[u8], msg: &[u8], der_sig: &[u8]) -> bool {
-    use x509_cert::spki::DecodePublicKey;
+    // p256 0.14's spki 0.8 DecodePublicKey; x509-cert 0.2 still uses spki 0.7.
+    use p256::ecdsa::signature::Verifier as _;
+    use p256::pkcs8::DecodePublicKey as _;
     if let Ok(vk) = p256::ecdsa::VerifyingKey::from_public_key_der(spki_der) {
         return p256::ecdsa::Signature::from_der(der_sig)
             .map(|sig| vk.verify(msg, &sig).is_ok())

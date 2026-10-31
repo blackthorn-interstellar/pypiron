@@ -2021,6 +2021,39 @@ def test_proxy_fix_exemption_can_be_turned_off(tmp_path_factory, pypiron_bin, tm
         gen.close()
 
 
+@pytest.mark.parametrize(
+    ("settle_secs", "modified_ago", "exempt"),
+    [
+        ("10800", 7200, False),  # longer than the default: a 2h-old edit still waits
+        ("0", 0, True),  # zero: trusted as soon as it is seen
+    ],
+)
+def test_proxy_fix_settle_is_configurable(
+    tmp_path_factory, pypiron_bin, tmp_path, settle_secs, modified_ago, exempt
+):
+    """`--security-fix-settle-secs` sets how long the advisory must sit unchanged."""
+    feed = make_osv_zip(
+        tmp_path / "osv.zip",
+        {"PYSEC-2026-3": _fix_record("PYSEC-2026-3", "settlelib", "1.0.0", _iso(modified_ago))},
+    )
+    gen = _start_proxy_pair(
+        tmp_path_factory,
+        pypiron_bin,
+        proxy_extra_args=["--advisory-feed", str(feed), "--security-fix-settle-secs", settle_secs],
+        exclude_newer=None,
+    )
+    pair = next(gen)
+    try:
+        upstream, proxy = pair["upstream"], pair["proxy"]
+        assert _poll_metric(proxy["base_url"], "pypiron_advisory_snapshot_age_seconds") is not None
+        wheel = make_wheel("settlelib", "1.0.0", tmp_path)
+        _upstream_upload(upstream, wheel)
+        wait_for_file_in_index(upstream["simple"], "settlelib", wheel.name)
+        assert _listed(proxy, "settlelib") == ({wheel.name} if exempt else set())
+    finally:
+        gen.close()
+
+
 def test_sync_carries_advisory_named_fix_through_cooldown(tmp_path_factory, pypiron_bin, tmp_path):
     """`sync` under the default cooldown copies only the advisory-named fix — and
     picks it up on a later run whose feed newly names it, even though the

@@ -335,6 +335,7 @@ hostnames, so its egress policy must enforce hostname restrictions.
 | `exclude-prereleases` | `--exclude-prereleases` | `PYPIRON_EXCLUDE_PRERELEASES` |
 | `include-yanked` | `--include-yanked` | `PYPIRON_INCLUDE_YANKED` |
 | `security-fixes-skip-cooldown` | `--security-fixes-skip-cooldown true\|false` | `PYPIRON_SECURITY_FIXES_SKIP_COOLDOWN` |
+| `security-fix-settle-secs` | `--security-fix-settle-secs N` | `PYPIRON_SECURITY_FIX_SETTLE_SECS` |
 
 Rules:
 
@@ -360,7 +361,8 @@ Rules:
   hold. `""` disables it.
 - `security-fixes-skip-cooldown` (default `true`) lets a release skip a sliding
   cooldown when a vulnerability advisory names it as the fix and the advisory
-  has been unchanged for an hour. Only that version skips. A fixed-date
+  has been unchanged for `security-fix-settle-secs` (default `3600`; any edit
+  restarts the clock, `0` skips the wait). Only that version skips. A fixed-date
   `exclude-newer` is never lifted. `sync` needs an advisory feed to see fixes.
 - `WHEN` accepts an RFC 3339 timestamp, bare date, bare day count, friendly
   duration (`"30 days"`), or ISO 8601 duration (`P30D`).

@@ -95,6 +95,8 @@ pub struct UpstreamConfig {
     pub include_yanked: Option<bool>,
     /// Advisory-named fix releases skip a rolling cooldown; default true.
     pub security_fixes_skip_cooldown: Option<bool>,
+    /// Seconds the naming advisory must sit unchanged first; default 3600.
+    pub security_fix_settle_secs: Option<u64>,
 }
 
 /// `[serve]`: the server process. Non-secret knobs only — admin/uploader/read

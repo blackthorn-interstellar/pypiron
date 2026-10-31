@@ -1677,7 +1677,7 @@ impl Proxy {
         let security_fix = |filename: &str| {
             fixes.as_ref().is_some_and(|snap| {
                 infer_version_from_filename(filename)
-                    .is_some_and(|v| snap.security_fix(pkg, &v, now))
+                    .is_some_and(|v| snap.security_fix(pkg, &v, now, self.mirror.fix_settle))
             })
         };
         let files: Vec<SimpleFile> = index

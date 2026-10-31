@@ -205,6 +205,7 @@
 # exclude-newer = "7"
 # security-fixes-skip-cooldown = true       # a release a vulnerability advisory names
                                             # as the fix skips a sliding cooldown
+# security-fix-settle-secs = 3600           # ...once the advisory sat unchanged this long
 # exclude-older = "2020-01-01"              # keep only files at or after this cutoff
 
 

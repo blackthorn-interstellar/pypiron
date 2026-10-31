@@ -139,20 +139,20 @@ pub struct AdvisoryRecord {
     pub matcher: VersionScope,
 }
 
-/// How long a vulnerability advisory must sit unchanged before the release it
-/// names as the fix may skip the cooldown. A bogus advisory pointing at a
-/// malicious "fix" gets this long to be withdrawn or flagged as malware, and any
-/// edit restarts the clock.
-pub const FIX_SETTLE: time::Duration = time::Duration::hours(1);
+/// Default for how long a vulnerability advisory must sit unchanged before the
+/// release it names as the fix may skip the cooldown (`--security-fix-settle-secs`).
+/// A bogus advisory pointing at a malicious "fix" gets this long to be withdrawn
+/// or flagged as malware, and any edit restarts the clock.
+pub const DEFAULT_FIX_SETTLE_SECS: u64 = 3600;
 
 /// One security-fix rule: a vulnerability advisory naming `version` as the
-/// release that fixes it. That exact release may skip the rolling cooldown from
-/// `eligible_at` (the advisory's `modified` plus [`FIX_SETTLE`]).
+/// release that fixes it. That exact release may skip the rolling cooldown once
+/// the advisory has gone unchanged since `modified` for the settle period.
 #[derive(Debug, Clone)]
 pub struct FixRule {
     pub id: String,
     pub version: Version,
-    pub eligible_at: OffsetDateTime,
+    pub modified: OffsetDateTime,
 }
 
 /// The parsed snapshot: normalized name → rules/records.
@@ -197,28 +197,44 @@ impl AdvisoryDb {
         &self.fixes
     }
 
-    /// Whether an advisory names `name_norm` at `version` as a settled fix.
-    pub fn security_fix(&self, name_norm: &str, version: &str, now: OffsetDateTime) -> bool {
-        fix_hit(&self.fixes, name_norm, version, now, |_| false)
+    /// Whether an advisory names `name_norm` at `version` as a fix that has sat
+    /// unchanged for `settle` by `now`.
+    pub fn security_fix(
+        &self,
+        name_norm: &str,
+        version: &str,
+        now: OffsetDateTime,
+        settle: time::Duration,
+    ) -> bool {
+        fix_hit(&self.fixes, name_norm, version, now, settle, |_| false)
     }
 
     /// Whether any fix rule for `name_norm` became (or will become) eligible
     /// after `since` — a fix release that may still be inside the cooldown.
-    pub fn fix_since(&self, name_norm: &str, since: OffsetDateTime) -> bool {
-        self.fixes
-            .get(name_norm)
-            .is_some_and(|rules| rules.iter().any(|r| r.eligible_at > since))
+    pub fn fix_since(
+        &self,
+        name_norm: &str,
+        since: OffsetDateTime,
+        settle: time::Duration,
+    ) -> bool {
+        self.fixes.get(name_norm).is_some_and(|rules| {
+            rules
+                .iter()
+                .any(|r| r.modified.saturating_add(settle) > since)
+        })
     }
 }
 
-/// Whether a fix rule in `fixes` names `name_norm` at `version` and has settled
-/// by `now`. Rules whose id `skip`s are ignored (the probe superseded them).
-/// An unparseable version is never a fix: the exemption fails closed.
+/// Whether a fix rule in `fixes` names `name_norm` at `version` and has sat
+/// unchanged for `settle` by `now`. Rules whose id `skip`s are ignored (the
+/// probe superseded them). An unparseable version is never a fix: the exemption
+/// fails closed.
 pub(crate) fn fix_hit(
     fixes: &HashMap<String, Vec<FixRule>>,
     name_norm: &str,
     version: &str,
     now: OffsetDateTime,
+    settle: time::Duration,
     skip: impl Fn(&str) -> bool,
 ) -> bool {
     let Some(rules) = fixes.get(name_norm) else {
@@ -229,7 +245,7 @@ pub(crate) fn fix_hit(
     };
     rules
         .iter()
-        .any(|r| r.version == version && r.eligible_at <= now && !skip(&r.id))
+        .any(|r| r.version == version && r.modified.saturating_add(settle) <= now && !skip(&r.id))
 }
 
 /// The `MAL-*` ids that condemn `name_norm` at `version` (empty = not blocked).
@@ -451,7 +467,7 @@ fn ingest_advisory(db: &mut AdvisoryDb, adv: &OsvAdvisory) -> bool {
         .map(str::to_string)
         .unwrap_or_default();
     let summary = truncated(&adv.summary, MAX_SUMMARY_BYTES);
-    let fix_eligible_at = fix_eligible_at(adv);
+    let fix_modified = fix_modified(adv);
 
     let mut matched_pypi = false;
     for (name, affected) in pypi_clauses(adv) {
@@ -462,7 +478,7 @@ fn ingest_advisory(db: &mut AdvisoryDb, adv: &OsvAdvisory) -> bool {
                 id: adv.id.clone(),
                 scope: scope.clone(),
             });
-        } else if let Some(at) = fix_eligible_at {
+        } else if let Some(at) = fix_modified {
             let rules = clause_fixes(&adv.id, affected, at);
             if !rules.is_empty() {
                 db.fixes.entry(name.clone()).or_default().extend(rules);
@@ -569,18 +585,15 @@ fn parse_ranges(ranges: &[OsvRange]) -> Vec<(Version, Option<Version>)> {
     pairs
 }
 
-/// When a vulnerability advisory's named fixes may skip the cooldown: its
-/// `modified` plus [`FIX_SETTLE`]. `None` (no readable `modified`) means never.
-fn fix_eligible_at(adv: &OsvAdvisory) -> Option<OffsetDateTime> {
-    adv.modified
-        .as_deref()
-        .and_then(parse_modified)
-        .map(|m| m.saturating_add(FIX_SETTLE))
+/// When a vulnerability advisory last changed, which starts its fixes' settle
+/// clock. `None` (no readable `modified`) means its fixes never skip.
+fn fix_modified(adv: &OsvAdvisory) -> Option<OffsetDateTime> {
+    adv.modified.as_deref().and_then(parse_modified)
 }
 
 /// The fix rules one affected clause contributes: each `fixed` event of an
 /// `ECOSYSTEM` range that reads as a PEP 440 version.
-fn clause_fixes(id: &str, affected: &OsvAffected, eligible_at: OffsetDateTime) -> Vec<FixRule> {
+fn clause_fixes(id: &str, affected: &OsvAffected, modified: OffsetDateTime) -> Vec<FixRule> {
     affected
         .ranges
         .iter()
@@ -590,7 +603,7 @@ fn clause_fixes(id: &str, affected: &OsvAffected, eligible_at: OffsetDateTime) -
         .map(|version| FixRule {
             id: id.to_string(),
             version,
-            eligible_at,
+            modified,
         })
         .collect()
 }
@@ -602,7 +615,7 @@ pub(crate) fn fix_rules(adv: &OsvAdvisory) -> Vec<(String, FixRule)> {
     if adv.withdrawn.is_some() || !usable_id(&adv.id) || adv.id.starts_with("MAL-") {
         return Vec::new();
     }
-    let Some(at) = fix_eligible_at(adv) else {
+    let Some(at) = fix_modified(adv) else {
         return Vec::new();
     };
     pypi_clauses(adv)
@@ -1124,19 +1137,24 @@ mod tests {
     }
 
     #[test]
-    fn named_fix_is_exempt_only_after_the_settle_hour() {
+    fn named_fix_is_exempt_only_after_the_settle_period() {
         let mut adv = pysec_fixed("GHSA-aaaa-bbbb-cccc", "Cert.Lib", "2.0");
         adv["modified"] = "2026-10-20T19:00:00Z".into();
         let db = parse_feed(&osv_zip(&[("GHSA.json", adv)])).unwrap();
+        let hour = time::Duration::hours(1);
         let settled = at("2026-10-20T20:00:00Z");
         // PEP 440 equality, normalized names, exact version only.
-        assert!(db.security_fix("cert-lib", "2.0.0", settled));
-        assert!(!db.security_fix("cert-lib", "2.0.1", settled));
-        assert!(!db.security_fix("cert-lib", "not a version", settled));
-        // Not before the advisory has sat unchanged for an hour.
-        assert!(!db.security_fix("cert-lib", "2.0", at("2026-10-20T19:59:59Z")));
-        assert!(db.fix_since("cert-lib", at("2026-10-14T00:00:00Z")));
-        assert!(!db.fix_since("cert-lib", settled));
+        assert!(db.security_fix("cert-lib", "2.0.0", settled, hour));
+        assert!(!db.security_fix("cert-lib", "2.0.1", settled, hour));
+        assert!(!db.security_fix("cert-lib", "not a version", settled, hour));
+        // Not before the advisory has sat unchanged for the settle period.
+        let early = at("2026-10-20T19:59:59Z");
+        assert!(!db.security_fix("cert-lib", "2.0", early, hour));
+        assert!(db.security_fix("cert-lib", "2.0", early, time::Duration::ZERO));
+        assert!(!db.security_fix("cert-lib", "2.0", settled, time::Duration::hours(2)));
+        assert!(db.fix_since("cert-lib", at("2026-10-14T00:00:00Z"), hour));
+        assert!(!db.fix_since("cert-lib", settled, hour));
+        assert!(db.fix_since("cert-lib", settled, time::Duration::hours(2)));
     }
 
     #[test]
@@ -1160,7 +1178,10 @@ mod tests {
         ]))
         .unwrap();
         for name in ["evil", "gone", "undated", "gitonly"] {
-            assert!(!db.security_fix(name, "1.0", now), "{name} must not exempt");
+            assert!(
+                !db.security_fix(name, "1.0", now, time::Duration::ZERO),
+                "{name} must not exempt"
+            );
         }
     }
 }

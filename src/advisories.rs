@@ -278,13 +278,22 @@ impl AdvisoryState {
     /// Whether a settled vulnerability advisory names `(name_norm, version)` as
     /// its fix, across the baseline (minus ids the probe superseded) ∪ the fix
     /// overlay. Such a release may skip the rolling cooldown.
-    pub fn security_fix(&self, name_norm: &str, version: &str, now: OffsetDateTime) -> bool {
+    pub fn security_fix(
+        &self,
+        name_norm: &str,
+        version: &str,
+        now: OffsetDateTime,
+        settle: time::Duration,
+    ) -> bool {
         let baseline = self.db.as_ref().is_some_and(|db| {
-            fix_hit(db.fixes(), name_norm, version, now, |id| {
+            fix_hit(db.fixes(), name_norm, version, now, settle, |id| {
                 self.fix_superseded.contains(id)
             })
         });
-        baseline || fix_hit(&self.fix_overlay, name_norm, version, now, |_| false)
+        baseline
+            || fix_hit(&self.fix_overlay, name_norm, version, now, settle, |_| {
+                false
+            })
     }
 
     /// Whether anything can block yet: a loaded baseline, or a non-empty probe
@@ -2269,7 +2278,8 @@ mod tests {
             ..AdvisoryState::default()
         }));
         let now = OffsetDateTime::now_utc();
-        assert!(AdvisoryState::read(&slot).security_fix("certlib", "2.0", now));
+        let settle = time::Duration::hours(1);
+        assert!(AdvisoryState::read(&slot).security_fix("certlib", "2.0", now, settle));
 
         // An edit restarts the settle hour: the baseline copy stops counting
         // and the overlay's fresh copy hasn't settled yet.
@@ -2288,8 +2298,10 @@ mod tests {
             },
         );
         let state = AdvisoryState::read(&slot);
-        assert!(!state.security_fix("certlib", "2.0", now));
-        assert!(state.security_fix("certlib", "2.0", now + crate::osv::FIX_SETTLE));
+        assert!(!state.security_fix("certlib", "2.0", now, settle));
+        assert!(state.security_fix("certlib", "2.0", now + settle, settle));
+        // The settle period is the operator's: zero trusts the edit at once.
+        assert!(state.security_fix("certlib", "2.0", now, time::Duration::ZERO));
 
         // A withdrawal removes it outright.
         adv["withdrawn"] = adv["modified"].clone();
@@ -2303,8 +2315,8 @@ mod tests {
                 ..ProbeDelta::default()
             },
         );
-        let later = now + crate::osv::FIX_SETTLE;
-        assert!(!AdvisoryState::read(&slot).security_fix("certlib", "2.0", later));
+        let later = now + settle;
+        assert!(!AdvisoryState::read(&slot).security_fix("certlib", "2.0", later, settle));
     }
 
     #[test]

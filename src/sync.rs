@@ -437,8 +437,9 @@ pub struct MirrorArgs {
 
     /// Let a release skip a rolling --exclude-newer cooldown when a
     /// vulnerability advisory in the advisory feed names it as the fix and has
-    /// sat unchanged for an hour. Default true. Only that exact release skips;
-    /// malware blocking still applies, and a fixed-date cutoff is never lifted.
+    /// sat unchanged for --security-fix-settle-secs. Default true. Only that
+    /// exact release skips; malware blocking still applies, and a fixed-date
+    /// cutoff is never lifted.
     #[arg(
         long = "security-fixes-skip-cooldown",
         env = "PYPIRON_SECURITY_FIXES_SKIP_COOLDOWN",
@@ -446,6 +447,16 @@ pub struct MirrorArgs {
         value_name = "BOOL"
     )]
     pub security_fixes_skip_cooldown: Option<bool>,
+
+    /// How long a vulnerability advisory must sit unchanged before the release
+    /// it names as the fix skips the cooldown. Default 3600. Any edit to the
+    /// advisory restarts the clock; `0` trusts it as soon as it is seen.
+    #[arg(
+        long = "security-fix-settle-secs",
+        env = "PYPIRON_SECURITY_FIX_SETTLE_SECS",
+        value_name = "N"
+    )]
+    pub security_fix_settle_secs: Option<u64>,
 }
 
 impl MirrorArgs {
@@ -556,6 +567,14 @@ impl MirrorArgs {
                 .security_fixes_skip_cooldown
                 .or(file.and_then(|f| f.security_fixes_skip_cooldown))
                 .unwrap_or(true),
+            fix_settle: time::Duration::seconds(
+                i64::try_from(
+                    self.security_fix_settle_secs
+                        .or(file.and_then(|f| f.security_fix_settle_secs))
+                        .unwrap_or(crate::osv::DEFAULT_FIX_SETTLE_SECS),
+                )
+                .unwrap_or(i64::MAX),
+            ),
         })
     }
 
@@ -951,6 +970,8 @@ pub struct ResolvedMirror {
     pub(crate) exclude_yanked: bool,
     /// Let advisory-named fix releases skip a rolling `exclude_newer`.
     pub(crate) fixes_skip_cooldown: bool,
+    /// How long the naming advisory must sit unchanged first.
+    pub(crate) fix_settle: time::Duration,
 }
 
 impl ResolvedMirror {
@@ -2951,10 +2972,14 @@ fn select_from_index(
         }
         let security_fix = resolved.mirror.fix_lifts_cooldown()
             && version.as_deref().is_some_and(|v| {
-                resolved
-                    .advisories
-                    .as_ref()
-                    .is_some_and(|db| db.security_fix(&spec.name, v, crate::clock::now_utc()))
+                resolved.advisories.as_ref().is_some_and(|db| {
+                    db.security_fix(
+                        &spec.name,
+                        v,
+                        crate::clock::now_utc(),
+                        resolved.mirror.fix_settle,
+                    )
+                })
             });
         if matches_mirror_fix(&file, &resolved.mirror, security_fix) {
             file.url = resolve(&file.url);
@@ -2979,7 +3004,12 @@ fn recent_fix(resolved: &Resolved, pkg: &str) -> bool {
     else {
         return false;
     };
-    resolved.mirror.fixes_skip_cooldown && db.fix_since(pkg, crate::clock::now_utc() - window)
+    resolved.mirror.fixes_skip_cooldown
+        && db.fix_since(
+            pkg,
+            crate::clock::now_utc() - window,
+            resolved.mirror.fix_settle,
+        )
 }
 
 /// Provenance objects are small JSON, and the destination's upload path rejects
@@ -3924,6 +3954,7 @@ mod tests {
             exclude_larger: None,
             exclude_yanked: false,
             fixes_skip_cooldown: true,
+            fix_settle: time::Duration::hours(1),
         }
     }
 
@@ -4349,6 +4380,7 @@ mod tests {
         // The opt-out holds the fix like any other release.
         let off = ResolvedMirror {
             fixes_skip_cooldown: false,
+            fix_settle: time::Duration::hours(1),
             ..rolling
         };
         assert!(!matches_mirror_fix(&fresh, &off, true));

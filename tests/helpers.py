@@ -447,6 +447,28 @@ def _poll_until(predicate, *, timeout: float, interval: float):
     return _PENDING
 
 
+def wait_bucket_selected(base_url: str, *, timeout: float = 30.0) -> None:
+    """Poll `/metrics` until a multi-bucket server reports its selected bucket.
+
+    The bucket worker publishes the selection after the server already answers
+    HTTP, so a test that reads it first on a loaded box sees no bucket at all.
+    """
+
+    def probe():
+        try:
+            code, body, _ = _http_request(f"{base_url}/metrics")
+        except (ConnectionError, TimeoutError):
+            return _PENDING
+        selected = code == 200 and any(
+            line.startswith("pypiron_bucket_selected{") and line.endswith(" 1")
+            for line in body.decode().splitlines()
+        )
+        return True if selected else _PENDING
+
+    if _poll_until(probe, timeout=timeout, interval=0.1) is _PENDING:
+        raise TimeoutError(f"{base_url} never reported a selected bucket within {timeout}s")
+
+
 def wait_http_ok(url: str, *, timeout: float = 15.0, interval: float = 0.1) -> None:
     """Poll until GET returns 2xx or timeout."""
     last_err = None

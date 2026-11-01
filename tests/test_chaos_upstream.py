@@ -271,13 +271,18 @@ class _FaultHandler(http.server.BaseHTTPRequestHandler):
         self.close_connection = True
 
 
+class _BackloggedServer(http.server.ThreadingHTTPServer):
+    # The default backlog of 5 resets a burst of parallel fills on macOS.
+    request_queue_size = 128
+
+
 class _FaultServer:
     """A threaded fake upstream. Register a wheel, then flip its artifact fault
     mode at will; the proxy under test fetches from `base`."""
 
     def __init__(self) -> None:
         port = find_free_port()
-        self.httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), _FaultHandler)
+        self.httpd = _BackloggedServer(("127.0.0.1", port), _FaultHandler)
         self.httpd.registry = {}  # type: ignore[attr-defined]
         self.httpd.faults = {}  # type: ignore[attr-defined]
         self.httpd.hits = {}  # type: ignore[attr-defined]

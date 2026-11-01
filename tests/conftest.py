@@ -28,6 +28,7 @@ from .helpers import (
     run_checked,
     run_returncode,
     uv_python_path,
+    wait_bucket_selected,
     wait_http_ok,
     wait_http_responding,
 )
@@ -1010,6 +1011,12 @@ class BucketFaults:
 
 class _S3FaultProxyServer(ThreadingHTTPServer):
     daemon_threads = True
+    # socketserver's default listen backlog is 5. pypiron's boot audit opens a
+    # burst of connections at once; past the backlog macOS resets them and Linux
+    # stalls them past the one-second health probe, and with
+    # `--bucket-leave-failures 1` either flips the selected bucket before the
+    # test has started.
+    request_queue_size = 128
 
     def __init__(self, address, origin_host: str, origin_port: int, faults: BucketFaults):
         super().__init__(address, _S3FaultProxyHandler)
@@ -1037,6 +1044,7 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
     # must not pin a proxy thread forever. StreamRequestHandler.setup() applies
     # this to the socket, so a stalled client trips it and the thread is freed.
     timeout = 60
+    _upstream: http.client.HTTPConnection | None = None
 
     def do_DELETE(self) -> None:
         self._proxy()
@@ -1095,25 +1103,8 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
             self._send_error(400, b"invalid request body")
             return
 
-        connection = http.client.HTTPConnection(
-            self.server.origin_host,
-            self.server.origin_port,
-            timeout=30,
-        )
         try:
-            connection.putrequest(
-                self.command,
-                self.path,
-                skip_host=True,
-                skip_accept_encoding=True,
-            )
-            for name, value in self.headers.items():
-                connection.putheader(name, value)
-            connection.endheaders()
-            if body:
-                connection.send(body)
-            response = connection.getresponse()
-            response_body = response.read()
+            response, response_body = self._forward(body)
             self._log(bucket, received, len(body), str(response.status))
             drip_duration = (
                 self.server.faults.drip_duration(bucket, key) if self.command == "GET" else None
@@ -1127,8 +1118,48 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
         except (ConnectionError, OSError, http.client.HTTPException) as exc:
             self._log(bucket, received, len(body), f"502-{type(exc).__name__}")
             self._send_error(502, b"MinIO proxy upstream unavailable")
-        finally:
+
+    def _forward(self, body: bytes):
+        """Send this request upstream on the client connection's own MinIO
+        connection. One connection per proxied request put every S3 call's port
+        into TIME_WAIT; with ten workers that ran macOS out of ephemeral ports,
+        and pypiron read the resulting connect errors as bucket outages. A reused
+        connection MinIO already closed fails before any response, so that one
+        case retries on a fresh connection."""
+        reused = self._upstream is not None
+        try:
+            return self._exchange(body)
+        except (ConnectionError, OSError, http.client.HTTPException):
+            if not reused:
+                raise
+            return self._exchange(body)
+
+    def _exchange(self, body: bytes):
+        if self._upstream is None:
+            self._upstream = http.client.HTTPConnection(
+                self.server.origin_host, self.server.origin_port, timeout=30
+            )
+        connection = self._upstream
+        try:
+            connection.putrequest(
+                self.command, self.path, skip_host=True, skip_accept_encoding=True
+            )
+            for name, value in self.headers.items():
+                connection.putheader(name, value)
+            connection.endheaders()
+            if body:
+                connection.send(body)
+            response = connection.getresponse()
+            return response, response.read()
+        except (ConnectionError, OSError, http.client.HTTPException):
             connection.close()
+            self._upstream = None
+            raise
+
+    def finish(self) -> None:
+        if self._upstream is not None:
+            self._upstream.close()
+        super().finish()
 
     def _request_body(self, *, drip_duration: float | None = None) -> bytes:
         transfer_encoding = self.headers.get("Transfer-Encoding", "").lower()
@@ -1862,6 +1893,8 @@ def _start_s3_server(
         )
         try:
             wait_http_ok(f"http://{bind}/simple/index.json", timeout=30.0)
+            if len(minio.get("buckets") or []) > 1:
+                wait_bucket_selected(f"http://{bind}")
             yield {
                 "bind": bind,
                 "base_url": f"http://{bind}",

@@ -10,10 +10,9 @@
 
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::app::PACKAGES_PREFIX;
-use crate::replicate::Origin;
+use crate::replicate::{status_merge, MergeChoice, Origin};
 use crate::storage::Storage;
 
 /// A PEP 792 project status marker. Unknown values are rejected at parse time
@@ -48,6 +47,16 @@ impl ProjectStatus {
     /// download, so its index is rendered with no file links.
     pub fn blocks_downloads(self) -> bool {
         matches!(self, ProjectStatus::Quarantined)
+    }
+
+    /// How much the status withholds; a split merge keeps the stricter one.
+    pub(crate) fn restriction(self) -> u8 {
+        match self {
+            ProjectStatus::Active => 0,
+            ProjectStatus::Deprecated => 1,
+            ProjectStatus::Archived => 2,
+            ProjectStatus::Quarantined => 3,
+        }
     }
 }
 
@@ -90,14 +99,6 @@ pub struct VersionedProjectStatus {
     pub epoch: u64,
     pub(crate) origin: Option<Origin>,
     pub etag: String,
-}
-
-/// Deterministic, symmetric status merge result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StatusWinner {
-    InSync,
-    Left,
-    Right,
 }
 
 /// The side changed by a successful pairwise reconciliation.
@@ -189,80 +190,10 @@ pub(crate) fn encode_status(
     })?)
 }
 
-fn restriction_rank(status: ProjectStatus) -> u8 {
-    match status {
-        ProjectStatus::Active => 0,
-        ProjectStatus::Deprecated => 1,
-        ProjectStatus::Archived => 2,
-        ProjectStatus::Quarantined => 3,
-    }
-}
-
-fn status_digest(status: &VersionedProjectStatus) -> [u8; 32] {
-    let bytes = encode_status(&status.doc, status.epoch, status.origin).unwrap_or_default();
-    Sha256::digest(bytes).into()
-}
-
-/// Merge project status without clocks. Private-origin events outrank tagged
-/// mirror events; within one origin world the greater epoch wins. A split can
-/// produce two different events at the same epoch; the more restrictive state
-/// wins, then the lexicographically smaller canonical-record digest settles
-/// differing reasons. No bucket identity participates, so all pair orders agree.
-pub(crate) fn merge_status(
-    left: Option<&VersionedProjectStatus>,
-    right: Option<&VersionedProjectStatus>,
-) -> StatusWinner {
-    match (left, right) {
-        (None, None) => StatusWinner::InSync,
-        (Some(left), None) => {
-            if left.epoch == 0 && left.doc == ProjectStatusDoc::default() {
-                StatusWinner::InSync
-            } else {
-                StatusWinner::Left
-            }
-        }
-        (None, Some(right)) => {
-            if right.epoch == 0 && right.doc == ProjectStatusDoc::default() {
-                StatusWinner::InSync
-            } else {
-                StatusWinner::Right
-            }
-        }
-        (Some(left), Some(right))
-            if left.origin == Some(Origin::Private) && right.origin == Some(Origin::Mirror) =>
-        {
-            StatusWinner::Left
-        }
-        (Some(left), Some(right))
-            if left.origin == Some(Origin::Mirror) && right.origin == Some(Origin::Private) =>
-        {
-            StatusWinner::Right
-        }
-        (Some(left), Some(right)) if left.epoch > right.epoch => StatusWinner::Left,
-        (Some(left), Some(right)) if right.epoch > left.epoch => StatusWinner::Right,
-        (Some(left), Some(right)) if left.doc == right.doc && left.origin == right.origin => {
-            StatusWinner::InSync
-        }
-        (Some(left), Some(right)) if left.doc == right.doc => match (left.origin, right.origin) {
-            (Some(Origin::Private), _) => StatusWinner::Left,
-            (_, Some(Origin::Private)) => StatusWinner::Right,
-            (Some(Origin::Mirror), None) => StatusWinner::Left,
-            (None, Some(Origin::Mirror)) => StatusWinner::Right,
-            _ => StatusWinner::InSync,
-        },
-        (Some(left), Some(right)) => {
-            let left_rank = restriction_rank(left.doc.status);
-            let right_rank = restriction_rank(right.doc.status);
-            if left_rank > right_rank {
-                StatusWinner::Left
-            } else if right_rank > left_rank {
-                StatusWinner::Right
-            } else if status_digest(left) <= status_digest(right) {
-                StatusWinner::Left
-            } else {
-                StatusWinner::Right
-            }
-        }
+impl VersionedProjectStatus {
+    /// The stored bytes of this event — the merge's residual tiebreak.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        encode_status(&self.doc, self.epoch, self.origin).unwrap_or_default()
     }
 }
 
@@ -330,9 +261,9 @@ pub(crate) async fn reconcile_status_pair(
     for _ in 0..STATUS_CAS_ATTEMPTS {
         let left = read_status_versioned(left_storage, pkg).await?;
         let right = read_status_versioned(right_storage, pkg).await?;
-        match merge_status(left.as_ref(), right.as_ref()) {
-            StatusWinner::InSync => return Ok(StatusConvergence::InSync),
-            StatusWinner::Left => {
+        match status_merge(left.as_ref(), right.as_ref()) {
+            MergeChoice::Equal => return Ok(StatusConvergence::InSync),
+            MergeChoice::A => {
                 let winner = left
                     .as_ref()
                     .ok_or_else(|| anyhow!("status merge selected an absent left winner"))?;
@@ -349,7 +280,7 @@ pub(crate) async fn reconcile_status_pair(
                     return Ok(StatusConvergence::UpdatedRight);
                 }
             }
-            StatusWinner::Right => {
+            MergeChoice::B => {
                 let winner = right
                     .as_ref()
                     .ok_or_else(|| anyhow!("status merge selected an absent right winner"))?;
@@ -574,19 +505,19 @@ mod tests {
         let old_quarantine = versioned(ProjectStatus::Quarantined, None, 2);
         let new_active = versioned(ProjectStatus::Active, None, 3);
         assert_eq!(
-            merge_status(Some(&old_quarantine), Some(&new_active)),
-            StatusWinner::Right
+            status_merge(Some(&old_quarantine), Some(&new_active)),
+            MergeChoice::B
         );
 
         let active = versioned(ProjectStatus::Active, None, 4);
         let quarantine = versioned(ProjectStatus::Quarantined, None, 4);
         assert_eq!(
-            merge_status(Some(&active), Some(&quarantine)),
-            StatusWinner::Right
+            status_merge(Some(&active), Some(&quarantine)),
+            MergeChoice::B
         );
         assert_eq!(
-            merge_status(Some(&quarantine), Some(&active)),
-            StatusWinner::Left
+            status_merge(Some(&quarantine), Some(&active)),
+            MergeChoice::A
         );
 
         let mut private = versioned(ProjectStatus::Active, None, 1);
@@ -594,8 +525,8 @@ mod tests {
         let mut mirror = versioned(ProjectStatus::Quarantined, None, 99);
         mirror.origin = Some(Origin::Mirror);
         assert_eq!(
-            merge_status(Some(&private), Some(&mirror)),
-            StatusWinner::Left,
+            status_merge(Some(&private), Some(&mirror)),
+            MergeChoice::A,
             "mirror epochs belong to a superseded origin world"
         );
     }
@@ -604,15 +535,15 @@ mod tests {
     fn status_merge_reason_tie_break_is_symmetric() {
         let a = versioned(ProjectStatus::Archived, Some("alpha"), 5);
         let b = versioned(ProjectStatus::Archived, Some("beta"), 5);
-        let ab = merge_status(Some(&a), Some(&b));
-        let ba = merge_status(Some(&b), Some(&a));
-        assert!(matches!(ab, StatusWinner::Left | StatusWinner::Right));
+        let ab = status_merge(Some(&a), Some(&b));
+        let ba = status_merge(Some(&b), Some(&a));
+        assert!(matches!(ab, MergeChoice::A | MergeChoice::B));
         assert_eq!(
             (ab, ba),
             match ab {
-                StatusWinner::Left => (StatusWinner::Left, StatusWinner::Right),
-                StatusWinner::Right => (StatusWinner::Right, StatusWinner::Left),
-                StatusWinner::InSync => unreachable!(),
+                MergeChoice::A => (MergeChoice::A, MergeChoice::B),
+                MergeChoice::B => (MergeChoice::B, MergeChoice::A),
+                MergeChoice::Equal => unreachable!(),
             }
         );
     }

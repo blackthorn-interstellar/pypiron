@@ -4,9 +4,18 @@
 //! Split out of [`super`][crate::replicate] as the no-I/O decision core: every
 //! input is durable bucket state, so the whole module is unit-testable without
 //! storage. The I/O executors that apply a [`Verdict`] stay in `replicate`.
+//!
+//! Every replicated document merges here and nowhere else: a filename's record
+//! ([`decide`]), its sidecar ([`sidecar_merge`]), the package claim
+//! ([`claim_join`]) and the project status ([`status_merge`]). They share one
+//! origin precedence ([`Origin::rank`]) and one tiebreak ([`ranked_merge`]),
+//! and the law tests below hold each ranked merge to a total order — the
+//! property that makes N buckets converge on one answer whatever order the
+//! pairs sync in.
 
 use crate::origin::{OriginState, MIRROR, PRIVATE};
 use crate::sidecar::{Sidecar, Yanked};
+use crate::status::{ProjectStatusDoc, VersionedProjectStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
@@ -36,6 +45,41 @@ impl Origin {
             .ok()
             .and_then(|state| state.try_into().ok())
     }
+
+    /// The one origin precedence every merge ranks by: private ≻ mirror.
+    /// Private is the operator's own truth; mirror is a copy of upstream.
+    pub fn rank(self) -> u8 {
+        match self {
+            Origin::Mirror => 1,
+            Origin::Private => 2,
+        }
+    }
+}
+
+/// The package claim both buckets converge on: the higher-ranked one, an
+/// absent claim lowest. A lone claim is a fan-out a partition cut short, and
+/// private is terminal, so the join only ever raises a side.
+pub fn claim_join(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
+    if b.map_or(0, Origin::rank) > a.map_or(0, Origin::rank) {
+        b
+    } else {
+        a
+    }
+}
+
+/// A mirror record standing under a private package claim. A proxy fill can
+/// commit after the claim turned private, so this is a demotion loser to
+/// quarantine — never truth to replicate, whatever [`decide`] would say about
+/// the record on its own.
+pub(crate) fn is_late_mirror(record: &Record, pkg_origin: Option<Origin>) -> bool {
+    pkg_origin == Some(Origin::Private)
+        && matches!(
+            record.state(),
+            RecordState::Live {
+                origin: Origin::Mirror,
+                ..
+            }
+        )
 }
 
 impl TryFrom<OriginState> for Origin {
@@ -329,25 +373,14 @@ pub(crate) fn conflict_winner(a: &Record, b: &Record) -> Option<Side> {
     Some(if ta < tb { Side::A } else { Side::B })
 }
 
-/// Both sides hold the same bytes. Origin precedence (private ≻ mirror) first,
-/// then the yank merge (§6.5). Adopt the winner's sidecar wholesale.
+/// Both sides hold the same bytes: the [`sidecar_merge`] winner's sidecar is
+/// adopted wholesale.
 pub fn same_bytes(a: &Record, b: &Record, oa: Origin, ob: Origin) -> Verdict {
-    match (oa, ob) {
-        (Origin::Private, Origin::Mirror) => return Verdict::AdoptSidecar(Side::A),
-        (Origin::Mirror, Origin::Private) => return Verdict::AdoptSidecar(Side::B),
-        // Two mirror records of the same bytes converge their yank metadata
-        // through the merge below (§6.5) — snapshot, cache, or a mixed pair
-        // alike. The snapshot/cache bit is write-time provenance, not truth the
-        // merge arbitrates; it rides the yank_merge winner's sidecar. Using
-        // yank_merge (not a snapshot-wins pick) keeps the yank state fail-closed:
-        // a yanked side is never silently un-yanked by the peer's provenance.
-        (Origin::Mirror, Origin::Mirror) | (Origin::Private, Origin::Private) => {}
-    }
     let (sca, scb) = match (a.sidecar.as_ref(), b.sidecar.as_ref()) {
         (Some(sca), Some(scb)) => (sca, scb),
         _ => return Verdict::Noop,
     };
-    match yank_merge(sca, scb) {
+    match sidecar_merge(sca, Some(oa), scb, Some(ob)) {
         MergeChoice::A => Verdict::AdoptSidecar(Side::A),
         MergeChoice::B => Verdict::AdoptSidecar(Side::B),
         MergeChoice::Equal => Verdict::Noop,
@@ -361,50 +394,101 @@ pub enum MergeChoice {
     Equal,
 }
 
+/// The one tiebreak every replicated document merges by. The greater key wins;
+/// an equal key over identical bytes is already converged; an equal key over
+/// different bytes goes to the lexicographically smaller sha256 of the bytes,
+/// so every pair order and every bucket picks the same winner. Never a wall
+/// clock and never a bucket identity — two buckets have two of each.
+/// (Comparing the bytes directly would also be a total order, but not the one
+/// stored records were already merged under.)
+pub fn ranked_merge<K: Ord>(ka: K, a: &[u8], kb: K, b: &[u8]) -> MergeChoice {
+    match ka.cmp(&kb) {
+        std::cmp::Ordering::Greater => MergeChoice::A,
+        std::cmp::Ordering::Less => MergeChoice::B,
+        std::cmp::Ordering::Equal if a == b => MergeChoice::Equal,
+        std::cmp::Ordering::Equal if Sha256::digest(a) <= Sha256::digest(b) => MergeChoice::A,
+        std::cmp::Ordering::Equal => MergeChoice::B,
+    }
+}
+
 pub fn is_yanked(sc: &Sidecar) -> bool {
     !matches!(sc.yanked.normalized(), Yanked::Flag(false))
 }
 
-/// Sidecar merge: max yank epoch wins; on an equal epoch a conflicting state
-/// resolves to yanked (fail-closed); only then does the higher upload-time
-/// revision win, so a timestamp repair can never outrank a yank. A residual
-/// tie (both yanked, different reasons) breaks on the lexicographically
-/// smaller sidecar sha256. Never a wall clock — two buckets have two clocks.
-pub fn yank_merge(a: &Sidecar, b: &Sidecar) -> MergeChoice {
-    if a.yank_epoch != b.yank_epoch {
-        return if a.yank_epoch > b.yank_epoch {
-            MergeChoice::A
-        } else {
-            MergeChoice::B
-        };
-    }
-    let (ay, by) = (is_yanked(a), is_yanked(b));
-    if ay != by {
-        return if ay { MergeChoice::A } else { MergeChoice::B };
-    }
-    if a.upload_time_revision != b.upload_time_revision {
-        return if a.upload_time_revision > b.upload_time_revision {
-            MergeChoice::A
-        } else {
-            MergeChoice::B
-        };
-    }
-    // A residual same-epoch tie includes differing yank reasons and the
-    // write-time metadata from two byte-identical partition uploads. Exact
-    // equality is already converged; otherwise the sidecar digest gives every
-    // pair order the same winner. Comparing serialized bytes directly is not
-    // equivalent to comparing their digests.
-    match (serde_json::to_vec(a), serde_json::to_vec(b)) {
-        (Ok(ja), Ok(jb)) if ja == jb => MergeChoice::Equal,
-        (Ok(ja), Ok(jb)) if Sha256::digest(&ja) <= Sha256::digest(&jb) => MergeChoice::A,
-        (Ok(_), Ok(_)) => MergeChoice::B,
-        _ => MergeChoice::Equal,
+/// Same-bytes sidecar merge (§6.5), ranked by: origin (private ≻ mirror; an
+/// untyped legacy sidecar ranks as mirror, so it never outranks private truth
+/// and never wins on provenance alone); then the yank epoch; then yanked over
+/// not, so a split never un-yanks (fail-closed); then the upload-time revision,
+/// so a timestamp repair never outranks a yank. A residual tie — differing yank
+/// reasons, or the write-time metadata of two byte-identical partition
+/// uploads — falls to [`ranked_merge`]'s digest.
+pub fn sidecar_merge(
+    a: &Sidecar,
+    oa: Option<Origin>,
+    b: &Sidecar,
+    ob: Option<Origin>,
+) -> MergeChoice {
+    let key = |sc: &Sidecar, origin: Option<Origin>| {
+        (
+            origin.unwrap_or(Origin::Mirror).rank(),
+            sc.yank_epoch,
+            is_yanked(sc),
+            sc.upload_time_revision,
+        )
+    };
+    ranked_merge(
+        key(a, oa),
+        &serde_json::to_vec(a).unwrap_or_default(),
+        key(b, ob),
+        &serde_json::to_vec(b).unwrap_or_default(),
+    )
+}
+
+/// Project-status merge, without clocks. Absence is `active` at epoch zero, so
+/// a stored epoch-zero `active` event and no event agree. Otherwise ranked by:
+/// operator-authored over relayed — a mirror-tagged event is a proxy's copy of
+/// upstream and ranks below anything an operator wrote, tagged private or
+/// untagged (a claim absent at write time); then the greater epoch; then the
+/// more restrictive status (fail-closed); then private over untagged.
+///
+/// Untagged ranks *with* private, not with mirror, unlike an untyped sidecar:
+/// an untagged status is still an operator's write, and a peer's private event
+/// must not outrank a later one by provenance alone. It ranks above mirror
+/// rather than beside it by epoch because both cannot hold: private ≻ mirror
+/// regardless of epoch, so ordering untagged against each by epoch alone was a
+/// cycle (untagged@2 ≻ private@1 ≻ mirror@3 ≻ untagged@2) whose outcome
+/// depended on which pair synced first.
+pub fn status_merge(
+    a: Option<&VersionedProjectStatus>,
+    b: Option<&VersionedProjectStatus>,
+) -> MergeChoice {
+    let is_default =
+        |s: &VersionedProjectStatus| s.epoch == 0 && s.doc == ProjectStatusDoc::default();
+    let key = |s: &VersionedProjectStatus| {
+        (
+            s.origin != Some(Origin::Mirror),
+            s.epoch,
+            s.doc.status.restriction(),
+            s.origin == Some(Origin::Private),
+        )
+    };
+    match (a, b) {
+        (None, None) => MergeChoice::Equal,
+        (Some(s), None) | (None, Some(s)) if is_default(s) => MergeChoice::Equal,
+        (Some(_), None) => MergeChoice::A,
+        (None, Some(_)) => MergeChoice::B,
+        (Some(a), Some(b)) => ranked_merge(key(a), &a.encode(), key(b), &b.encode()),
     }
 }
 
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+
+    /// The yank half of [`sidecar_merge`]: two sidecars of one origin.
+    fn yank_merge(a: &Sidecar, b: &Sidecar) -> MergeChoice {
+        sidecar_merge(a, None, b, None)
+    }
 
     pub(crate) fn sc(sha: &str, origin: &str, yanked: Yanked, epoch: u64) -> Sidecar {
         Sidecar {
@@ -905,5 +989,203 @@ pub(crate) mod tests {
         assert_eq!(decide(&orphan, &live("x", PRIVATE)), Verdict::Defer);
         assert_eq!(decide(&live("x", PRIVATE), &orphan), Verdict::Defer);
         assert_eq!(decide(&orphan, &absent()), Verdict::Defer);
+    }
+
+    // ---------------------------------------------------------------------
+    // Merge laws. Exhaustive over small domains: every ranking compares only
+    // through `Ord` and byte equality, so a few values per field reach every
+    // branch a larger domain would.
+    // ---------------------------------------------------------------------
+
+    fn mirrored(choice: MergeChoice) -> MergeChoice {
+        match choice {
+            MergeChoice::A => MergeChoice::B,
+            MergeChoice::B => MergeChoice::A,
+            MergeChoice::Equal => MergeChoice::Equal,
+        }
+    }
+
+    /// `merge` must be a total order: reflexive, antisymmetric under a swap,
+    /// and transitive. Transitivity is the convergence property — without it
+    /// three buckets can hold a cycle and the fleet's answer depends on which
+    /// pair synced first.
+    fn assert_total_order<T: std::fmt::Debug>(items: &[T], merge: impl Fn(&T, &T) -> MergeChoice) {
+        let at_least = |a: &T, b: &T| merge(a, b) != MergeChoice::B;
+        for a in items {
+            assert_eq!(merge(a, a), MergeChoice::Equal, "not reflexive: {a:?}");
+            for b in items {
+                assert_eq!(
+                    merge(b, a),
+                    mirrored(merge(a, b)),
+                    "asymmetric: {a:?} vs {b:?}"
+                );
+                if !at_least(a, b) {
+                    continue;
+                }
+                for c in items {
+                    assert!(
+                        !at_least(b, c) || at_least(a, c),
+                        "cycle: {a:?} >= {b:?} >= {c:?} but not {a:?} >= {c:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sidecar_merge_is_a_total_order() {
+        let mut items = Vec::new();
+        for origin in [None, Some(Origin::Private), Some(Origin::Mirror)] {
+            for yank_epoch in 0..3 {
+                for yanked in [
+                    Yanked::Flag(false),
+                    Yanked::Flag(true),
+                    Yanked::Reason("r".into()),
+                ] {
+                    for upload_time_revision in 0..2 {
+                        let mut sidecar = sc("x", PRIVATE, yanked.clone(), yank_epoch);
+                        sidecar.origin = origin.map(|o| match o {
+                            Origin::Private => PRIVATE.to_string(),
+                            Origin::Mirror => MIRROR.to_string(),
+                        });
+                        sidecar.upload_time_revision = upload_time_revision;
+                        items.push((sidecar, origin));
+                    }
+                }
+            }
+        }
+        assert_total_order(&items, |(a, oa), (b, ob)| sidecar_merge(a, *oa, b, *ob));
+    }
+
+    #[test]
+    fn status_merge_is_a_total_order() {
+        use crate::status::ProjectStatus;
+        let mut items = Vec::new();
+        for origin in [None, Some(Origin::Private), Some(Origin::Mirror)] {
+            for epoch in 0..3 {
+                for (status, reason) in [
+                    (ProjectStatus::Active, None),
+                    (ProjectStatus::Deprecated, None),
+                    (ProjectStatus::Quarantined, Some("r1")),
+                    (ProjectStatus::Quarantined, Some("r2")),
+                ] {
+                    items.push(VersionedProjectStatus {
+                        doc: ProjectStatusDoc {
+                            status,
+                            reason: reason.map(str::to_string),
+                        },
+                        epoch,
+                        origin,
+                        etag: String::new(),
+                    });
+                }
+            }
+        }
+        assert_total_order(&items, |a, b| status_merge(Some(a), Some(b)));
+        // Absence is the epoch-zero active default: equal to it, below the rest.
+        for item in &items {
+            let expected = if item.epoch == 0 && item.doc == ProjectStatusDoc::default() {
+                MergeChoice::Equal
+            } else {
+                MergeChoice::A
+            };
+            assert_eq!(status_merge(Some(item), None), expected, "{item:?}");
+            assert_eq!(
+                status_merge(None, Some(item)),
+                mirrored(expected),
+                "{item:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn claim_join_is_a_join() {
+        let claims = [None, Some(Origin::Mirror), Some(Origin::Private)];
+        for a in claims {
+            assert_eq!(claim_join(a, a), a);
+            for b in claims {
+                assert_eq!(claim_join(a, b), claim_join(b, a));
+                for c in claims {
+                    assert_eq!(
+                        claim_join(claim_join(a, b), c),
+                        claim_join(a, claim_join(b, c))
+                    );
+                }
+            }
+        }
+        assert_eq!(
+            claim_join(Some(Origin::Mirror), Some(Origin::Private)),
+            Some(Origin::Private)
+        );
+        assert_eq!(claim_join(None, Some(Origin::Mirror)), Some(Origin::Mirror));
+    }
+
+    fn swap(side: Side) -> Side {
+        match side {
+            Side::A => Side::B,
+            Side::B => Side::A,
+        }
+    }
+
+    fn mirrored_verdict(verdict: Verdict) -> Verdict {
+        match verdict {
+            Verdict::Copy(side) => Verdict::Copy(swap(side)),
+            Verdict::AdoptSidecar(side) => Verdict::AdoptSidecar(swap(side)),
+            Verdict::Supersede(side) => Verdict::Supersede(swap(side)),
+            Verdict::QuarantineLoser(side) => Verdict::QuarantineLoser(swap(side)),
+            Verdict::PropagateFreeze(side) => Verdict::PropagateFreeze(swap(side)),
+            other @ (Verdict::Noop
+            | Verdict::Defer
+            | Verdict::Freeze
+            | Verdict::Tombstone
+            | Verdict::FinishFreeze
+            | Verdict::SettleMirrorQuarantine) => other,
+        }
+    }
+
+    /// `decide(a, b)` and `decide(b, a)` name the same physical outcome, so a
+    /// bidirectional diff can never double-apply or fight itself.
+    #[test]
+    fn decide_is_symmetric() {
+        let mut sidecars = vec![None];
+        for (sha, origin, epoch_ms) in [
+            ("x", PRIVATE, Some(0)),
+            ("x", MIRROR, None),
+            ("y", PRIVATE, Some(10_000)),
+            ("y", PRIVATE, Some(1_000)),
+            ("y", MIRROR, None),
+        ] {
+            let mut sidecar = sc(sha, origin, Yanked::Flag(false), 0);
+            sidecar.upload_epoch_ms = epoch_ms;
+            sidecars.push(Some(sidecar));
+        }
+        let mut yanked = sc("x", PRIVATE, Yanked::Flag(true), 1);
+        yanked.upload_epoch_ms = Some(0);
+        sidecars.push(Some(yanked));
+
+        let mut records = Vec::new();
+        for sidecar in &sidecars {
+            for bits in 0..16u8 {
+                records.push(Record {
+                    sidecar: sidecar.clone(),
+                    has_artifact: bits & 1 != 0,
+                    has_metadata: false,
+                    has_provenance: false,
+                    tombstoned: bits & 2 != 0,
+                    frozen: bits & 4 != 0,
+                    mirror_quarantined: bits & 8 != 0,
+                    pkg_origin: None,
+                });
+            }
+        }
+        for a in &records {
+            for b in &records {
+                assert_eq!(
+                    decide(b, a),
+                    mirrored_verdict(decide(a, b)),
+                    "asymmetric verdict for {a:?} vs {b:?}"
+                );
+            }
+        }
     }
 }

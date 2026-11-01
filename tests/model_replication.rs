@@ -81,7 +81,7 @@ struct AbsSidecar {
     epoch_ms: Option<u16>,
     /// Provenance of a mirror record: true on a `sync --to` snapshot, false on a
     /// proxy cache and on private records. Both mirror kinds replicate now — the
-    /// merge does not arbitrate this bit; it only rides the yank_merge winner.
+    /// merge does not arbitrate this bit; it only rides the sidecar_merge winner.
     snapshot: bool,
 }
 
@@ -390,27 +390,16 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
             let (Some(sa), Some(sb)) = (ra.sidecar, rb.sidecar) else {
                 return;
             };
-            match (sa.origin, sb.origin) {
-                (MOrigin::Private, MOrigin::Mirror) => {
+            let (ra, rb) = (to_sidecar(&sa), to_sidecar(&sb));
+            let origin = |sc: &Sidecar| sc.origin.as_deref().and_then(ROrigin::parse);
+            match pypiron::replicate::sidecar_merge(&ra, origin(&ra), &rb, origin(&rb)) {
+                pypiron::replicate::MergeChoice::A => {
                     b.files[file as usize].sidecar = Some(sa);
                 }
-                (MOrigin::Mirror, MOrigin::Private) => {
+                pypiron::replicate::MergeChoice::B => {
                     a.files[file as usize].sidecar = Some(sb);
                 }
-                // Any two same-byte mirror records (snapshot, cache, or mixed)
-                // converge their yank state exactly like two private records —
-                // yank_merge, fail-closed, the snapshot bit riding the winner.
-                (MOrigin::Mirror, MOrigin::Mirror) | (MOrigin::Private, MOrigin::Private) => {
-                    match pypiron::replicate::yank_merge(&to_sidecar(&sa), &to_sidecar(&sb)) {
-                        pypiron::replicate::MergeChoice::A => {
-                            b.files[file as usize].sidecar = Some(sa);
-                        }
-                        pypiron::replicate::MergeChoice::B => {
-                            a.files[file as usize].sidecar = Some(sb);
-                        }
-                        pypiron::replicate::MergeChoice::Equal => {}
-                    }
-                }
+                pypiron::replicate::MergeChoice::Equal => {}
             }
         }
         Verdict::Supersede(side) | Verdict::QuarantineLoser(side) => {
@@ -484,27 +473,35 @@ fn reconcile_split_origin_abs(w: &mut World) {
     // Mirror never demotes private, so this only ever fills in a missing claim;
     // an empty claim has no record for the copy path to ride along with, so
     // without it a claim whose fan-out lost its peer never converges.
-    match (w.buckets[0].pkg_origin, w.buckets[1].pkg_origin) {
-        (Some(MOrigin::Mirror), None) => w.buckets[1].pkg_origin = Some(MOrigin::Mirror),
-        (None, Some(MOrigin::Mirror)) => w.buckets[0].pkg_origin = Some(MOrigin::Mirror),
-        _ => {}
-    }
-    match (w.buckets[0].pkg_origin, w.buckets[1].pkg_origin) {
-        // Demoting the peer's mirror claim strands its mirror bodies; the
-        // promoted side quarantines them in the same pass.
-        (Some(MOrigin::Private), Some(MOrigin::Mirror)) => {
-            w.buckets[1].pkg_origin = Some(MOrigin::Private);
-            quarantine_mirror_artifacts_abs(&mut w.buckets[1]);
+    let to_real = |o: Option<MOrigin>| {
+        o.map(|o| match o {
+            MOrigin::Private => ROrigin::Private,
+            MOrigin::Mirror => ROrigin::Mirror,
+        })
+    };
+    let from_real = |o: Option<ROrigin>| {
+        o.map(|o| match o {
+            ROrigin::Private => MOrigin::Private,
+            ROrigin::Mirror => MOrigin::Mirror,
+        })
+    };
+    // Both claims join upward through the real `claim_join`. Demoting a
+    // mirror claim strands its mirror bodies, so that side quarantines them in
+    // the same pass; an unclaimed side holds no mirror record to strand (a
+    // mirror writer claims the name before it writes anything).
+    let join = from_real(pypiron::replicate::claim_join(
+        to_real(w.buckets[0].pkg_origin),
+        to_real(w.buckets[1].pkg_origin),
+    ));
+    for bucket in &mut w.buckets {
+        if bucket.pkg_origin == join {
+            continue;
         }
-        (Some(MOrigin::Mirror), Some(MOrigin::Private)) => {
-            w.buckets[0].pkg_origin = Some(MOrigin::Private);
-            quarantine_mirror_artifacts_abs(&mut w.buckets[0]);
+        let demoted = bucket.pkg_origin == Some(MOrigin::Mirror);
+        bucket.pkg_origin = join;
+        if demoted {
+            quarantine_mirror_artifacts_abs(bucket);
         }
-        // An unclaimed peer holds no mirror record to strand (a mirror writer
-        // claims the name before it writes anything), so no scan follows.
-        (Some(MOrigin::Private), None) => w.buckets[1].pkg_origin = Some(MOrigin::Private),
-        (None, Some(MOrigin::Private)) => w.buckets[0].pkg_origin = Some(MOrigin::Private),
-        _ => {}
     }
 }
 

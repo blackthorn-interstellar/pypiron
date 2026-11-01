@@ -499,18 +499,9 @@ async fn adopt_sidecar_cas(
         };
         let left_origin = sidecar_origin(&left, left_claim)?;
         let right_origin = sidecar_origin(&right, right_claim)?;
-        let choice = match (left_origin, right_origin) {
-            (Origin::Private, Origin::Mirror) => MergeChoice::A,
-            (Origin::Mirror, Origin::Private) => MergeChoice::B,
-            // Any two mirror records of the same bytes converge their yank state
-            // (§6.5) — snapshot, cache, or a mixed pair. yank_merge is fail-closed
-            // (a yanked side is never un-yanked by the peer's provenance); the
-            // snapshot bit rides the winner's sidecar, matching `same_bytes`.
-            (Origin::Mirror, Origin::Mirror) | (Origin::Private, Origin::Private) => {
-                yank_merge(&left, &right)
-            }
-        };
-        match choice {
+        // The same merge `same_bytes` decided by, recomputed on the current
+        // sidecars; the snapshot bit rides the winner's sidecar.
+        match sidecar_merge(&left, Some(left_origin), &right, Some(right_origin)) {
             MergeChoice::Equal => return Ok((false, false)),
             MergeChoice::A => {
                 if b.put_if_match(&key, &right_etag, left_bytes)
@@ -1064,11 +1055,9 @@ async fn install_or_verify_sidecar(
         let replace = if current.sha256 != sidecar.sha256 {
             body.is_none() || body_matches || current.origin.as_deref() == Some(MIRROR)
         } else {
-            match current.origin.as_deref() {
-                Some(MIRROR) | None => true,
-                Some(PRIVATE) => yank_merge(sidecar, &current) == MergeChoice::A,
-                Some(_) => false,
-            }
+            let current_origin = current.origin.as_deref().and_then(Origin::parse);
+            sidecar_merge(sidecar, Some(Origin::Private), &current, current_origin)
+                == MergeChoice::A
         };
         if !replace {
             if current.sha256 != sidecar.sha256 {
@@ -1893,8 +1882,10 @@ pub(crate) async fn install_or_verify_mirror_sidecar(
                     .as_deref()
                     .is_some_and(|body| sha256_hex(body) == sidecar.sha256)
         } else {
-            // Same bytes: the higher yank epoch wins (§6.5).
-            yank_merge(sidecar, &current) == MergeChoice::A
+            // Same bytes: the sidecar merge decides (§6.5). Private truth
+            // already returned above, so this is mirror against mirror.
+            let current_origin = current.origin.as_deref().and_then(Origin::parse);
+            sidecar_merge(sidecar, Some(Origin::Mirror), &current, current_origin) == MergeChoice::A
         };
         if !replace {
             if current.sha256 != sidecar.sha256 {
@@ -2693,32 +2684,25 @@ async fn reconcile_split_origin(
     } else if b_origin == Some(Origin::Mirror) && a_origin.is_none() {
         a_origin = Some(ensure_mirror_origin(a, pkg).await?);
     }
-    match (a_origin, b_origin) {
-        (Some(Origin::Private), Some(Origin::Mirror)) => {
-            ensure_private_origin(b, pkg).await?;
-            if quarantine_mirror_artifacts(b, pkg).await? > 0 {
-                markers::mark_dirty(b, pkg).await?;
+    // Both claims join upward ([`claim_join`]). A side raised from mirror to
+    // private is a demotion, so its mirror bodies are quarantined on the way.
+    if claim_join(a_origin, b_origin) == Some(Origin::Private) {
+        for (storage, origin, scanned) in [
+            (a, &mut a_origin, &mut scanned_a),
+            (b, &mut b_origin, &mut scanned_b),
+        ] {
+            if *origin == Some(Origin::Private) {
+                continue;
             }
-            scanned_b = true;
-            b_origin = Some(Origin::Private);
-        }
-        (Some(Origin::Mirror), Some(Origin::Private)) => {
-            ensure_private_origin(a, pkg).await?;
-            if quarantine_mirror_artifacts(a, pkg).await? > 0 {
-                markers::mark_dirty(a, pkg).await?;
+            ensure_private_origin(storage, pkg).await?;
+            if *origin == Some(Origin::Mirror) {
+                if quarantine_mirror_artifacts(storage, pkg).await? > 0 {
+                    markers::mark_dirty(storage, pkg).await?;
+                }
+                *scanned = true;
             }
-            scanned_a = true;
-            a_origin = Some(Origin::Private);
+            *origin = Some(Origin::Private);
         }
-        (Some(Origin::Private), None) => {
-            ensure_private_origin(b, pkg).await?;
-            b_origin = Some(Origin::Private);
-        }
-        (None, Some(Origin::Private)) => {
-            ensure_private_origin(a, pkg).await?;
-            a_origin = Some(Origin::Private);
-        }
-        _ => {}
     }
     Ok(SplitOriginReconciled {
         a_origin,
@@ -2775,17 +2759,6 @@ async fn replicate_record(
     }
     let verdict = decide(&a, &b);
     execute(state, (src, dst), pkg, filename, (&a, &b), verdict, source).await
-}
-
-fn is_late_mirror(record: &Record, pkg_origin: Option<Origin>) -> bool {
-    pkg_origin == Some(Origin::Private)
-        && matches!(
-            record.state(),
-            RecordState::Live {
-                origin: Origin::Mirror,
-                ..
-            }
-        )
 }
 
 async fn normalize_mirror_status_under_private_claim(

@@ -611,8 +611,13 @@ marker so a crash between the two is a recognizable torn record the next rebuild
 finishes. Pinned as a property of the write *sequence* in
 `tests/conformance_publish_ordering.rs`.
 
-Correctness does not depend on every node selecting the same bucket. The merge
-(`replicate::decide`, pure and unit-tested) has precedence
+Correctness does not depend on every node selecting the same bucket. Every
+replicated document merges in one pure module (`src/replicate/decide.rs`): the
+record (`decide`), its sidecar (`sidecar_merge`), the package claim
+(`claim_join`) and the project status (`status_merge`). They share one origin
+rank and one residual tiebreak, and exhaustive law tests hold each to a total
+order — the property that makes N buckets agree whatever order pairs sync in.
+The record merge has precedence
 **tombstone ≻ origin (private ≻ mirror) ≻ union ≻ freeze**: deletes beat live
 records, private beats mirror, artifact sets union, and logical yank/status
 epochs settle metadata. Two different **mirror** bodies under one immutable PyPI
@@ -1169,10 +1174,14 @@ stay at the top level; `pypiron-epoch` is a monotonic local event counter and
 files omit both and read as epoch zero. Every multi-bucket set or clear
 CAS-bumps the epoch, and a clear persists an explicit `active` event instead of
 deleting the file. Single-bucket mode keeps the original plain-document PUT and
-active-marker DELETE. Private-tagged status beats mirror-tagged status; within
-one origin world, cross-bucket merge takes the greater epoch. Equal epochs take
-the more restrictive state, then the canonical record sha256 as a deterministic
-reason tie-break. Corrupt files and storage
+active-marker DELETE. Mirror-tagged status — a proxy's relay of upstream —
+ranks below anything an operator wrote, private-tagged or untagged; among
+those, cross-bucket merge takes the greater epoch, then the more restrictive
+state, then private over untagged, then the canonical record sha256 as a
+deterministic reason tie-break. Untagged ranks above mirror outright, not by
+epoch: with private ≻ mirror regardless of epoch, ordering untagged by epoch
+against both was a three-bucket cycle whose winner depended on sync order.
+Corrupt files and storage
 read failures never default to active.
 Mirror status stays local. When a private claim supersedes a mirror one, the
 copy path reconciles status directly (`reconcile_project_status`, run whenever

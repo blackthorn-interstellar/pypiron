@@ -13,10 +13,11 @@ name: Docker
 # linux/<arch>` builds it without emulation. Each image is then booted under
 # QEMU and smoke-tested (dev/scripts/image-smoke.sh) BEFORE it is pushed, so a
 # binary that cannot load on its base, or an image missing a dir the server
-# needs, never reaches GHCR. Releases (tags) and manual dry-runs cover the full
-# arch set; ordinary pushes/PRs build only amd64+arm64 to stay fast. Per-arch
-# images are pushed by digest, then `imagetools create` stitches them into one
-# manifest list (the merge job).
+# needs, never reaches GHCR. Releases (tags) and manual dry-runs (including the
+# one each nightly dependency PR dispatches) cover the full arch set; ordinary
+# pushes/PRs build only amd64+arm64 to stay fast. Per-arch images are pushed by
+# digest, then `imagetools create` stitches them into one manifest list (the
+# merge job).
 
 on:
   push:

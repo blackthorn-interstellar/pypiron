@@ -29,9 +29,11 @@
 # agent attempt.
 #
 # Event model: a PR opened with the GITHUB_TOKEN does NOT trigger `pull_request`
-# workflows (GitHub's anti-recursion rule), so the publish jobs dispatch ci.yml
-# and security.yaml explicitly and approve any run GitHub parked at
-# action_required. No PAT is involved anywhere.
+# workflows (GitHub's anti-recursion rule), so the publish jobs dispatch ci.yml,
+# security.yaml and docker.yml explicitly and approve any ci/security run GitHub
+# parked at action_required. No PAT is involved anywhere. (docker.yml's own
+# pull_request run parks and is never approved: the dispatched one supersedes
+# it, and builds the full arch set where a pull_request run builds two.)
 name: Nightly deps
 
 on:
@@ -374,12 +376,14 @@ jobs:
         run: |
           set -euo pipefail
           # A GITHUB_TOKEN event triggers no workflow, so nothing runs on this
-          # SHA unless it is dispatched. ci.yml and security.yaml both take
-          # workflow_dispatch, and a dispatched run's check runs land on the
+          # SHA unless it is dispatched. ci.yml, security.yaml and docker.yml all
+          # take workflow_dispatch, and a dispatched run's check runs land on the
           # branch head — which is the PR head — so they join the PR's rollup
-          # and `gh pr checks` judges them.
+          # and `gh pr checks` judges them. docker.yml dispatched builds and
+          # boot-tests every release arch and pushes nothing.
           gh workflow run ci.yml --ref "$BRANCH"
           gh workflow run security.yaml --ref "$BRANCH"
+          gh workflow run docker.yml --ref "$BRANCH"
           head=$(gh pr view "$BRANCH" --json headRefOid --jq .headRefOid)
           # Opening the PR can ALSO file runs that GitHub parks at
           # action_required. A parked run executes no jobs and contributes ZERO
@@ -729,6 +733,7 @@ jobs:
           set -euo pipefail
           gh workflow run ci.yml --ref "$BRANCH"
           gh workflow run security.yaml --ref "$BRANCH"
+          gh workflow run docker.yml --ref "$BRANCH"
           head=$(gh pr view "$BRANCH" --json headRefOid --jq .headRefOid)
           sec=0
           for _ in $(seq 1 12); do
@@ -801,14 +806,14 @@ jobs:
       # `gh pr checks --watch` only judges the checks that EXIST. A gate that
       # never lands in the PR's rollup reads as green here, and the night then
       # dies at merge time with an opaque 405 — or worse, merges a bump nothing
-      # scanned. Both merge gates are dispatched by the publish jobs rather than
+      # scanned. All three merge gates are dispatched by the publish jobs rather than
       # triggered by the PR event, so "it dispatched" is not proof "it ran":
       # a run parked at action_required contributes ZERO check runs.
       #
       # Key off `conclusion`, NEVER `status`: a parked run reads status=completed
       # with conclusion=action_required, so a status test calls the missing run
       # finished and asserts nothing.
-      - name: Both merge gates actually ran on this SHA
+      - name: Every merge gate actually ran on this SHA
         if: steps.wait.outputs.failed == 'false'
         run: |
           set -euo pipefail
@@ -816,7 +821,7 @@ jobs:
           gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$head&per_page=100" --paginate \
             --jq '.workflow_runs[] | select(.conclusion != "action_required") | .path' > "$RUNNER_TEMP/paths.txt"
           fail=0
-          for wf in ci.yml security.yaml; do
+          for wf in ci.yml security.yaml docker.yml; do
             n=$(grep -cxF ".github/workflows/$wf" "$RUNNER_TEMP/paths.txt" || true)
             echo "$wf runs on $head that were not parked: $n"
             if [ "${n:-0}" -eq 0 ]; then
@@ -846,7 +851,7 @@ jobs:
           # classification.
           gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$head&per_page=100" --paginate \
             --jq '.workflow_runs[]
-                  | select(.path == ".github/workflows/ci.yml" or .path == ".github/workflows/security.yaml")
+                  | select(.path == ".github/workflows/ci.yml" or .path == ".github/workflows/security.yaml" or .path == ".github/workflows/docker.yml")
                   | select(.conclusion != "action_required")
                   | "\(.path) \(.status) \(.conclusion // "none") \(.id)"' > "$RUNNER_TEMP/runs.txt"
           cat "$RUNNER_TEMP/runs.txt"
@@ -1115,6 +1120,7 @@ jobs:
           # rightly refuse to merge it.
           gh workflow run ci.yml --ref "$BRANCH"
           gh workflow run security.yaml --ref "$BRANCH"
+          gh workflow run docker.yml --ref "$BRANCH"
           head=$(git rev-parse HEAD)
           sec=0
           for _ in $(seq 1 12); do
@@ -1203,18 +1209,19 @@ jobs:
           while :; do
             gh api "repos/$GITHUB_REPOSITORY/actions/runs?head_sha=$SHA&per_page=100" \
               --jq '.workflow_runs[]
-                    | select(.path == ".github/workflows/ci.yml" or .path == ".github/workflows/security.yaml")
+                    | select(.path == ".github/workflows/ci.yml" or .path == ".github/workflows/security.yaml" or .path == ".github/workflows/docker.yml")
                     | select(.conclusion != "action_required")
                     | "\(.path) \(.status)"' > "$RUNNER_TEMP/runs.txt" || true
             n_ci=$(grep -c 'ci\.yml' "$RUNNER_TEMP/runs.txt" || true)
             n_security=$(grep -c 'security\.yaml' "$RUNNER_TEMP/runs.txt" || true)
+            n_docker=$(grep -c 'docker\.yml' "$RUNNER_TEMP/runs.txt" || true)
             n_open=$(grep -vc ' completed$' "$RUNNER_TEMP/runs.txt" || true)
-            if [ "$n_ci" -gt 0 ] && [ "$n_security" -gt 0 ] && [ "$n_open" -eq 0 ]; then
+            if [ "$n_ci" -gt 0 ] && [ "$n_security" -gt 0 ] && [ "$n_docker" -gt 0 ] && [ "$n_open" -eq 0 ]; then
               break
             fi
             if [ "$(date +%s)" -ge "$deadline" ]; then
               echo "still_red=true" >> "$GITHUB_OUTPUT"
-              echo "::error::the re-kicked runs never completed on $SHA (ci: $n_ci, security: $n_security, still open: $n_open)"
+              echo "::error::the re-kicked runs never completed on $SHA (ci: $n_ci, security: $n_security, docker: $n_docker, still open: $n_open)"
               cat "$RUNNER_TEMP/runs.txt"
               exit 0
             fi

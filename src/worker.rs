@@ -37,8 +37,8 @@ use crate::app::{AppState, DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::hash::sha256_hex;
 use crate::lease::LeaseManager;
 use crate::markers::{
-    clear_intent, mark_commit, mark_dirty, mark_intent, parse_marker, Marker, COMMIT_SUFFIX,
-    INTENT_SUFFIX,
+    clear_intent, mark_commit, mark_dirty, mark_intent, parse_marker, Marker, PairIntentOnDrop,
+    COMMIT_SUFFIX, INTENT_SUFFIX,
 };
 use crate::names::infer_version_from_filename;
 use crate::render::{
@@ -2646,53 +2646,6 @@ pub(crate) struct RebuiltPackage {
     file_shas: FileShas,
 }
 
-/// The `Arc` for `storage` when it is one of this node's configured buckets.
-/// Rebuild cancellation (a health flap, a selection switch) drops the future
-/// between `mark_intent` and its pair; pairing from `Drop` needs an owned
-/// handle. Pointer identity is enough: every production caller passes
-/// `handle.storage.as_ref()` / `pinned.storage.as_ref()` of that Arc.
-fn owned_bucket_storage(state: &AppState, storage: &dyn Storage) -> Option<Arc<dyn Storage>> {
-    let want = storage as *const dyn Storage as *const ();
-    state.buckets.handles().iter().find_map(|handle| {
-        let got = handle.storage.as_ref() as *const dyn Storage as *const ();
-        (got == want).then(|| handle.storage.clone())
-    })
-}
-
-/// Pairs a rebuild intent if the future is dropped mid-rebuild. An unpaired
-/// intent otherwise defers the package for the whole grace window — dest-bucket
-/// drains have no audit backstop, so a health-flap cancel used to leave a live
-/// artifact with no index until that window elapsed.
-struct PairRebuildIntentOnDrop {
-    storage: Arc<dyn Storage>,
-    pkg: String,
-    nonce: String,
-    armed: bool,
-}
-
-impl Drop for PairRebuildIntentOnDrop {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.armed = false;
-        let storage = Arc::clone(&self.storage);
-        let pkg = std::mem::take(&mut self.pkg);
-        let nonce = std::mem::take(&mut self.nonce);
-        if let Ok(handle) = tokio::runtime::Handle::try_current() {
-            handle.spawn(async move {
-                if let Err(error) = mark_commit(storage.as_ref(), &pkg, &nonce).await {
-                    warn!(
-                        package = %pkg,
-                        error = ?error,
-                        "could not pair rebuild intent after cancellation"
-                    );
-                }
-            });
-        }
-    }
-}
-
 /// Rebuild only a package's index views from `storage`'s own truth, touching no
 /// node-local inventory. `rebuild_package_excluding` layers the selected
 /// bucket's inventory on top; the replicator (src/replicate.rs) calls this
@@ -2718,20 +2671,12 @@ pub(crate) async fn rebuild_package_indexes(
     // or `consumable_dirty_work` skips the package for the whole grace (900s
     // by default) and a warm copy's index never comes back.
     let nonce = mark_intent(storage, pkg).await?;
-    let mut cancel_guard =
-        owned_bucket_storage(state, storage).map(|owned| PairRebuildIntentOnDrop {
-            storage: owned,
-            pkg: pkg.to_string(),
-            nonce: nonce.clone(),
-            armed: true,
-        });
+    let mut cancel_guard = PairIntentOnDrop::arm(state, storage, pkg, &nonce);
     let result = rebuild_package_indexes_inner(state, storage, pkg, omit).await;
     match result {
         Ok(value) => {
             clear_intent(storage, pkg, &nonce).await?;
-            if let Some(guard) = cancel_guard.as_mut() {
-                guard.armed = false;
-            }
+            cancel_guard.disarm();
             Ok(value)
         }
         Err(error) => {
@@ -2739,9 +2684,7 @@ pub(crate) async fn rebuild_package_indexes(
             // views. Pair the intent so the ordinary worker retries it; never
             // erase the only crash-recovery event on an error path.
             let _ = mark_commit(storage, pkg, &nonce).await;
-            if let Some(guard) = cancel_guard.as_mut() {
-                guard.armed = false;
-            }
+            cancel_guard.disarm();
             Err(error)
         }
     }

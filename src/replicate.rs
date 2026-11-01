@@ -271,11 +271,16 @@ pub async fn execute(
         | Verdict::Tombstone
         | Verdict::SettleMirrorQuarantine => (true, true),
     };
+    // The pre-ack fan-out runs inside an upload request, so a disconnecting
+    // client can cancel this between an intent and its pair.
     let intent_a = if bracket_a {
         Some(markers::mark_intent(a, pkg).await?)
     } else {
         None
     };
+    let mut guard_a = intent_a
+        .as_deref()
+        .map(|nonce| markers::PairIntentOnDrop::arm(state, a, pkg, nonce));
     let intent_b = if bracket_b {
         match markers::mark_intent(b, pkg).await {
             Ok(nonce) => Some(nonce),
@@ -286,12 +291,18 @@ pub async fn execute(
                 if let Some(nonce) = &intent_a {
                     let _ = markers::mark_commit(a, pkg, nonce).await;
                 }
+                if let Some(guard) = guard_a.as_mut() {
+                    guard.disarm();
+                }
                 return Err(error);
             }
         }
     } else {
         None
     };
+    let mut guard_b = intent_b
+        .as_deref()
+        .map(|nonce| markers::PairIntentOnDrop::arm(state, b, pkg, nonce));
     let pick = |side: Side| -> (&dyn Storage, &dyn Storage, &Record) {
         match side {
             Side::A => (a, b, ra),
@@ -446,6 +457,9 @@ pub async fn execute(
     }
     if let Some(nonce) = intent_b {
         let _ = markers::mark_commit(b, pkg, &nonce).await;
+    }
+    for guard in [&mut guard_a, &mut guard_b].into_iter().flatten() {
+        guard.disarm();
     }
     result
 }
@@ -2233,6 +2247,7 @@ async fn freeze_copy_race(
     // a crash mid-freeze must not leave changed source truth with no rebuild
     // signal (the same reasoning as execute's bracketing).
     let src_intent = markers::mark_intent(src, pkg).await?;
+    let mut guard = markers::PairIntentOnDrop::arm(state, src, pkg, &src_intent);
     let result = async {
         freeze_side(src, pkg, filename).await?;
         freeze_side(dst, pkg, filename).await?;
@@ -2241,6 +2256,7 @@ async fn freeze_copy_race(
     }
     .await;
     let _ = markers::mark_commit(src, pkg, &src_intent).await;
+    guard.disarm();
     result?;
     state
         .metrics
@@ -2740,7 +2756,7 @@ async fn replicate_record(
     }
     if filename == PROJECT_STATUS_MARKER {
         if src_origin == Some(Origin::Private) || dst_origin == Some(Origin::Private) {
-            reconcile_project_status(src, dst, pkg).await?;
+            reconcile_project_status(state, src, dst, pkg).await?;
         }
         return Ok(Convergence::Converged);
     }
@@ -2773,6 +2789,7 @@ fn is_late_mirror(record: &Record, pkg_origin: Option<Origin>) -> bool {
 }
 
 async fn normalize_mirror_status_under_private_claim(
+    state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
 ) -> Result<bool> {
@@ -2792,6 +2809,7 @@ async fn normalize_mirror_status_under_private_claim(
     // Join the same base package-intent protocol as request writers. The exact
     // claim re-read below keeps a concurrent owner transition fail-closed.
     let nonce = markers::mark_intent(storage, pkg).await?;
+    let mut guard = markers::PairIntentOnDrop::arm(state, storage, pkg, &nonce);
     let result: Result<bool> = async {
         if read_origin_observation(storage, pkg).await?.as_ref() != Some(&claim) {
             return Ok(false);
@@ -2821,6 +2839,7 @@ async fn normalize_mirror_status_under_private_claim(
     }
     .await;
     let committed = markers::mark_commit(storage, pkg, &nonce).await;
+    guard.disarm();
     match (result, committed) {
         (Ok(changed), Ok(())) => Ok(changed),
         (Err(error), _) => Err(error),
@@ -2828,11 +2847,16 @@ async fn normalize_mirror_status_under_private_claim(
     }
 }
 
-async fn reconcile_project_status(a: &dyn Storage, b: &dyn Storage, pkg: &str) -> Result<()> {
+async fn reconcile_project_status(
+    state: &AppState,
+    a: &dyn Storage,
+    b: &dyn Storage,
+    pkg: &str,
+) -> Result<()> {
     // Normalization owns an intent/commit pair, so its commit is already the
     // dirty event. Emitting another marker would only force a duplicate rebuild.
-    normalize_mirror_status_under_private_claim(a, pkg).await?;
-    normalize_mirror_status_under_private_claim(b, pkg).await?;
+    normalize_mirror_status_under_private_claim(state, a, pkg).await?;
+    normalize_mirror_status_under_private_claim(state, b, pkg).await?;
     match status::reconcile_status_pair(a, b, pkg).await? {
         StatusConvergence::InSync => {}
         StatusConvergence::UpdatedLeft => {
@@ -3630,7 +3654,7 @@ async fn converge_package(
     }
 
     if a_origin == Some(Origin::Private) || b_origin == Some(Origin::Private) {
-        reconcile_project_status(a, b, pkg).await?;
+        reconcile_project_status(state, a, b, pkg).await?;
     }
 
     let mut converged = false;
@@ -5507,7 +5531,10 @@ mod tests {
             .await
             .unwrap();
 
-        reconcile_project_status(&a, &b, "pkg").await.unwrap();
+        let state = test_state(Arc::new(InMemStorage::default()));
+        reconcile_project_status(&state, &a, &b, "pkg")
+            .await
+            .unwrap();
         let normalized = status::read_status_versioned(&b, "pkg")
             .await
             .unwrap()

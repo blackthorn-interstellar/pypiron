@@ -1656,20 +1656,25 @@ async fn edit_sidecar(
     let sc_key = sidecar_key(&key);
     let storage = pinned.storage.as_ref();
 
-    let mut intent_nonce = if state.buckets.is_multi() {
-        Some(markers::mark_intent(storage, pkg).await.map_err(|e| {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                format!("failed to reserve {}: {e}", mutation.noun()),
-            )
-        })?)
+    let mut intent = if state.buckets.is_multi() {
+        Some(
+            markers::Intent::open(state, &pinned.storage, pkg)
+                .await
+                .map_err(|e| {
+                    (
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!("failed to reserve {}: {e}", mutation.noun()),
+                    )
+                })?,
+        )
     } else {
         None
     };
     let mut wrote = false;
     let mut record_origin = None;
     // A refusal must still close the intent it opened: an unpaired one defers
-    // the package's index rebuilds for the whole intent grace.
+    // the package's index rebuilds for the whole intent grace. (A cancelled
+    // request closes it on drop.)
     let edited = async {
         for _ in 0..8 {
             let Some((bytes, etag)) = storage.get_with_etag(&sc_key).await.map_err(|e| {
@@ -1766,8 +1771,8 @@ async fn edit_sidecar(
                 )
             })?;
             record_origin = sc.origin.clone();
-            if intent_nonce.is_none() {
-                intent_nonce = markers::mark_intent(storage, pkg).await.ok();
+            if intent.is_none() {
+                intent = Some(markers::Intent::open_best_effort(state, &pinned.storage, pkg).await);
             }
             let out = serde_json::to_vec(&sc).map_err(|e| internal("encode", e))?;
             match storage.put_if_match(&sc_key, &etag, out).await {
@@ -1793,14 +1798,14 @@ async fn edit_sidecar(
     match edited {
         Ok(true) => {}
         Ok(false) => {
-            if let Some(nonce) = intent_nonce {
-                let _ = markers::mark_commit(storage, pkg, &nonce).await;
+            if let Some(intent) = intent {
+                let _ = intent.commit().await;
             }
             return Ok(StatusCode::OK);
         }
         Err(refused) => {
-            if intent_nonce.is_some() {
-                if let Err(e) = markers::commit_marker(state, storage, pkg, intent_nonce).await {
+            if let Some(intent) = intent {
+                if let Err(e) = intent.commit().await {
                     warn!(error=?e, "metadata update: failed to close intent marker");
                 }
             }
@@ -1808,7 +1813,11 @@ async fn edit_sidecar(
         }
     }
 
-    if let Err(e) = markers::commit_marker(state, storage, pkg, intent_nonce).await {
+    let committed = match intent {
+        Some(intent) => intent.commit().await,
+        None => markers::commit_marker(state, storage, pkg, None).await,
+    };
+    if let Err(e) = committed {
         warn!(error=?e, "metadata update: failed to write commit marker");
     }
     // A yank rides truth, and all package truth replicates now: private always,

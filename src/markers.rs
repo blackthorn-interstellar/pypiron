@@ -237,6 +237,59 @@ impl Drop for Intent {
     }
 }
 
+/// Pairs an open intent in the background if the future holding it is dropped
+/// before the writer pairs (or clears) it itself. For writers that hold only a
+/// borrowed `&dyn Storage` — the rebuild and replication paths, which a health
+/// flap, a selection switch, or a disconnecting client can cancel mid-await.
+/// Inert when `storage` is not one of this node's buckets: with no owned handle
+/// to pair from, the intent heals after the grace, as it did before.
+pub(crate) struct PairIntentOnDrop(Option<(Arc<dyn Storage>, String, String)>);
+
+impl PairIntentOnDrop {
+    pub(crate) fn arm(state: &AppState, storage: &dyn Storage, pkg: &str, nonce: &str) -> Self {
+        Self(
+            owned_bucket_storage(state, storage)
+                .map(|owned| (owned, pkg.to_string(), nonce.to_string())),
+        )
+    }
+
+    /// The writer paired (or cleared) the intent itself.
+    pub(crate) fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for PairIntentOnDrop {
+    fn drop(&mut self) {
+        let Some((storage, pkg, nonce)) = self.0.take() else {
+            return;
+        };
+        let Ok(handle) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        handle.spawn(async move {
+            if let Err(error) = mark_commit(storage.as_ref(), &pkg, &nonce).await {
+                warn!(
+                    package = %pkg,
+                    error = ?error,
+                    "could not pair an intent after cancellation; it heals after the intent grace"
+                );
+            }
+        });
+    }
+}
+
+/// The `Arc` for `storage` when it is one of this node's configured buckets.
+/// Pointer identity is enough: every production caller passes
+/// `handle.storage.as_ref()` / `pinned.storage.as_ref()` of that Arc.
+fn owned_bucket_storage(state: &AppState, storage: &dyn Storage) -> Option<Arc<dyn Storage>> {
+    let want = storage as *const dyn Storage as *const ();
+    state.buckets.handles().iter().find_map(|handle| {
+        let got = handle.storage.as_ref() as *const dyn Storage as *const ();
+        (got == want).then(|| handle.storage.clone())
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

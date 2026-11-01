@@ -77,7 +77,7 @@ def test_endpoint_op_pins(tmp_path, pypiron_bin):
             if ep.mutates:
                 # The bytes-range hit is otherwise unsettled; a delayed
                 # rebuild would leak into the next endpoint's cold window.
-                eptab.settle_write(base, ep, rebuilds_before)
+                eptab.settle_write(base, ep, ctx, rebuilds_before)
             if ep.cold_ops is not None and cold != ep.cold_ops:
                 failures.append(f"{ep.name}: cold ops {cold} != pinned {ep.cold_ops}")
             if ep.warm_ops is not None:

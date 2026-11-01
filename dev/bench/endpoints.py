@@ -707,6 +707,7 @@ class Ctx:
     probe_prefix: str = "mb-probe"
     probe_filenames: dict = field(default_factory=dict)  # i -> uploaded wheel filename
     probe_hashes: dict = field(default_factory=dict)  # i -> uploaded wheel SHA-256
+    data_dir: Path | None = None  # the server's tree, for settle_write's marker wait
 
     def probe_pkg(self, i: int) -> str:
         return f"{self.probe_prefix}-{i}"
@@ -734,7 +735,7 @@ def assign_targets(data_dir: Path) -> Ctx:
                 break
         else:
             raise RuntimeError("not enough >=3-file packages to dedicate targets")
-    return Ctx(targets=targets, versions=versions)
+    return Ctx(targets=targets, versions=versions, data_dir=Path(data_dir))
 
 
 def build_request(ep: Endpoint, ctx: Ctx, i: int) -> tuple:
@@ -872,10 +873,32 @@ def wait_rebuild(base: str, rebuilds_before: int, timeout: float = 20.0) -> None
     raise TimeoutError("index rebuild never ran after mutation")
 
 
-def settle_write(base: str, ep: Endpoint, rebuilds_before: int) -> dict:
-    """Settle a mutation: wait for its rebuild (if any), then for ops silence."""
+def wait_markers_consumed(data_dir: Path, timeout: float = 20.0) -> None:
+    """Block until the worker has consumed every dirty marker.
+
+    Deleting the markers is the tick's last storage op, and the op counter
+    ticks before the call, so an empty `_dirty/` means the whole tail is
+    counted. Silence alone is not proof: on a loaded CI runner the worker
+    thread stalled past `ops_settled`'s quiet window mid-tail, and the
+    rebuild's final write and marker delete fell outside this endpoint's
+    delta (12 CI failures, every one a write endpoint short by its tail).
+    """
+    dirty = data_dir / "_dirty"
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not dirty.is_dir() or not any(dirty.iterdir()):
+            return
+        time.sleep(0.05)
+    raise TimeoutError(f"dirty markers never consumed: {sorted(p.name for p in dirty.iterdir())}")
+
+
+def settle_write(base: str, ep: Endpoint, ctx: Ctx, rebuilds_before: int) -> dict:
+    """Settle a mutation: wait for its rebuild (if any) and the markers it
+    consumes, then for ops silence."""
     if ep.target == "probe":
         wait_rebuild(base, rebuilds_before)
+    if ctx.data_dir is not None:
+        wait_markers_consumed(ctx.data_dir)
     return ops_settled(base)
 
 
@@ -888,5 +911,5 @@ def measure_ops(base: str, ep: Endpoint, ctx: Ctx, i: int) -> dict:
     before = ops_settled(base)
     rebuilds_before = index_rebuilds(base) if ep.mutates else 0
     hit(base, ep, ctx, i)
-    after = settle_write(base, ep, rebuilds_before) if ep.mutates else ops_snapshot(base)
+    after = settle_write(base, ep, ctx, rebuilds_before) if ep.mutates else ops_snapshot(base)
     return ops_delta(before, after)

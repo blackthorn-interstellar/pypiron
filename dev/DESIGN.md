@@ -503,7 +503,11 @@ gets one durable `_repl/` repair note in the selected bucket **before the ack**;
 notes are the failure path only, so a healthy fleet acks with every bucket
 holding the record and no note written. The note is not best-effort: it is the
 fleet's only record that a peer is owed the file, and nothing else re-derives one
-(`_dirty/` markers drive index rebuilds, not replication). A note write that
+(`_dirty/` markers drive index rebuilds, not replication) — which is also why
+a note the sweep cannot deliver for a non-availability reason is kept and alarmed
+(`pypiron_replication_marker_failures`, an error log naming it) rather than
+dead-lettered: moving it aside after N attempts would open the read-return and
+migrate gates over a record whose only copy may be the source. A note write that
 fails is retried once and then **refuses the ack** — 503, with a body saying the
 change is durable here but the gap could not be recorded — rather than returning
 200 over the one state the totality principle forbids. Deletes, yanks, and status
@@ -819,9 +823,12 @@ packages/<pkg>/<filename>.superseding    # a replication supersede is mid-flight
                                          #   re-hashes a stored body in the normal course and both buckets'
                                          #   sidecars stay identical, so `decide` would read the torn record
                                          #   as agreed forever. Written before the body, deleted once the
-                                         #   sidecar names it — so anything left is a crash, and the next
-                                         #   index rebuild finishes it from this marker alone. Never
-                                         #   suppresses the name; the record is live throughout.
+                                         #   sidecar names it. An index rebuild that finds one installs
+                                         #   its sidecar if the body already matches, but deletes it only
+                                         #   once that answer is final — body matches, or the marker is
+                                         #   older than the intent grace — because the supersede may still
+                                         #   be running and its next write would overtake a stale read.
+                                         #   Never suppresses the name; the record is live throughout.
 packages/<pkg>/.origin                   # nonce-bearing {origin, nonce} NEVER-DELETED claim
                                          #   (private|mirror|unclaimed); legacy plaintext still reads
 packages/<pkg>/.project-status.json      # PEP 792 {status, reason?}; multi-bucket events also carry
@@ -885,7 +892,13 @@ _repl/<dest-tag>/<pkg>/<file>!<nonce>    # multi-bucket repair note, FAILURE-PAT
                                          #   (counters::bucket_tag of its configured name), NOT its list
                                          #   position — so a topology reorder/removal can neither orphan
                                          #   the note nor point it at the wrong bucket. One bucket: never
-                                         #   written.
+                                         #   written. A note whose delivery fails for a non-availability
+                                         #   reason (damaged sidecar, malformed claim) is RETAINED — never
+                                         #   capped, aged out or moved aside, since it may be the only
+                                         #   record of the debt; it keeps region reads and migrate fenced,
+                                         #   logs at error and counts in
+                                         #   pypiron_replication_marker_failures until the record is
+                                         #   repaired or `buckets migrate --force` accepts it.
 _repl/<dest-tag>/_backfill!<nonce>       # backfill sentinel: an empty read-affinity fence a freshly-
                                          #   added bucket seeds on every peer at `buckets migrate`, so the
                                          #   new bucket serves no region reads until a clean reconcile
@@ -946,7 +959,7 @@ declared class fails CI. Six classes:
 
 | Prefix | Class | Replicates? |
 | --- | --- | --- |
-| `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile. Private truth and `sync --to` snapshots (sidecar `snapshot=true`) fan out pre-ack; proxy-cache fills (sidecar `snapshot` absent/false) replicate too but **asynchronously** — a post-serve `_repl/` note the sweep drains, healed by the reconcile diff — so any bucket serves the whole corpus, cached bytes included. No standing exceptions: a demotion loser *leaves* this tree rather than sitting in it unreplicated — its `.mirror-quarantined` fence replicates, its body moves to `_quarantine/`, and the canonical key ends empty everywhere. The one key under this prefix that is deliberately bucket-local is `<filename>.superseding`, and it is transient rather than an exception: it is not in the replicated record set, it is written and deleted inside one `supersede_record`, and a crash that strands one is cleared unconditionally by the next index rebuild's `finish_interrupted_supersedes` (or by `drop_record_objects`, if a tombstone or freeze lands over the filename first). So the tree converges because the marker always goes, not because it replicates — which is why a bucket-local key can live under a truth-replicated prefix without contradicting the class |
+| `packages/` | truth-replicated | yes, per record — three-tier fan-out → `_repl/` notes → reconcile. Private truth and `sync --to` snapshots (sidecar `snapshot=true`) fan out pre-ack; proxy-cache fills (sidecar `snapshot` absent/false) replicate too but **asynchronously** — a post-serve `_repl/` note the sweep drains, healed by the reconcile diff — so any bucket serves the whole corpus, cached bytes included. No standing exceptions: a demotion loser *leaves* this tree rather than sitting in it unreplicated — its `.mirror-quarantined` fence replicates, its body moves to `_quarantine/`, and the canonical key ends empty everywhere. The one key under this prefix that is deliberately bucket-local is `<filename>.superseding`, and it is transient rather than an exception: it is not in the replicated record set, it is written and deleted inside one `supersede_record`, and one left behind is cleared by the first index rebuild whose `finish_interrupted_supersedes` sees a final answer — the body already matches, or the marker is older than the intent grace, so its writer is finished or dead (or by `drop_record_objects`, if a tombstone or freeze lands over the filename first). Deletion uses a re-listing to skip a marker another supersede rewrote meanwhile; with no conditional delete in storage, a rewrite landing in the one round trip between that re-listing and the delete is the residual. So the tree converges because the marker always goes, not because it replicates — which is why a bucket-local key can live under a truth-replicated prefix without contradicting the class |
 | `_advisories/osv-pypi.zip`, `_advisories/quarantined.json`, `_transparency/chain/` | singleton-replicated | yes — control records written write-through to every healthy bucket + reseed-if-absent; the chain is written through so a failover continues the seq rather than restarting genesis, and `verify-chain` walks every bucket. `quarantined.json` is the one member that is a **derived view**, not authored state: truth is the per-package `.project-status.json` sidecars, and the audit sweep rebuilds the whole set from them, so deleting the key costs one sweep. It is replicated rather than re-derived per bucket because re-deriving costs a walk of the whole corpus, and a node booting onto a bucket that lacks it would come up under-blocked. Nor is it leader-only: every status write publishes its own one-name increment, so a freeze does not wait on a sweep — see below |
 | `_counters/day/` | replicated-rollup | yes — leader-authored, immutable day-rollups, each naming the bucket whose segments it summed (`<shard>@<bucket>.json`), reseeded copy-if-absent until every bucket holds the union, so a failover keeps the /audit ranking and /stats history. The reseed is a union mesh, not a push from the write pin: each bucket authors its own variants, so a peer's rollup has to reach the pin too or a read there would report a short day |
 | `_counters/seg/`, `_quarantine/` | declared-loss | no — two bounded, annotated losses. `_counters/seg/`: the current day's un-rolled-up live tallies, at most one day. `_quarantine/`: the losing byte-sets of freezes and demotions resolved on that bucket — never a byte the fleet serves, never the winner, and always announced by a fence (`.frozen` + tombstone, or `.mirror-quarantined`) that *does* replicate. Calling the quarantine tree "derived" was the comfortable lie: a preserved loser is not recomputable from anything |

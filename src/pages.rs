@@ -276,7 +276,13 @@ async fn render_project(
     let listed = if state.buckets.is_multi() {
         worker::list_artifacts_readonly(storage.as_ref(), &state.sidecar_cache, &pkg).await
     } else {
-        worker::list_artifacts(storage.as_ref(), &state.sidecar_cache, &pkg).await
+        worker::list_artifacts(
+            storage.as_ref(),
+            &state.sidecar_cache,
+            &pkg,
+            state.intent_grace,
+        )
+        .await
     };
     let mut files = match listed {
         Ok((files, _raw)) => files,

@@ -35,9 +35,10 @@ pub const MIRROR_QUARANTINED_SUFFIX: &str = ".mirror-quarantined";
 /// re-hashes a stored body in the normal course, both buckets' sidecars stay
 /// byte-identical, and the merge reads them as agreed forever — so without this
 /// marker the tear is permanent and silent. It is written before the body and
-/// deleted once the sidecar names it; anything left behind is a crash, and
-/// `replicate::finish_interrupted_supersedes` re-hashes that one body to finish
-/// or discard the operation.
+/// deleted once the sidecar names it. An index rebuild that finds one runs
+/// `replicate::finish_interrupted_supersedes`, which re-hashes that one body to
+/// finish the operation, and deletes the marker only once its writer can no
+/// longer move the body — the supersede may still be running.
 pub const SUPERSEDING_SUFFIX: &str = ".superseding";
 
 /// PEP 592 yank state: `false`, `true`, or a reason string.

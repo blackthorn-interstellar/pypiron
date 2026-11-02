@@ -46,7 +46,7 @@ use crate::origin::{
 use crate::sidecar::{
     frozen_key, metadata_key, mirror_quarantined_key, provenance_key, sidecar_key, superseding_key,
     tombstone_key, Sidecar, FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX, SIDECAR_SUFFIX,
-    TOMBSTONE_SUFFIX,
+    SUPERSEDING_SUFFIX, TOMBSTONE_SUFFIX,
 };
 use crate::status::{self, StatusConvergence};
 use crate::storage::{
@@ -2377,13 +2377,52 @@ pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Re
     Ok(quarantined)
 }
 
-/// Finish a [`supersede_record`] that died between writing a body and
-/// publishing the sidecar that names it. `filenames` is the set the caller's
-/// package listing already flagged with a `.superseding` marker — the rare set,
-/// so a fleet that never crashed mid-supersede does no work here at all. That
-/// gating is the whole design: the repair itself has to re-hash a body, which
-/// is affordable for a handful of flagged records and is not affordable as a
-/// blanket sweep over a 770k-package mirror.
+/// What an index rebuild may do about one record carrying a `.superseding`
+/// marker. The decision is pure so a table test pins it; the I/O around it is
+/// [`finish_interrupted_supersedes`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MarkedRecord {
+    /// Publish the marker's sidecar: the body already holds the bytes it names.
+    pub install: bool,
+    /// Delete the marker: no writer can still move the body under it.
+    pub retire: bool,
+}
+
+/// Classify a marked record from one body observation.
+///
+/// `body_sha` is `None` when there is nothing to compare: the body is absent,
+/// or a tombstone/freeze already adjudicated the filename and it was not read.
+/// `marker_age` is the marker's storage age as of *before* that body read, and
+/// `None` when storage reported no usable timestamp.
+///
+/// Installing is safe whenever the body matches: it is the completion the
+/// writer itself would publish, and a CAS that agrees with it. Retiring is not —
+/// a body read while the owning supersede is still running can be overtaken by
+/// its very next write, and a marker deleted on that stale answer leaves the
+/// tear the marker exists to catch. So the marker goes only once the answer is
+/// final: the body already holds the intended bytes (the writer has nothing
+/// left that moves it), or the marker is older than the intent grace, past
+/// which the whole intent protocol presumes its writer finished or dead.
+pub(crate) fn classify_marked_record(
+    body_sha: Option<&str>,
+    intended_sha: &str,
+    marker_age: Option<time::Duration>,
+    intent_grace: time::Duration,
+) -> MarkedRecord {
+    let install = body_sha == Some(intended_sha);
+    let settled = marker_age.is_some_and(|age| age >= intent_grace);
+    MarkedRecord {
+        install,
+        retire: install || settled,
+    }
+}
+
+/// Finish a [`supersede_record`] that left a body ahead of the sidecar naming
+/// it. `markers` are the `.superseding` entries the caller's package listing
+/// already holds — the rare set, so a fleet that never crashed mid-supersede
+/// does no work here at all. That gating is the whole design: the repair itself
+/// has to re-hash a body, which is affordable for a handful of flagged records
+/// and is not affordable as a blanket sweep over a 770k-package mirror.
 ///
 /// Called from the index rebuild rather than the periodic audit, and the
 /// simulator's repair classifier is what settles that: the executor already
@@ -2391,23 +2430,36 @@ pub async fn quarantine_mirror_artifacts(storage: &dyn Storage, pkg: &str) -> Re
 /// package is guaranteed a rebuild, and healing anywhere later means the views
 /// stay pointed at the stale digest until the audit happens to come round.
 ///
-/// One shot per marker, whatever it finds. The marker's only job is to say "the
-/// body under this key may be ahead of its sidecar"; once this has read the
-/// body, that question is answered for good and re-asking it on every audit
-/// would turn an O(1) listing check into an O(bytes) one.
+/// A marker may also belong to a supersede that is still running — the audit
+/// and replicator rebuilds do not wait out live intents, and another node's
+/// rebuild can land mid-supersede — so [`classify_marked_record`] keeps it until
+/// the answer is final, and the next rebuild re-asks. A kept marker over a
+/// still-old body is harmless: the record describes itself correctly, and the
+/// writer's own `_dirty/` intent guarantees the rebuild that sees its outcome.
+///
+/// Retiring is a re-listing then a delete, and only a marker whose listed
+/// version did not change since the caller's listing goes: another supersede of
+/// the same file that rewrote the marker meanwhile owns it now. Storage has no
+/// conditional delete, so a rewrite landing between that re-listing and the
+/// delete still loses its marker — a window of one round trip.
 ///
 /// Returns the number of records whose sidecar this call published — the
 /// caller's signal to rebuild the package's views over the repaired truth.
 pub async fn finish_interrupted_supersedes(
     storage: &dyn Storage,
     pkg: &str,
-    filenames: &[String],
+    markers: &[&crate::storage::FileEntry],
+    intent_grace: time::Duration,
 ) -> Result<usize> {
+    let now = crate::clock::now_utc();
     let mut finished = 0;
-    for filename in filenames {
-        let akey = artifact_key(pkg, filename);
-        let marker = superseding_key(&akey);
-        let intended: Sidecar = match storage.get_bytes(&marker).await {
+    let mut answered: Vec<(&str, &str)> = Vec::new();
+    for entry in markers {
+        let marker = entry.key.as_str();
+        let Some(akey) = marker.strip_suffix(SUPERSEDING_SUFFIX) else {
+            continue;
+        };
+        let intended: Sidecar = match storage.get_bytes(marker).await {
             Ok(bytes) => serde_json::from_slice(&bytes)
                 .with_context(|| format!("parse supersede intent at {marker}"))?,
             // Another node finished it between the listing and now.
@@ -2420,30 +2472,57 @@ pub async fn finish_interrupted_supersedes(
         // it; this covers the interleaving where the intent outlived it. Checked
         // before the body read, which is the expensive part.
         let (tombstoned, frozen) = futures::future::try_join(
-            storage.head_exists(&tombstone_key(&akey)),
-            storage.head_exists(&frozen_key(&akey)),
+            storage.head_exists(&tombstone_key(akey)),
+            storage.head_exists(&frozen_key(akey)),
         )
         .await?;
-        if !tombstoned && !frozen {
-            let body = match storage.get_bytes(&akey).await {
-                Ok(body) => Some(body),
+        let body_sha = if tombstoned || frozen {
+            None
+        } else {
+            match storage.get_bytes(akey).await {
+                Ok(body) => Some(sha256_hex(&body)),
                 Err(e) if is_not_found(&e) => None,
                 Err(e) => return Err(e),
-            };
-            // The body is what the interrupted supersede meant to install, so
-            // the sidecar naming it is the completion — and only that. A body
-            // still holding the *old* bytes means the crash landed before the
-            // replacement and the record already describes itself correctly; a
-            // body that is neither was written by something this intent knows
-            // nothing about. Both are left exactly as found: this finishes a
-            // torn write, it never adjudicates one.
-            if body.is_some_and(|body| sha256_hex(&body) == intended.sha256)
-                && install_or_verify_sidecar(storage, &sidecar_key(&akey), &intended).await?
-            {
-                finished += 1;
             }
+        };
+        let age = entry.last_modified.as_deref().and_then(|raw| {
+            time::OffsetDateTime::parse(raw, &time::format_description::well_known::Rfc3339)
+                .ok()
+                .map(|written| now - written)
+        });
+        // A body still holding the *old* bytes, or bytes this intent knows
+        // nothing about, is left exactly as found: this finishes a torn write,
+        // it never adjudicates one.
+        let verdict =
+            classify_marked_record(body_sha.as_deref(), &intended.sha256, age, intent_grace);
+        if verdict.install
+            && install_or_verify_sidecar(storage, &sidecar_key(akey), &intended).await?
+        {
+            finished += 1;
         }
-        storage.delete_keys(&[marker]).await?;
+        // A backend that lists no version can never prove the marker unchanged,
+        // so its marker stays: a re-hash on each rebuild, never a lost fence.
+        if let (true, Some(etag)) = (verdict.retire, entry.etag.as_deref()) {
+            answered.push((marker, etag));
+        }
+    }
+    if answered.is_empty() {
+        return Ok(finished);
+    }
+    let relisted = storage
+        .list_dir_entries(&format!("{PACKAGES_PREFIX}{pkg}/"))
+        .await?;
+    let current: HashMap<&str, &str> = relisted
+        .iter()
+        .filter_map(|entry| Some((entry.key.as_str(), entry.etag.as_deref()?)))
+        .collect();
+    let unchanged: Vec<String> = answered
+        .into_iter()
+        .filter(|(marker, etag)| current.get(marker) == Some(etag))
+        .map(|(marker, _)| marker.to_string())
+        .collect();
+    if !unchanged.is_empty() {
+        storage.delete_keys(&unchanged).await?;
     }
     Ok(finished)
 }
@@ -2918,8 +2997,18 @@ pub async fn sweep_all_markers(state: &AppState) -> Result<()> {
     while let Some((idx, result)) = sweeps.next().await {
         match result {
             Ok(backlog) => {
-                for (dest, count) in backlog {
-                    *total.entry(dest).or_default() += count;
+                // Failures are published per source, from complete sweeps only:
+                // a source this sweep has not finished — or whose listing died
+                // part-way — keeps its last answer rather than reading as fixed.
+                let handles = state.buckets.handles();
+                for (dest, handle) in handles.iter().enumerate() {
+                    let failing = backlog.get(&dest).map_or(0, |b| b.failing);
+                    state
+                        .metrics
+                        .set_marker_failures(&handles[idx].name, &handle.name, failing);
+                }
+                for (dest, b) in backlog {
+                    *total.entry(dest).or_default() += b.pending;
                 }
             }
             Err(e) => failures.push(format!("source bucket {idx}: {e:#}")),
@@ -2935,7 +3024,7 @@ pub async fn sweep_all_markers(state: &AppState) -> Result<()> {
     }
 }
 
-/// Whether a bucket holds any undrained `_repl/` *repair note* — a real fan-out
+/// The first undrained `_repl/` *repair note* a bucket holds, if any — a real fan-out
 /// marker (`_repl/<dest>/<pkg>/<file>!<nonce>`) that may be a record's sole copy.
 /// Backfill sentinels (`_repl/<dest>/_backfill!<nonce>`) share the prefix but are
 /// empty gate markers, not repair notes: they fence a freshly-added bucket's
@@ -2943,19 +3032,23 @@ pub async fn sweep_all_markers(state: &AppState) -> Result<()> {
 /// otherwise seeding one on `buckets migrate` would wedge every later migrate
 /// until a server ran a reconcile. `buckets migrate` uses this to refuse
 /// shrinking/reordering while a genuine repair note is still stranded. Bounded:
-/// pages `_repl/` and returns on the first key that [`parse_repl_marker`] accepts;
-/// the sentinel count is O(buckets²), so at most a page or two are skipped.
-pub async fn has_undrained_repl_notes(storage: &dyn Storage) -> Result<bool> {
+/// pages `_repl/` and returns the first key that [`parse_repl_marker`] accepts,
+/// so a refusal can name it; the sentinel count is O(buckets²), so at most a
+/// page or two are skipped.
+pub async fn first_undrained_repl_note(storage: &dyn Storage) -> Result<Option<String>> {
     let mut after: Option<String> = None;
     loop {
         let page = storage
             .list_page(REPL_PREFIX, after.as_deref(), REPL_SWEEP_PAGE)
             .await?;
-        if page.iter().any(|obj| parse_repl_marker(&obj.key).is_some()) {
-            return Ok(true);
+        if let Some(note) = page
+            .iter()
+            .find(|obj| parse_repl_marker(&obj.key).is_some())
+        {
+            return Ok(Some(note.key.clone()));
         }
         if page.len() < REPL_SWEEP_PAGE {
-            return Ok(false);
+            return Ok(None);
         }
         after = page.last().map(|obj| obj.key.clone());
     }
@@ -2981,7 +3074,7 @@ pub async fn bucket_is_corpus_empty(storage: &dyn Storage) -> Result<bool> {
 /// means the destination is missing an acked file, so reads stay on the write
 /// bucket until it drains. Keying on the tag (not the list position) means the
 /// fence follows its bucket across any topology reorder or removal. Same bounded
-/// single-key LIST as [`has_undrained_repl_notes`].
+/// single-key LIST as [`first_undrained_repl_note`].
 pub async fn has_undrained_repl_notes_for(storage: &dyn Storage, dest_tag: &str) -> Result<bool> {
     let prefix = format!("{REPL_PREFIX}{dest_tag}/");
     Ok(!storage.list_page(&prefix, None, 1).await?.is_empty())
@@ -3024,7 +3117,7 @@ pub async fn region_owed_no_notes(handles: &[crate::buckets::BucketHandle], regi
 /// `_repl/<dest>/`. It names no package, so [`parse_repl_marker`] returns `None`
 /// and the marker sweep never tries to "deliver" it — only a clean full reconcile
 /// pass clears it. It rides the very `_repl/<dest>/` prefix that
-/// [`has_undrained_repl_notes_for`] (read affinity) and [`has_undrained_repl_notes`]
+/// [`has_undrained_repl_notes_for`] (read affinity) and [`first_undrained_repl_note`]
 /// (`buckets migrate`) already check, so a new region bucket serves no region
 /// reads until the corpus has converged onto it — no per-file read-through.
 const BACKFILL_SENTINEL: &str = "_backfill!";
@@ -3243,12 +3336,72 @@ async fn wait_until_pair_ineligible(state: &AppState, src: usize, dst: usize) {
     }
 }
 
-/// Drain one bucket's `_repl/` tree, returning the number of markers that
-/// remained undelivered per destination index.
-async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<HashMap<usize, u64>> {
+/// What one sweep did with one `_repl/` note.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NoteOutcome {
+    /// Delivered and deleted.
+    Consumed,
+    /// Retained for a reason that heals by itself: a bucket out of reach, or a
+    /// merge waiting on the destination's own rebuild.
+    Pending,
+    /// Retained because delivery failed for any other reason — a damaged
+    /// sidecar, a malformed claim, a refused write. Those fail identically
+    /// every sweep until someone repairs the record.
+    Failing,
+}
+
+/// Notes a sweep left behind for one destination; `failing` is a subset of
+/// `pending`.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct Backlog {
+    pending: u64,
+    failing: u64,
+}
+
+/// Classify why a note stays. Pure, so the split between "waits" and "needs a
+/// human" is pinned by a table test. An availability failure (timeout,
+/// connection, 5xx) clears when the bucket returns, by the same rule bucket
+/// health uses to fail over; nothing else does.
+fn classify_note_failure(error: &anyhow::Error) -> NoteOutcome {
+    if crate::bucket_health::classify(crate::observed_storage::signal_for_error(error))
+        == crate::bucket_health::SignalClass::AvailabilityFailure
+    {
+        NoteOutcome::Pending
+    } else {
+        NoteOutcome::Failing
+    }
+}
+
+/// Log a retained note at the level its cause deserves and say which it is.
+/// The note itself always stays: it may be the fleet's only record of the debt,
+/// so it is never dropped, capped or moved aside — a failing one keeps region
+/// reads and `buckets migrate` fenced until the record is repaired.
+fn retain_note(dest: &str, marker: &ReplMarker, what: &str, error: &anyhow::Error) -> NoteOutcome {
+    let outcome = classify_note_failure(error);
+    if outcome == NoteOutcome::Failing {
+        error!(
+            dest = %dest,
+            package = %marker.pkg,
+            filename = %marker.filename,
+            note = %marker.key,
+            error = ?error,
+            "{what}; replication note cannot be delivered until the record is repaired — reads stay off the destination and `buckets migrate` refuses meanwhile"
+        );
+    } else {
+        warn!(dest = %dest, package = %marker.pkg, filename = %marker.filename, error = ?error, "{what}; marker retained");
+    }
+    outcome
+}
+
+/// Drain one bucket's `_repl/` tree, returning what remained undelivered per
+/// destination index.
+async fn sweep_bucket_markers(
+    state: &AppState,
+    src_index: usize,
+) -> Result<HashMap<usize, Backlog>> {
     let handles = state.buckets.handles();
     let src = handles[src_index].storage.clone();
-    let mut remaining: HashMap<usize, u64> = HashMap::new();
+    let mut remaining: HashMap<usize, Backlog> = HashMap::new();
     let mut after: Option<String> = None;
     // Page the `_repl/` tree so an arbitrarily large failure backlog is never
     // materialized in one Vec (v1 review finding). Each bounded page is fully
@@ -3291,7 +3444,8 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
                 let src = src.clone();
                 async move {
                     if !bucket_eligible(state, dest_index) {
-                        return (dest_index, markers.len() as u64);
+                        let pending = markers.len() as u64;
+                        return (dest_index, Backlog { pending, failing: 0 });
                     }
                     let dst = &handles[dest_index];
                     let results = futures::stream::iter(markers)
@@ -3307,9 +3461,14 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
                                         &marker.filename,
                                         ArtifactSource::Bucket,
                                     ) => result,
+                                    // Not a failure: the pair left the eligible
+                                    // set, and the note waits for it to return.
                                     _ = wait_until_pair_ineligible(state, src_index, dest_index) => {
-                                        Err(anyhow!("source or destination became topology-ineligible"))
+                                        return NoteOutcome::Pending;
                                     }
+                                };
+                                let retain = |what: &str, error: anyhow::Error| {
+                                    retain_note(&dst.name, &marker, what, &error)
                                 };
                                 match result {
                                     // The merge declined: the destination holds
@@ -3323,9 +3482,9 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
                                             markers::mark_dirty(dst.storage.as_ref(), &marker.pkg)
                                                 .await
                                         {
-                                            warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication deferred and the destination rebuild signal failed; marker retained");
+                                            return retain("replication deferred and the destination rebuild signal failed", e);
                                         }
-                                        true
+                                        NoteOutcome::Pending
                                     }
                                     Ok(Convergence::Converged) => {
                                         // The note's existence proves a fan-out went wrong
@@ -3340,33 +3499,35 @@ async fn sweep_bucket_markers(state: &AppState, src_index: usize) -> Result<Hash
                                             markers::mark_dirty(dst.storage.as_ref(), &marker.pkg)
                                                 .await
                                         {
-                                            warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication succeeded but destination rebuild signal failed; marker retained");
-                                            return true;
+                                            return retain("replication succeeded but destination rebuild signal failed", e);
                                         }
-                                        if let Err(e) = src.delete_keys(&[marker.key]).await {
-                                            warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication succeeded but marker could not be consumed");
-                                            return true;
+                                        if let Err(e) = src.delete_keys(std::slice::from_ref(&marker.key)).await {
+                                            return retain("replication succeeded but marker could not be consumed", e);
                                         }
-                                        false
+                                        NoteOutcome::Consumed
                                     }
-                                    Err(e) => {
-                                        warn!(dest=%dst.name, package=%marker.pkg, filename=%marker.filename, error=?e, "replication marker retry failed; retained");
-                                        true
-                                    }
+                                    Err(e) => retain("replication marker retry failed", e),
                                 }
                             }
                         })
                         .buffer_unordered(16)
                         .collect::<Vec<_>>()
                         .await;
-                    (dest_index, results.into_iter().filter(|pending| *pending).count() as u64)
+                    let mut backlog = Backlog::default();
+                    for outcome in results {
+                        backlog.pending += u64::from(outcome != NoteOutcome::Consumed);
+                        backlog.failing += u64::from(outcome == NoteOutcome::Failing);
+                    }
+                    (dest_index, backlog)
                 }
             })
             .buffer_unordered(handles.len().max(1))
             .collect::<Vec<_>>()
             .await;
-        for (dest, count) in outcomes {
-            *remaining.entry(dest).or_default() += count;
+        for (dest, backlog) in outcomes {
+            let total = remaining.entry(dest).or_default();
+            total.pending += backlog.pending;
+            total.failing += backlog.failing;
         }
         if page_len < REPL_SWEEP_PAGE {
             break;
@@ -5024,9 +5185,14 @@ mod tests {
             format!(r#"{{"filename":"{filename}"}}"#).into_bytes()
         );
         assert_eq!(storage.list_all(QUARANTINE_PREFIX).await.unwrap().len(), 1);
-        let (rendered, _) = worker::list_artifacts(&storage, &Default::default(), "pkg")
-            .await
-            .unwrap();
+        let (rendered, _) = worker::list_artifacts(
+            &storage,
+            &Default::default(),
+            "pkg",
+            time::Duration::seconds(900),
+        )
+        .await
+        .unwrap();
         assert!(rendered.is_empty());
         // Idempotent: a second pass has nothing left to settle.
         assert_eq!(
@@ -5297,6 +5463,147 @@ mod tests {
         assert!(
             !storage.head_exists(&superseding_key(&key)).await.unwrap(),
             "an answered intent fence must not survive to be re-answered"
+        );
+    }
+
+    #[test]
+    fn a_marker_retires_only_once_its_answer_is_final() {
+        let grace = time::Duration::seconds(900);
+        let young = Some(time::Duration::seconds(1));
+        let old = Some(grace);
+        let keep = MarkedRecord {
+            install: false,
+            retire: false,
+        };
+        let heal = MarkedRecord {
+            install: true,
+            retire: true,
+        };
+        let drop = MarkedRecord {
+            install: false,
+            retire: true,
+        };
+        // (body sha, marker age) -> verdict, for a marker intending "new".
+        let cases = [
+            // The body already holds the intended bytes: finished, at any age.
+            (Some("new"), young, heal),
+            (Some("new"), old, heal),
+            (Some("new"), None, heal),
+            // Old, foreign, absent or adjudicated body under a writer that may
+            // still be running: its next write can overtake this answer.
+            (Some("old"), young, keep),
+            (None, young, keep),
+            // No trustworthy age is a young one.
+            (Some("old"), None, keep),
+            // Past grace the writer is finished or dead: answered for good.
+            (Some("old"), old, drop),
+            (None, old, drop),
+        ];
+        for (body, age, want) in cases {
+            assert_eq!(
+                classify_marked_record(body, "new", age, grace),
+                want,
+                "body {body:?} at age {age:?}"
+            );
+        }
+    }
+
+    /// The marker exists for exactly the window a live supersede is in: body
+    /// replaced, sidecar not yet published. A rebuild that lands *before* the
+    /// body write (the audit's and replicator's rebuilds do not wait out live
+    /// intents; another node's can land any time) reads the old body. Deleting
+    /// the marker on that answer means the writer's next write — and a crash
+    /// right after it — leaves a tear nothing can find.
+    #[tokio::test]
+    async fn a_rebuild_keeps_the_fence_of_a_supersede_still_in_flight() {
+        let standing = b"the bytes being replaced";
+        let winner = b"the private bytes that won";
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let storage = Arc::new(InMemStorage::default());
+        seed_live(storage.as_ref(), "pkg", filename, standing, PRIVATE);
+        storage.insert(
+            &superseding_key(&key),
+            serde_json::to_vec(&sc(&sha256_hex(winner), PRIVATE, Yanked::Flag(false), 0)).unwrap(),
+        );
+        let mut state = test_state(storage.clone());
+        // InMem stamps every object 2026-01-01: a vast grace makes it young.
+        state.intent_grace = time::Duration::weeks(10_000);
+
+        worker::rebuild_package(&state, storage.as_ref(), "pkg")
+            .await
+            .unwrap();
+        assert!(
+            storage.head_exists(&superseding_key(&key)).await.unwrap(),
+            "a rebuild deleted the fence of a supersede that may still be running"
+        );
+        let published: Sidecar =
+            serde_json::from_slice(&storage.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
+        assert_eq!(published.sha256, sha256_hex(standing));
+
+        // The writer goes on: replaces the body, then dies before its sidecar.
+        storage.insert(&key, winner.to_vec());
+        worker::rebuild_package(&state, storage.as_ref(), "pkg")
+            .await
+            .unwrap();
+
+        let published: Sidecar =
+            serde_json::from_slice(&storage.get_bytes(&sidecar_key(&key)).await.unwrap()).unwrap();
+        assert_eq!(
+            published.sha256,
+            sha256_hex(winner),
+            "the torn record outlived the rebuild that should have finished it"
+        );
+        assert!(
+            !storage.head_exists(&superseding_key(&key)).await.unwrap(),
+            "a finished record kept its fence"
+        );
+        let index =
+            String::from_utf8(storage.get_bytes("simple/pkg/index.json").await.unwrap()).unwrap();
+        assert!(index.contains(&sha256_hex(winner)), "{index}");
+    }
+
+    /// The ABA shape: a rebuild reads an abandoned marker, and while it hashes
+    /// the body a fresh supersede of the same file rewrites the marker as its
+    /// own fence. The rebuild's answer was about the old marker; deleting the
+    /// key would strip the new writer's fence.
+    #[tokio::test]
+    async fn a_rebuild_keeps_a_fence_another_supersede_rewrote_meanwhile() {
+        let standing = b"the bytes this bucket holds";
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let fresh = serde_json::to_vec(&sc(
+            &sha256_hex(b"the next supersede's bytes"),
+            PRIVATE,
+            Yanked::Flag(false),
+            0,
+        ))
+        .unwrap();
+        let storage = Arc::new(
+            RacingWriterStorage::new(superseding_key(&key), fresh.clone()).racing_a_read(),
+        );
+        seed_live(&storage.inner, "pkg", filename, standing, PRIVATE);
+        storage.inner.insert(
+            &superseding_key(&key),
+            serde_json::to_vec(&sc(
+                &sha256_hex(b"bytes an abandoned supersede never wrote"),
+                PRIVATE,
+                Yanked::Flag(false),
+                0,
+            ))
+            .unwrap(),
+        );
+        // Default grace: the abandoned marker is long past it.
+        let state = test_state(storage.clone());
+
+        worker::rebuild_package(&state, storage.as_ref(), "pkg")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.get_bytes(&superseding_key(&key)).await.unwrap(),
+            fresh,
+            "the rebuild deleted a fence a newer supersede wrote after it looked"
         );
     }
 
@@ -5912,11 +6219,97 @@ mod tests {
             .await
             .unwrap();
 
+        state.metrics.set_multi_bucket();
         sweep_all_markers(&state).await.unwrap();
         assert!(
             !b.list_all(REPL_PREFIX).await.unwrap().is_empty(),
             "a note the merge deferred must survive the sweep that could not deliver it",
         );
+        assert_eq!(
+            failing_notes(&state, "a"),
+            Some(0),
+            "a deferral heals by itself and must not page anyone"
+        );
+        // And it still asks for the destination rebuild that unblocks it.
+        assert!(!a
+            .list_all(crate::app::DIRTY_PREFIX)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn only_an_outage_makes_a_retained_note_wait_quietly() {
+        use std::io::{Error as IoError, ErrorKind};
+        let waits = [
+            anyhow::Error::new(IoError::from(ErrorKind::TimedOut)),
+            anyhow::Error::new(IoError::from(ErrorKind::ConnectionRefused))
+                .context("copy pkg/pkg-1.whl"),
+        ];
+        for error in waits {
+            assert_eq!(
+                classify_note_failure(&error),
+                NoteOutcome::Pending,
+                "{error:#}"
+            );
+        }
+        let damaged = serde_json::from_slice::<Sidecar>(b"not-json")
+            .map_err(anyhow::Error::from)
+            .context("parse sidecar for packages/pkg/pkg-1.whl")
+            .unwrap_err();
+        let fails = [
+            damaged,
+            anyhow!(
+                "sidecar at packages/pkg/pkg-1.whl.sidecar.json holds an unexpected origin 'bogus'"
+            ),
+            anyhow::Error::new(IoError::from(ErrorKind::PermissionDenied)),
+        ];
+        for error in fails {
+            assert_eq!(
+                classify_note_failure(&error),
+                NoteOutcome::Failing,
+                "{error:#}"
+            );
+        }
+    }
+
+    fn failing_notes(state: &AppState, dest: &str) -> Option<u64> {
+        let line = format!("pypiron_replication_marker_failures{{dest=\"{dest}\"}} ");
+        state
+            .metrics
+            .render()
+            .lines()
+            .find_map(|l| l.strip_prefix(&line)?.parse().ok())
+    }
+
+    /// A note whose record is damaged fails the same way every sweep. It must
+    /// stay — it may be the only record of the debt — but it must also stop
+    /// looking like a note merely waiting for an outage to end, and it must
+    /// drain on its own once the record is repaired.
+    #[tokio::test]
+    async fn a_note_a_damaged_record_blocks_is_failing_until_the_record_is_repaired() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        seed_live(a.as_ref(), "pkg", filename, b"bytes", PRIVATE);
+        seed_live(b.as_ref(), "pkg", filename, b"bytes", PRIVATE);
+        b.insert(&sidecar_key(&key), b"not-json".to_vec());
+        let state = two_bucket_state(a.clone(), b.clone());
+        state.metrics.set_multi_bucket();
+        write_marker(a.as_ref(), "b", "pkg", filename)
+            .await
+            .unwrap();
+
+        sweep_all_markers(&state).await.unwrap();
+        assert_eq!(a.list_all(REPL_PREFIX).await.unwrap().len(), 1);
+        assert_eq!(failing_notes(&state, "b"), Some(1));
+
+        let intact = a.get_bytes(&sidecar_key(&key)).await.unwrap();
+        b.insert(&sidecar_key(&key), intact);
+        sweep_all_markers(&state).await.unwrap();
+        assert!(a.list_all(REPL_PREFIX).await.unwrap().is_empty());
+        assert_eq!(failing_notes(&state, "b"), Some(0));
     }
 
     #[tokio::test]

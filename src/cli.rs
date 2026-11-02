@@ -135,7 +135,9 @@ pub struct BucketsMigrateArgs {
     /// **permanent data loss**. Without it, migrate refuses to remove a bucket
     /// that is the fleet's only copy of some content (back the corpus up onto a
     /// surviving bucket first, e.g. by adding the survivor and letting
-    /// replication converge, then remove the old one).
+    /// replication converge, then remove the old one). Also proceeds past
+    /// pending `_repl/` repairs: a surviving bucket's are still retried, a
+    /// removed bucket's are abandoned.
     #[arg(long, env = "PYPIRON_MIGRATE_FORCE")]
     pub(crate) force: bool,
 }
@@ -506,15 +508,24 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
     // record not yet replicated, and shrinking/reordering could remove the
     // bucket it points at. Let the sweep drain first. Surviving buckets that are
     // unreachable are skipped — migrate itself tolerates them, and we cannot
-    // inspect them.
+    // inspect them. A note the sweep can never deliver (a damaged record) would
+    // wedge this forever, so the refusal names it and `--force` proceeds: on a
+    // surviving bucket the note stays and keeps being retried.
     if buckets.is_multi() {
         for handle in buckets.handles() {
-            match replicate::has_undrained_repl_notes(handle.storage.as_ref()).await {
-                Ok(false) => {}
-                Ok(true) => bail!(
-                    "bucket '{}' has undrained _repl/ repair notes; a stranded note may be a \
-                     record's only copy. Let the running server's sweep drain them (or wait for \
-                     the periodic sweep), then retry `pypiron buckets migrate`.",
+            match replicate::first_undrained_repl_note(handle.storage.as_ref()).await {
+                Ok(None) => {}
+                Ok(Some(note)) if args.force => eprintln!(
+                    "migrate: --force: bucket '{}' still holds repair note '{note}'; it stays \
+                     and the server keeps retrying it",
+                    handle.name
+                ),
+                Ok(Some(note)) => bail!(
+                    "bucket '{}' holds undrained repair note '{note}' (maybe among others); a \
+                     pending repair may be a record's only copy. A running server delivers it \
+                     on its next sweep. If it cannot (pypiron_replication_marker_failures is \
+                     above 0 and the server log names this note), repair that file's record and \
+                     the sweep finishes it — or pass --force to change the list anyway.",
                     handle.name
                 ),
                 Err(error) if is_availability(&error) => {
@@ -570,13 +581,20 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
                         .build_one_by_identity(removed)
                         .await
                         .with_context(|| format!("connect to removed bucket '{removed}'"))?;
-                    match replicate::has_undrained_repl_notes(storage.as_ref()).await {
-                        Ok(false) => {}
-                        Ok(true) => bail!(
-                            "bucket '{removed}' is being removed but still holds undrained _repl/ \
-                         repair notes; a stranded note there may be a record's only copy. Let the \
-                         running server's sweep drain them (or wait for the periodic sweep), then \
-                         retry `pypiron buckets migrate`."
+                    match replicate::first_undrained_repl_note(storage.as_ref()).await {
+                        Ok(None) => {}
+                        Ok(Some(note)) if args.force => eprintln!(
+                            "migrate: --force: dropping bucket '{removed}' abandons its pending \
+                             repair note '{note}' (maybe among others); a record that existed \
+                             only there is lost"
+                        ),
+                        Ok(Some(note)) => bail!(
+                            "bucket '{removed}' is being removed but still holds undrained repair \
+                             note '{note}' (maybe among others); a pending repair there may be a \
+                             record's only copy. Let the running server's sweep deliver it, then \
+                             retry. If it cannot (pypiron_replication_marker_failures is above 0 \
+                             and the server log names this note), repair that file's record, or \
+                             pass --force to accept the loss."
                         ),
                         Err(error) if is_availability(&error) => bail!(
                         "bucket '{removed}' is being removed but is unreachable, so its _repl/ \

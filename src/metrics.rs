@@ -182,6 +182,10 @@ pub struct Metrics {
     /// Undelivered `_repl/` markers, by destination bucket, as measured by the
     /// last sweep (gauge). Low cardinality — one series per configured bucket.
     marker_backlog: Mutex<HashMap<String, u64>>,
+    /// `_repl/` notes whose last delivery failed for a non-availability reason,
+    /// keyed `(source, destination)` and replaced only by that source's next
+    /// complete sweep; rendered summed per destination (gauge).
+    marker_failures: Mutex<HashMap<(String, String), u64>>,
     /// Latest P4 health/selection view. `None` until a multi-bucket worker
     /// publishes its first snapshot; never populated by a single-bucket node.
     bucket_health: Mutex<Option<BucketMetricState>>,
@@ -304,6 +308,15 @@ impl Metrics {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(dest.to_string(), count);
+    }
+
+    /// Publish the failing-note count one source's complete sweep found for
+    /// one destination.
+    pub fn set_marker_failures(&self, source: &str, dest: &str, count: u64) {
+        self.marker_failures
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert((source.to_string(), dest.to_string()), count);
     }
 
     /// Publish one worker health snapshot and accumulate its per-bucket alarm
@@ -655,6 +668,26 @@ impl Metrics {
                 ));
             }
             drop(backlog);
+            let mut failures: std::collections::BTreeMap<&str, u64> =
+                std::collections::BTreeMap::new();
+            let by_source = self
+                .marker_failures
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            for ((_, dest), count) in by_source.iter() {
+                *failures.entry(dest.as_str()).or_default() += count;
+            }
+            out.push_str(
+                "# HELP pypiron_replication_marker_failures _repl/ notes whose last delivery failed for a reason other than an unreachable bucket (operator action required), by destination.\n",
+            );
+            out.push_str("# TYPE pypiron_replication_marker_failures gauge\n");
+            for (dest, count) in failures {
+                out.push_str(&format!(
+                    "pypiron_replication_marker_failures{{dest=\"{}\"}} {count}\n",
+                    prometheus_label(dest)
+                ));
+            }
+            drop(by_source);
             self.render_bucket_health(&mut out);
         }
         let map = self
@@ -1046,6 +1079,30 @@ mod tests {
         assert!(!text.contains("pypiron_bucket_health_alarms_total"));
         assert!(!text.contains("pypiron_bucket_topology_write_fenced"));
         assert!(!text.contains("pypiron_replication_objects_total"));
+    }
+
+    #[test]
+    fn marker_failures_sum_each_sources_last_complete_sweep() {
+        let m = Metrics::new();
+        m.set_multi_bucket();
+        m.set_marker_failures("a", "c", 2);
+        m.set_marker_failures("b", "c", 1);
+        m.set_marker_failures("a", "b", 0);
+        let text = m.render();
+        assert!(text.contains("# TYPE pypiron_replication_marker_failures gauge"));
+        assert!(
+            text.contains("pypiron_replication_marker_failures{dest=\"c\"} 3\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("pypiron_replication_marker_failures{dest=\"b\"} 0\n"),
+            "{text}"
+        );
+        // A later sweep of one source replaces only that source's answer.
+        m.set_marker_failures("a", "c", 0);
+        assert!(m
+            .render()
+            .contains("pypiron_replication_marker_failures{dest=\"c\"} 1\n"));
     }
 
     #[test]

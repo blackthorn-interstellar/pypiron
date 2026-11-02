@@ -66,6 +66,7 @@ pytestmark = [pytest.mark.integration, pytest.mark.s3]
 _SELECTED_RE = re.compile(r'^pypiron_bucket_selected\{bucket="([^"]+)",index="\d+"\} ([01])$')
 _HEALTH_RE = re.compile(r'^pypiron_bucket_health_state\{bucket="([^"]+)",index="\d+"\} (-?1|0)$')
 _BACKLOG_RE = re.compile(r'^pypiron_replication_marker_backlog\{dest="([^"]+)"\} (\d+)$')
+_FAILURES_RE = re.compile(r'^pypiron_replication_marker_failures\{dest="([^"]+)"\} (\d+)$')
 
 
 def _eventually(predicate, *, timeout: float = 30.0, interval: float = 0.3, what: str = ""):
@@ -128,6 +129,14 @@ def _marker_backlog(server, bucket: str) -> int:
         if match and _bare(match.group(1)) == bucket:
             return int(match.group(2))
     raise AssertionError(f"missing marker backlog metric for {bucket}")
+
+
+def _marker_failures(server, bucket: str) -> int:
+    for line in _metrics(server):
+        match = _FAILURES_RE.match(line)
+        if match and _bare(match.group(1)) == bucket:
+            return int(match.group(2))
+    raise AssertionError(f"missing marker failures metric for {bucket}")
 
 
 def _counter_value(server, name: str) -> int:
@@ -1038,6 +1047,8 @@ def test_repl_marker_accumulates_then_drains_when_destination_returns(
         lambda: _marker_backlog(server, b) > 0,
         what="reachable-source backlog is visible while B is unavailable",
     )
+    # Waiting out an outage is not a failure: nothing here needs a human.
+    assert _marker_failures(server, b) == 0
 
     # Bring the destination back; the per-tick sweep drains the backlog.
     minio_make_bucket(minio, b)
@@ -1063,6 +1074,33 @@ def test_repl_marker_accumulates_then_drains_when_destination_returns(
         lambda: _marker_backlog(server, b) == 0,
         what="backlog metric clears after delivery",
     )
+
+
+def test_undeliverable_repair_note_is_alarmed_until_the_record_is_repaired(
+    minio_two, s3_server_multi, tmp_path
+):
+    """A repair note whose destination record is damaged fails every sweep. It
+    stays (it may be the only record of the debt), but it is counted as failing
+    rather than merely waiting, and it drains once the record is repaired."""
+    server = s3_server_multi
+    minio = minio_two
+    a, b = minio["buckets"]
+    pkg = "poisonnote"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _upload(server, wheel)
+    akey = f"packages/{pkg}/{wheel.name}"
+    _eventually(lambda: minio_key_exists_in(minio, b, f"{akey}.meta.json"), what="fan-out")
+
+    minio_put_key_in(minio, b, f"{akey}.meta.json", "not-json")
+    note = f"_repl/{s3_repl_tag(b)}/{pkg}/{wheel.name}!poison"
+    minio_put_key_in(minio, a, note, "")
+    _eventually(lambda: _marker_failures(server, b) == 1, what="the stuck note is counted")
+    assert minio_key_exists_in(minio, a, note), "an undeliverable note must never be dropped"
+
+    # The documented repair: copy the intact record file from the other bucket.
+    minio_put_key_in(minio, b, f"{akey}.meta.json", minio_get_key_in(minio, a, f"{akey}.meta.json"))
+    _eventually(lambda: not minio_key_exists_in(minio, a, note), what="the note drains")
+    _eventually(lambda: _marker_failures(server, b) == 0, what="the alarm clears")
 
 
 def test_delete_propagates_tombstone_and_drops_from_both_indexes(
@@ -2059,6 +2097,41 @@ def test_migrate_refuses_to_drop_a_bucket_holding_unique_content_unless_forced(
         [str(pypiron_bin), "buckets", "migrate", "--force"], env=shrink_env, timeout=60
     )
     assert rc == 0, f"--force did not override the content gate:\n{out}\n{err}"
+    for bucket in (a, b):
+        stamp = json.loads(minio_get_key_in(minio, bucket, "_topology/stamp.json"))
+        assert stamp["buckets"] == [f"s3://{a}", f"s3://{b}"]
+
+
+def test_migrate_names_a_pending_repair_and_force_proceeds(minio_three, pypiron_bin):
+    """A repair note the sweep can never deliver would wedge `buckets migrate`
+    forever. The refusal names the note, and `--force` proceeds: a survivor's
+    note stays to be retried, a removed bucket's is knowingly abandoned."""
+    minio = minio_three
+    a, b, c = minio["buckets"]
+    env = _s3_env(minio, "127.0.0.1:0")
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b, c)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"initial migration failed:\n{out}\n{err}"
+
+    kept = f"_repl/{s3_repl_tag(b)}/stuckpkg/stuckpkg-1.0-py3-none-any.whl!poison"
+    dropped = f"_repl/{s3_repl_tag(a)}/gonepkg/gonepkg-1.0-py3-none-any.whl!poison"
+    minio_put_key_in(minio, a, kept, "")
+    minio_put_key_in(minio, c, dropped, "")
+
+    shrink_env = _s3_env(minio, "127.0.0.1:0")
+    shrink_env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "buckets", "migrate"], env=shrink_env, timeout=60
+    )
+    assert rc != 0, f"migrate ignored a pending repair:\n{out}\n{err}"
+    assert kept in (out + err) and "--force" in (out + err), f"must name the note:\n{out}\n{err}"
+
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "buckets", "migrate", "--force"], env=shrink_env, timeout=60
+    )
+    assert rc == 0, f"--force did not override the note gates:\n{out}\n{err}"
+    assert kept in err and dropped in err, f"--force must say what it overrode:\n{err}"
+    assert minio_key_exists_in(minio, a, kept), "a survivor's note must outlive the migrate"
     for bucket in (a, b):
         stamp = json.loads(minio_get_key_in(minio, bucket, "_topology/stamp.json"))
         assert stamp["buckets"] == [f"s3://{a}", f"s3://{b}"]

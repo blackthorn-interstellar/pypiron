@@ -109,7 +109,10 @@ backend account settings still come from the config.
 A new empty bucket stays out of regional reads until its backfill completes.
 Migration refuses to remove a bucket that is unreachable, has pending repairs,
 or contains the only copy of a file or of a deletion. Add its replacement, let backfill finish,
-then remove the old bucket. `--force` accepts loss of unique content.
+then remove the old bucket. It also refuses any change while a pending repair
+remains, and names that repair. `--force` accepts loss of unique content and
+proceeds past pending repairs: one on a bucket you keep is still retried, one on
+a bucket you remove is abandoned.
 
 To evacuate temporarily to one surviving bucket, stop the fleet and restart it
 with that single bucket. Returning to a multi-bucket list requires the migration
@@ -119,6 +122,21 @@ sequence above.
 
 Restoring only one bucket from an older snapshot can bring back files or names
 deleted later. Restore every bucket to the same point in time.
+
+### A repair that keeps failing
+
+When a copy to another bucket fails, pypiron records a pending repair and retries
+it until it lands. An unreachable bucket only delays it. A damaged file record
+makes it fail every time:
+
+- `pypiron_replication_marker_failures` stays above `0` for that bucket.
+- The server log has an error naming the file, the pending repair, and the cause.
+- Reads stay on the write bucket instead of returning to that region's bucket.
+- `buckets migrate` refuses and names the pending repair.
+
+Replace the damaged file record (the `<filename>.meta.json` object the log names)
+with the intact copy from another bucket. The next sweep finishes the repair, the
+gauge returns to `0`, and reads return to the region.
 
 ## Upload collisions
 

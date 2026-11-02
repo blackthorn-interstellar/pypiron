@@ -477,7 +477,7 @@ bucket. `--force` can discard content permanently.
 
 | Flag | Env | Default | Use |
 | --- | --- | --- | --- |
-| `--force` | `PYPIRON_MIGRATE_FORCE` | `false` | On `buckets migrate`, drop a bucket even when it holds the fleet's only copy of some content. **Permanent data loss** — back the corpus up onto a surviving bucket first. |
+| `--force` | `PYPIRON_MIGRATE_FORCE` | `false` | On `buckets migrate`, drop a bucket even when it holds the fleet's only copy of some content, and proceed past pending repairs. **Permanent data loss** — back the corpus up onto a surviving bucket first. |
 | `--deep` | `PYPIRON_VERIFY_DEEP` | `false` | On `verify-index`, re-hash every stored file against the SHA-256 its record publishes. Reads the whole corpus once. |
 | `--strict` | `PYPIRON_VERIFY_CHAIN_STRICT` | `false` | On `verify-chain`, treat any `fingerprint-changed` result as a failure. |
 
@@ -494,7 +494,8 @@ These series appear only when you configure two or more buckets:
 | `pypiron_replication_objects_total` | Artifact records copied into another bucket. |
 | `pypiron_replication_bytes_total` | Artifact bytes copied into other buckets; companion metadata is not included. |
 | `pypiron_replication_freezes_total` | Same-name, different-byte upload collisions where the loser was quarantined (or both quarantined when the arrival order was too close to call). Needs a human. Any increase needs attention. |
-| `pypiron_replication_marker_backlog{dest}` | Pending cross-bucket repairs (fan-out failures awaiting drain) found on reachable source buckets. During a source outage this is a lower bound. |
+| `pypiron_replication_marker_backlog{dest}` | Pending cross-bucket repairs (fan-out failures awaiting drain) found on reachable source buckets, including failing ones. During a source outage this is a lower bound. |
+| `pypiron_replication_marker_failures{dest}` | Pending repairs whose last attempt failed for a reason other than an unreachable bucket, such as a damaged file record. These do not clear on their own. Alert when this stays above `0` for two sweeps; see [A repair that keeps failing](../guides/multi-region.md#a-repair-that-keeps-failing). |
 | `pypiron_reconcile_diff_duration_seconds` | Wall time of the last pairwise full comparison. |
 | `pypiron_bucket_health_state{bucket,index}` | Per-node view: healthy `1`, unknown `0`, unhealthy `-1`. |
 | `pypiron_bucket_selected{bucket,index}` | Per-node selected bucket for writes: selected `1`, all others `0`. |

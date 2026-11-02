@@ -1561,7 +1561,7 @@ async fn current_package_shas(
     // sidecar and commits it as ordinary churn. An uncommitted file never
     // triggers a verify-chain violation, so the omission is safe — and this
     // keeps genesis read-only, doing no writes of its own.
-    let (files, _raw) = list_artifacts_for_claim(storage, sidecars, pkg, false).await?;
+    let (files, _raw) = list_artifacts_for_claim(storage, sidecars, pkg, None).await?;
     Ok(files.into_iter().map(|f| (f.filename, f.sha256)).collect())
 }
 
@@ -2704,7 +2704,8 @@ async fn rebuild_package_indexes_inner(
         .index_rebuilds
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let (mut files, mut raw) =
-        list_artifacts_for_claim(storage, &state.sidecar_cache, pkg, true).await?;
+        list_artifacts_for_claim(storage, &state.sidecar_cache, pkg, Some(state.intent_grace))
+            .await?;
     if let Some(omit) = omit {
         files.retain(|f| f.filename != omit);
         raw.retain(|(filename, _)| filename != omit);
@@ -3901,12 +3902,15 @@ async fn global_html_proved_current(
 /// inventory counts off this, not the metadata `Vec`, because a corrupt-sidecar
 /// file is dropped from the index (`load_file_metadata` returns `None`) yet
 /// still occupies storage, and the audit counts it off the listing.
+/// `intent_grace` is the age past which a `.superseding` marker's writer is
+/// presumed finished (see [`crate::replicate::finish_interrupted_supersedes`]).
 pub async fn list_artifacts(
     storage: &dyn Storage,
     sidecars: &SidecarCache,
     pkg: &str,
+    intent_grace: time::Duration,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
-    list_artifacts_for_claim(storage, sidecars, pkg, true).await
+    list_artifacts_for_claim(storage, sidecars, pkg, Some(intent_grace)).await
 }
 
 /// Request-path project rendering in multi-bucket mode never mutates truth. The
@@ -3917,15 +3921,19 @@ pub async fn list_artifacts_readonly(
     sidecars: &SidecarCache,
     pkg: &str,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
-    list_artifacts_for_claim(storage, sidecars, pkg, false).await
+    list_artifacts_for_claim(storage, sidecars, pkg, None).await
 }
 
+/// `authoring` is `Some(intent_grace)` for a truth-authoring rebuild, which may
+/// backfill missing sidecars and finish interrupted supersedes, and `None` for a
+/// read-only listing that must never mutate.
 async fn list_artifacts_for_claim(
     storage: &dyn Storage,
     sidecars: &SidecarCache,
     pkg: &str,
-    backfill_missing: bool,
+    authoring: Option<time::Duration>,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
+    let backfill_missing = authoring.is_some();
     let pkg_origin = match crate::origin::read_origin_claim(storage, pkg).await? {
         Some(crate::origin::OriginState::Private) => Some(crate::origin::PRIVATE),
         Some(crate::origin::OriginState::Mirror) => Some(crate::origin::MIRROR),
@@ -3933,34 +3941,34 @@ async fn list_artifacts_for_claim(
     };
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let mut entries = storage.list_dir_entries(&prefix).await?;
-    // A `.superseding` marker is a replication supersede that wrote a body and
-    // died before publishing the sidecar naming it, so this bucket is serving
-    // bytes its own index contradicts — and nothing else here would ever notice,
-    // because every other reader compares sidecars and none re-hashes a body.
-    // Finish it before deriving anything, or this rebuild renders the stale
-    // digest and calls the package converged.
+    // A `.superseding` marker is a replication supersede that may have written
+    // a body without yet publishing the sidecar naming it — one that died, or
+    // one still running on this or another node. If the body is ahead, this
+    // bucket is serving bytes its own index contradicts, and nothing else here
+    // would ever notice, because every other reader compares sidecars and none
+    // re-hashes a body. Finish it before deriving anything, or this rebuild
+    // renders the stale digest and calls the package converged.
     //
-    // Detected from the listing already in hand, so a package with no torn
-    // record pays one `strip_suffix` per name; the repair's O(bytes) re-hash and
-    // its single re-listing are reached only by the rare package that has one.
-    // Gated on `backfill_missing` for the same reason the sidecar backfill is:
-    // that flag is what separates the truth-authoring rebuild from the
-    // request-path render, which must never mutate.
-    if backfill_missing {
-        let mut torn: Vec<String> = entries
+    // Detected from the listing already in hand, so a package with no marker
+    // pays one `strip_suffix` per name; the repair's O(bytes) re-hash and its
+    // re-listings are reached only by the rare package that has one. Gated on
+    // `authoring` for the same reason the sidecar backfill is: it is what
+    // separates the truth-authoring rebuild from the request-path render, which
+    // must never mutate.
+    if let Some(intent_grace) = authoring {
+        let marked: Vec<&FileEntry> = entries
             .iter()
-            .filter_map(|entry| {
+            .filter(|entry| {
                 entry
                     .key
-                    .strip_prefix(&prefix)?
-                    .strip_suffix(SUPERSEDING_SUFFIX)
+                    .strip_prefix(&prefix)
+                    .and_then(|name| name.strip_suffix(SUPERSEDING_SUFFIX))
+                    .is_some_and(is_artifact)
             })
-            .filter(|filename| is_artifact(filename))
-            .map(str::to_string)
             .collect();
-        if !torn.is_empty() {
-            torn.sort();
-            crate::replicate::finish_interrupted_supersedes(storage, pkg, &torn).await?;
+        if !marked.is_empty() {
+            crate::replicate::finish_interrupted_supersedes(storage, pkg, &marked, intent_grace)
+                .await?;
             entries = storage.list_dir_entries(&prefix).await?;
         }
     }

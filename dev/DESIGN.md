@@ -1033,7 +1033,11 @@ absent), bounded retries, error when they run out. Three sources of edit:
   in-memory set first, so it refuses the bytes on the request that follows;
 - the worker's **re-derive**: draining a package's dirty marker, the selected
   bucket's tick reads that package's durable status and publishes the same
-  one-name increment from it (a GET and nothing more when it already matches).
+  one-name increment from it (a GET and nothing more when it already matches;
+  nothing at all for a package with no stored bytes). Before it *writes*, it
+  reads the status again, after reading the set: a newer status write then
+  either moves the set under this CAS or publishes after it, so a status read
+  the worker took before an operator's freeze can never undo it.
   Every status writer leaves its marker *after* its own publish, whatever that
   publish returned, so this is both the retry for an increment that failed or
   crashed mid-write and what orders two racing increments: a stale relay whose

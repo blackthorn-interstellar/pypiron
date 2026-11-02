@@ -2721,7 +2721,9 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
 /// the last word when two writers' increments landed out of order — on the
 /// marker drain, not a day later on the audit sweep. Only the selected-bucket
 /// tick does this: it is the bucket the fleet serves, the one the sweep derives
-/// the whole set from too.
+/// the whole set from too. A package with no stored bytes at all is skipped —
+/// there is nothing for the gate to refuse, and the rebuild that lands its next
+/// bytes re-derives it — so deleting a project's last file costs no extra reads.
 async fn republish_quarantine(
     state: &AppState,
     storage: &dyn Storage,
@@ -2729,6 +2731,9 @@ async fn republish_quarantine(
     pkg: &str,
     rebuilt: &RebuiltPackage,
 ) -> Result<()> {
+    if rebuilt.raw_artifacts.is_empty() {
+        return Ok(());
+    }
     let blocked = match rebuilt.quarantined {
         Some(blocked) => blocked,
         None => crate::status::read_status(storage, pkg)
@@ -2736,8 +2741,15 @@ async fn republish_quarantine(
             .status
             .blocks_downloads(),
     };
+    // Never a local arm from this read: it may predate a status write this node
+    // just armed. The publish re-reads the status before it writes anything, and
+    // this node adopts whatever set it confirms or writes.
+    let edit = crate::advisories::QuarantinedEdit::Derive {
+        name: pkg.to_string(),
+        blocked,
+    };
     let replicas = state.singleton_replicas(index);
-    crate::advisories::arm_quarantine(storage, &replicas, &state.advisories, pkg, blocked).await
+    crate::advisories::publish_quarantined(storage, &replicas, &state.advisories, &edit).await
 }
 
 /// Regenerate one package's indexes from a storage listing.
@@ -2814,7 +2826,8 @@ pub(crate) struct RebuiltPackage {
     /// it removed them. The audit reads them back before trusting a listing.
     views: Vec<(String, Vec<u8>)>,
     /// Whether the status the views were rendered from blocks downloads. `None`
-    /// when the package had nothing to render, so no status was read.
+    /// when the package had nothing to render (all delisted, or no bytes at all),
+    /// so no status was read.
     quarantined: Option<bool>,
 }
 
@@ -5082,13 +5095,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tick_drops_a_stale_blocked_entry_even_for_an_emptied_package() {
-        // A dequarantine whose publish never landed (or a relay's stale freeze
-        // that landed after it): the status says active, the set still blocks.
-        // The package has no artifacts left, so no view renders a status — the
-        // tick must still read it.
+    async fn tick_drops_a_stale_blocked_entry() {
+        // A release whose publish never landed (or a relay's stale freeze that
+        // landed after it): the status says active, the set still blocks.
         let storage = Arc::new(InMemStorage::default());
         let pkg = "released";
+        seed_private_artifact(storage.as_ref(), pkg, "released-1.0.whl");
         let state = Arc::new(AppState::headless(storage.clone()));
         let freeze = crate::advisories::QuarantinedEdit::One {
             name: pkg.into(),
@@ -5103,6 +5115,29 @@ mod tests {
 
         assert!(stored_set(storage.as_ref()).await.is_empty());
         assert!(!crate::advisories::AdvisoryState::read(&state.advisories).is_quarantined(pkg));
+    }
+
+    #[tokio::test]
+    async fn tick_reads_the_status_of_a_fully_delisted_package_it_still_stores() {
+        // Every file denylisted: no view renders a status, but the bytes are
+        // still fetchable by direct URL, so the gate must still follow it.
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "delisted";
+        seed_private_artifact(storage.as_ref(), pkg, "delisted-1.0.whl");
+        crate::status::write_status(storage.as_ref(), pkg, &frozen())
+            .await
+            .unwrap();
+        storage.insert(&format!("{DIRTY_PREFIX}{pkg}!n.commit"), Vec::new());
+        let mut state = AppState::headless(storage.clone());
+        let whole_name = [(pkg.to_string(), vec!["*".to_string()])].into();
+        state.denylist = Some(Arc::new(
+            crate::denylist::Denylist::from_canonical(&whole_name).unwrap(),
+        ));
+        let state = Arc::new(state);
+
+        tick(&state, &state.pin()).await.unwrap();
+
+        assert_eq!(stored_set(storage.as_ref()).await, [pkg]);
     }
 
     #[tokio::test]

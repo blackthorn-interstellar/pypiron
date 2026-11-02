@@ -312,8 +312,11 @@ ENDPOINTS: list = [
         target="probe",
         # +1 read: the rebuild hashes the new wheel's `.metadata` for the index.
         # +1 read: the post-create `.frozen` HEAD beside the tombstone's.
-        cold_ops={"read": 13, "write": 11, "list": 2, "delete": 1},
-        warm_ops={"read": 13, "write": 11, "list": 2, "delete": 1},
+        # +1 read: the worker re-derives the package's quarantined-set membership
+        # when it drains the marker (one get_with_etag of the set; no write when
+        # it already matches) — the retry for a status write whose publish failed.
+        cold_ops={"read": 14, "write": 11, "list": 2, "delete": 1},
+        warm_ops={"read": 14, "write": 11, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -341,8 +344,9 @@ ENDPOINTS: list = [
         target="probe",
         # +12 reads: the record (five fence/body HEADs and the claim) is
         # checked before the sidecar CAS and again after it.
-        cold_ops={"read": 18, "write": 5, "list": 2, "delete": 1},
-        warm_ops={"read": 18, "write": 5, "list": 2, "delete": 1},
+        # +1 read: the marker drain's quarantined-set re-derive (see upload-legacy).
+        cold_ops={"read": 19, "write": 5, "list": 2, "delete": 1},
+        warm_ops={"read": 19, "write": 5, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -356,8 +360,9 @@ ENDPOINTS: list = [
         target="probe",
         # +12 reads: the record (five fence/body HEADs and the claim) is
         # checked before the sidecar CAS and again after it.
-        cold_ops={"read": 18, "write": 5, "list": 2, "delete": 1},
-        warm_ops={"read": 18, "write": 5, "list": 2, "delete": 1},
+        # +1 read: the marker drain's quarantined-set re-derive (see upload-legacy).
+        cold_ops={"read": 19, "write": 5, "list": 2, "delete": 1},
+        warm_ops={"read": 19, "write": 5, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -371,8 +376,9 @@ ENDPOINTS: list = [
         target="probe",
         # Sidecar CAS/indexing like yank, record checks included. The HTML
         # Simple index contains no dates, so only the JSON index is rewritten.
-        cold_ops={"read": 18, "write": 4, "list": 2, "delete": 1},
-        warm_ops={"read": 18, "write": 4, "list": 2, "delete": 1},
+        # +1 read: the marker drain's quarantined-set re-derive (see upload-legacy).
+        cold_ops={"read": 19, "write": 4, "list": 2, "delete": 1},
+        warm_ops={"read": 19, "write": 4, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -396,8 +402,10 @@ ENDPOINTS: list = [
         # deliberately adopts no etag, because the listing it could read back may
         # already be a peer's newer body — pinning to that would make this node's
         # poll no-op past a freeze it never saw. The next poll re-reads instead.
-        cold_ops={"read": 5, "write": 6, "list": 2, "delete": 1},
-        warm_ops={"read": 5, "write": 6, "list": 2, "delete": 1},
+        # +1 read: the worker's re-derive when it drains this write's marker
+        # confirms the set (a GET, no write) — the retry had the publish failed.
+        cold_ops={"read": 6, "write": 6, "list": 2, "delete": 1},
+        warm_ops={"read": 6, "write": 6, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -413,9 +421,9 @@ ENDPOINTS: list = [
         # other direction: clearing writes an active status, which un-blocks the
         # name that endpoint quarantined at this same iteration index. A real
         # change again, so the same read/write pair and, for the same reason, no
-        # etag-adopting LIST.
-        cold_ops={"read": 5, "write": 5, "list": 2, "delete": 2},
-        warm_ops={"read": 5, "write": 5, "list": 2, "delete": 2},
+        # etag-adopting LIST. +1 read for the worker's confirming re-derive.
+        cold_ops={"read": 6, "write": 5, "list": 2, "delete": 2},
+        warm_ops={"read": 6, "write": 5, "list": 2, "delete": 2},
         bytes_range=(0, 100),
     ),
     _e(

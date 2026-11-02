@@ -1328,6 +1328,15 @@ pub enum QuarantinedEdit {
     /// set is stored. It never touches another name, so two nodes freezing two
     /// different projects at the same moment both land.
     One { name: String, blocked: bool },
+    /// The worker's re-derive of one name from its durable status, after draining
+    /// the package's dirty marker. `blocked` is what the status said when the
+    /// caller read it, which may predate a newer status write — so it is only
+    /// trusted to confirm the stored set. Before a WRITE the status is read again,
+    /// after the set was read: any status write later than that read publishes
+    /// after this CAS read too, so either this CAS loses and re-derives, or the
+    /// newer writer's publish lands last. A stale read can never be written over a
+    /// newer writer's publish.
+    Derive { name: String, blocked: bool },
     /// A complete audit sweep's set, republished as repair. `base_set`/`base_epoch`
     /// are the stored body as the walk BEGAN. When the epoch has not moved the
     /// sweep's set is written as-is. When it has — one status write anywhere in
@@ -1398,7 +1407,7 @@ pub async fn publish_quarantined(
                         stored_is_real = false;
                         (StoredQuarantined::default(), Some(etag.as_str()))
                     }
-                    QuarantinedEdit::One { .. } => return Err(e),
+                    QuarantinedEdit::One { .. } | QuarantinedEdit::Derive { .. } => return Err(e),
                 },
             },
             None => {
@@ -1407,16 +1416,27 @@ pub async fn publish_quarantined(
             }
         };
         let have: std::collections::BTreeSet<String> = stored.quarantined.iter().cloned().collect();
-        let next = match edit {
-            QuarantinedEdit::One { name, blocked } => {
-                let mut next = have.clone();
-                if *blocked {
-                    next.insert(name.clone());
-                } else {
-                    next.remove(name);
-                }
-                next
+        let with = |name: &String, blocked: bool| {
+            let mut next = have.clone();
+            if blocked {
+                next.insert(name.clone());
+            } else {
+                next.remove(name);
             }
+            next
+        };
+        let next = match edit {
+            QuarantinedEdit::One { name, blocked } => with(name, *blocked),
+            QuarantinedEdit::Derive { name, blocked } => match with(name, *blocked) {
+                confirmed if confirmed == have => confirmed,
+                _ => with(
+                    name,
+                    crate::status::read_status(storage, name)
+                        .await?
+                        .status
+                        .blocks_downloads(),
+                ),
+            },
             QuarantinedEdit::Sweep {
                 set,
                 base_set,
@@ -3009,6 +3029,41 @@ mod tests {
             Refused::No
         );
         assert!(live_names(&slot).is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_rederive_never_writes_a_status_read_a_newer_write_superseded() {
+        // The worker read `pkg` as active, then an operator froze it and
+        // published. Its re-derive must not take the freeze back out.
+        let storage = holding(&["pkg"], 3).await;
+        let frozen = crate::status::ProjectStatusDoc {
+            status: crate::status::ProjectStatus::Quarantined,
+            reason: None,
+        };
+        crate::status::write_status(&storage, "pkg", &frozen)
+            .await
+            .unwrap();
+        let slot = slot_with(&["pkg"], 3);
+        let stale = QuarantinedEdit::Derive {
+            name: "pkg".into(),
+            blocked: false,
+        };
+        publish_quarantined(&storage, &[], &slot, &stale)
+            .await
+            .unwrap();
+        assert_eq!(stored_names(&storage).await, ["pkg"]);
+        assert_eq!(
+            AdvisoryState::read(&slot).quarantined_epoch,
+            3,
+            "nothing written"
+        );
+
+        // The same read, now current (the operator released it): it lands.
+        crate::status::clear_status(&storage, "pkg").await.unwrap();
+        publish_quarantined(&storage, &[], &slot, &stale)
+            .await
+            .unwrap();
+        assert!(stored_names(&storage).await.is_empty());
     }
 
     /// Storage holding `names` at `epoch`, for the race tests below.

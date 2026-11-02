@@ -222,7 +222,9 @@ block list protects first boot and the delivered feed replaces it.
 ## Keep it fresh
 
 Alert on `pypiron_advisory_snapshot_age_seconds`. A networked transfer can run
-from cron; a media transfer is current only as of its last delivery.
+from cron; a media transfer is current only as of its last delivery. Before the
+first feed arrives, the gauge shows the age of the bundled block list, so the
+alert also fires if transfers never arrive at all.
 
 See [mirror selection](../reference/configuration.md#mirror-selection) for
 package filters and [security](../security.md) for the cooldown and malware

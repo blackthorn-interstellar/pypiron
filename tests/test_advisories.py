@@ -30,6 +30,7 @@ import threading
 import time
 import zipfile
 from contextlib import ExitStack, contextmanager
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -151,6 +152,11 @@ def advisory_server(tmp_path_factory, pypiron_bin, feed, extra_args=(), extra_en
 def _metric_value(text: str, name: str):
     m = re.search(rf"^{re.escape(name)} ([\d.eE+-]+)$", text, re.MULTILINE)
     return float(m.group(1)) if m else None
+
+
+def _iso_unix(stamp: str) -> float:
+    """Unix seconds of an RFC 3339 `...Z` stamp, as the fixtures write them."""
+    return datetime.fromisoformat(stamp.replace("Z", "+00:00")).timestamp()
 
 
 def _poll_metric(base_url: str, name: str, *, timeout: float = 20.0, until=lambda _v: True):
@@ -308,19 +314,29 @@ def test_ac7_implicit_default_starts_unfed_then_self_arms(pypiron_bin, tmp_path)
         _wait_log_contains(log_path, "armed from the embedded floor snapshot")
         # The worker's first (background) obtain fails → armed-but-unfed warning.
         _wait_log_contains(log_path, "armed but unfed")
-        # No snapshot yet → the gauge is absent (not a misleading zero).
+        # No live snapshot yet, but the staleness gauge already reports the age of
+        # the bundled list that is enforcing, so a node that is never fed ages into
+        # the same alert as one whose feed went stale.
         code, body, _ = http_get(f"{base}/metrics")
         assert code == 200
-        assert _metric_value(body.decode(), "pypiron_advisory_snapshot_age_seconds") is None
+        floor_age = _metric_value(body.decode(), "pypiron_advisory_snapshot_age_seconds")
+        assert floor_age is not None, "an unfed node must not be invisible to the staleness alert"
+        fixture_age = time.time() - _iso_unix(_DEFAULT_MODIFIED)
+        assert 0 <= floor_age < fixture_age, (floor_age, fixture_age)
 
-        # Push a snapshot → blocking self-arms without a restart.
+        # Push a snapshot → blocking self-arms without a restart, and the gauge
+        # switches to the pushed feed's own content age.
         feed_bytes = make_osv_zip(tmp_path / "osv.zip", canonical_records()).read_bytes()
         code, _, _ = http_request_auth(
             "PUT", f"{base}/advisories/feed", username="admin", password="secret", data=feed_bytes
         )
         assert code == 204
-        age = _poll_metric(base, "pypiron_advisory_snapshot_age_seconds")
-        assert age is not None, "gauge never appeared after the snapshot was pushed"
+        age = _poll_metric(
+            base,
+            "pypiron_advisory_snapshot_age_seconds",
+            until=lambda v: abs(v - (time.time() - _iso_unix(_DEFAULT_MODIFIED))) < 300,
+        )
+        assert age is not None, "the gauge never switched to the pushed snapshot's age"
     finally:
         kill_process_tree(proc)
 

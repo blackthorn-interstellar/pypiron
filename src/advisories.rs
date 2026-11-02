@@ -860,10 +860,11 @@ pub async fn refresh(
         return;
     }
 
-    // Arm the gauges only once a snapshot is actually loaded — an armed-but-unfed
-    // node has nothing to age. The read-liveness gauge tracks this cycle's
-    // success; the staleness gauge tracks the loaded feed's content watermark, so
-    // re-reading identical stale bytes lets the staleness alert age out.
+    // The read-liveness gauge arms only once a snapshot is actually loaded — an
+    // armed-but-unfed node has read nothing. The staleness gauge tracks the loaded
+    // feed's content watermark, so re-reading identical stale bytes lets the
+    // staleness alert age out; before the first load it carries the bundled
+    // floor's age, seeded at startup.
     let snap = AdvisoryState::read(ctx.slot);
     let has_snapshot = snap.db.is_some();
     if refreshed_ok && has_snapshot {

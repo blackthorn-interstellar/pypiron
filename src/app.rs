@@ -1612,14 +1612,23 @@ async fn run_serve(
             info!(feed = %url, "advisory feed: polling for the malware block set and org audit (loading in background)");
         }
         let mut st = advisories::AdvisoryState::default();
-        if let Some((floor, built_unix)) = advisories::embedded_floor() {
-            let age_days = crate::clock::unix_now_secs().saturating_sub(built_unix) / 86_400;
-            info!(
-                projects = floor.len(),
-                floor_age_days = age_days,
-                "malware blocking armed from the embedded floor snapshot; the first live feed supersedes it"
-            );
-            st.overlay = Arc::new(floor);
+        // Until a live feed loads, the staleness gauge reports the age of what is
+        // actually enforcing — the floor, as of when it was compiled — so the
+        // alert operators already run on it also catches a node that never gets
+        // fed. With no floor at all the newest advisory held is "never": the
+        // gauge reads decades and pages at once. The first live load replaces it.
+        match advisories::embedded_floor() {
+            Some((floor, built_unix)) => {
+                let age_days = crate::clock::unix_now_secs().saturating_sub(built_unix) / 86_400;
+                info!(
+                    projects = floor.len(),
+                    floor_age_days = age_days,
+                    "malware blocking armed from the embedded floor snapshot; the first live feed supersedes it"
+                );
+                metrics.advisory_content_modified(i64::try_from(built_unix).unwrap_or(1));
+                st.overlay = Arc::new(floor);
+            }
+            None => metrics.advisory_content_modified(1),
         }
         (st, false)
     };

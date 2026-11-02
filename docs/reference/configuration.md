@@ -264,6 +264,10 @@ With the advisory feed enabled, use
 `pypiron_advisory_snapshot_age_seconds`,
 `pypiron_advisory_last_refresh_age_seconds`, and
 `pypiron_malware_probe_age_seconds` to alert on stale data or failed polling.
+Until a server loads its first live feed, the snapshot age reports how old the
+block list bundled in the binary is, so the same alert fires for a server that
+never gets a feed. Give that alert a `for:` window of at least 15 minutes so a
+restart doesn't page while the first feed downloads.
 `pypiron_blocked_downloads_total` counts refused malware downloads.
 `pypiron_malware_probe_skipped_total` counts new malware advisories a node
 could not read after several tries; each is blocked once OSV updates it or a

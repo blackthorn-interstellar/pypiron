@@ -198,7 +198,10 @@ pub struct Metrics {
     /// Unix seconds of the newest OSV `modified` timestamp in the loaded feed —
     /// the snapshot's *content* age, which the staleness alert must page on. Stale
     /// bytes keep this fixed while wall time advances, so the age climbs even when
-    /// every read "succeeds". 0 = no feed loaded, or none carried a timestamp; the
+    /// every read "succeeds". On a default-config node still waiting for its first
+    /// live feed it holds the bundled malware list's compile time instead (1 when
+    /// the binary carries none), so a node that is never fed ages into the same
+    /// alert. 0 = nothing enforcing carried a timestamp; the
     /// `pypiron_advisory_snapshot_age_seconds` gauge is omitted until then.
     advisory_content_modified_unix: AtomicU64,
     /// Unix seconds of this node's last successful malware-probe cycle (a CSV poll,
@@ -549,14 +552,15 @@ impl Metrics {
         // OSV `modified` timestamp in the loaded feed, not read success. This is
         // what a "page when age > 48h" alert watches: a ferry re-reading a dead
         // file refreshes forever, but the content stops advancing, so this climbs.
-        // Emitted only once a feed with a parseable timestamp has loaded.
+        // Emitted once a feed with a parseable timestamp has loaded, or from boot,
+        // at the bundled malware list's age, on a node waiting for its first feed.
         let advisory_modified = self.advisory_content_modified_unix.load(Ordering::Relaxed);
         if advisory_modified != 0 {
             let age = unix_now_secs().saturating_sub(advisory_modified);
             emit_gauge(
                 &mut out,
                 "pypiron_advisory_snapshot_age_seconds",
-                "Seconds since the newest advisory in the loaded feed was modified (content staleness).",
+                "Seconds since the newest advisory enforcing was modified (content staleness; before the first live feed, the age of the list bundled in the binary).",
                 age,
             );
         }

@@ -253,6 +253,10 @@ enum Break {
     /// its per-package view → DELIST. Needs `--excludes`, which is what
     /// configures a denylist at all.
     Relist,
+    /// Stand a body back up under an acked-deleted filename's tombstone, on
+    /// every bucket: a delete that crashed between its tombstone and its body
+    /// drop, which nothing finished → RECORD_STATE.
+    TornDelete,
 }
 
 /// The package name every phantom-clone break materializes. Not in
@@ -264,7 +268,7 @@ const BREAK_PKG: &str = "vopr-phantom";
 /// reproduce line all read this table: a second list that quietly fails to
 /// track the first is exactly how the reproduce line came to describe a
 /// different run than the one that failed.
-const BREAKS: [(&str, Break); 26] = [
+const BREAKS: [(&str, Break); 27] = [
     ("view", Break::View),
     ("fanout", Break::Fanout),
     ("rerun", Break::Rerun),
@@ -291,6 +295,7 @@ const BREAKS: [(&str, Break); 26] = [
     ("attest", Break::Attest),
     ("global-pair", Break::GlobalPair),
     ("relist", Break::Relist),
+    ("torn-delete", Break::TornDelete),
 ];
 
 impl Break {
@@ -721,6 +726,27 @@ async fn apply_break(
             if let Some(akey) = victim {
                 let _ = buckets[0].delete_keys(&[format!("{akey}.tombstone")]).await;
                 buckets[0].insert(&akey, b"resurrected".to_vec());
+            }
+        }
+        // A crashed delete nothing finished: the tombstone stands, and so does
+        // a body beside it, fleet-wide. Every oracle that reads bytes exempts a
+        // tombstoned name and every bucket agrees, so only the record's own
+        // meaning — `Tombstoned { settled: false }` — says anything is wrong.
+        (Break::TornDelete, false) => {
+            let victim = {
+                let ledger = ledger.lock().expect("ledger lock");
+                ledger
+                    .last_ack_deleted
+                    .iter()
+                    .find(|(_, deleted)| **deleted)
+                    .map(|((pkg, fname), _)| format!("packages/{pkg}/{fname}"))
+            };
+            if let Some(akey) = victim {
+                for bucket in buckets {
+                    if bucket.keys().contains(&format!("{akey}.tombstone")) {
+                        bucket.insert(&akey, b"vopr: a body its delete never dropped".to_vec());
+                    }
+                }
             }
         }
         // A freeze over a filename nothing ever conflicted about. Planted on an
@@ -1416,9 +1442,10 @@ enum R {
     UntypedDisappearance,
     GlobalPair,
     Delist,
+    RecordState,
 }
 
-const REACH_SLOTS: usize = 27;
+const REACH_SLOTS: usize = 28;
 
 /// `(label, what exactly one execution counts)` — in `R`'s declaration order.
 const REACH_METER: [(&str, &str); REACH_SLOTS] = [
@@ -1518,6 +1545,10 @@ const REACH_METER: [(&str, &str); REACH_SLOTS] = [
         "DELIST",
         "delisted name weighed against a bucket's global index",
     ),
+    (
+        "RECORD_STATE",
+        "filename classified on a bucket at quiescence",
+    ),
 ];
 
 /// The violation prefix each reach slot's oracle pushes, in `R`'s declaration
@@ -1557,6 +1588,7 @@ const REACH_VIOLATION_PREFIX: [&str; REACH_SLOTS] = [
     "UNTYPED_DISAPPEARANCE",
     "GLOBAL_PAIR",
     "DELIST",
+    "RECORD_STATE",
 ];
 
 /// Zeros that are a known property of the harness or the product, not a hole.
@@ -2038,6 +2070,28 @@ fn record_from_dump(dump: &BTreeMap<String, Vec<u8>>, pkg: &str, fname: &str) ->
                     .and_then(|o| o.as_str())
                     .and_then(pypiron::replicate::Origin::parse)
             }),
+    )
+}
+
+/// A record state no pass may leave behind once the fleet is quiescent: an
+/// unsettled freeze, delete or demotion (the merge finishes those), a
+/// `.superseding` body (the rebuild's `finish_interrupted_supersedes`), a bare
+/// body (the rebuild's backfill), and a sidecar or companion with no body (the
+/// audit). No allowance: ~100k seeds over the rotating, partitioned,
+/// fault-injected and denylist profiles left none standing.
+fn record_torn(state: &replicate::RecordState) -> bool {
+    use replicate::RecordState::*;
+    matches!(
+        state,
+        Frozen { settled: false }
+            | Tombstoned { settled: false }
+            | QuarantinedMirror { settled: false }
+            | Live {
+                superseding: true,
+                ..
+            }
+            | Absent { debris: true }
+            | Bare
     )
 }
 
@@ -5380,25 +5434,41 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
                 .filter(|(p, _)| p == pkg)
             {
                 let akey = format!("packages/{pkg}/{fname}");
-                let inert = ["tombstone", "frozen", "mirror-quarantined"]
-                    .iter()
-                    .any(|suffix| dump.contains_key(&format!("{akey}.{suffix}")));
-                if inert || !dump.contains_key(&akey) {
-                    continue;
-                }
-                let origin = dump
-                    .get(&format!("{akey}.meta.json"))
-                    .and_then(|bytes| {
-                        serde_json::from_slice::<pypiron::sidecar::Sidecar>(bytes).ok()
-                    })
-                    .and_then(|sc| sc.origin);
-                if origin.as_deref() == Some("mirror") {
+                // Live mirror truth as the real classifier reads it: a body and a
+                // mirror sidecar no tombstone, freeze or demotion fence covers.
+                if matches!(
+                    replicate::classify_record(&record_from_dump(dump, pkg, &fname)),
+                    replicate::RecordState::Live {
+                        origin: replicate::Origin::Mirror,
+                        ..
+                    }
+                ) {
                     violations.push(format!(
                         "ORIGIN_TERMINALITY: bucket {bucket_idx} still serves {akey} as live \
                          mirror truth under a privately-claimed package — it must be superseded \
                          or quarantined, never left renderable"
                     ));
                 }
+            }
+        }
+    }
+
+    // RECORD_STATE. Every oracle above asks about bytes, views or claims; none
+    // asks what each filename's objects MEAN once the fleet is done. A crash
+    // mid-delete, mid-freeze, mid-demotion or mid-supersede leaves a record the
+    // real `classify_record` names torn, and the merge, the rebuild and the
+    // audit each own finishing one — so at quiescence none may still stand.
+    for (bucket_idx, dump) in dumps.iter().enumerate() {
+        for (pkg, fname) in record_names(std::slice::from_ref(dump)) {
+            REACH.hit(R::RecordState);
+            let state = replicate::classify_record(&record_from_dump(dump, &pkg, &fname));
+            if record_torn(&state) {
+                violations.push(format!(
+                    "RECORD_STATE: bucket {bucket_idx} left packages/{pkg}/{fname} torn at \
+                     quiescence as {state:?} — an interrupted operation nothing finished | \
+                     markers: {}",
+                    marker_census(&dumps, &pkg, &fname),
+                ));
             }
         }
     }

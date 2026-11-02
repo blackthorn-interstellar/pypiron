@@ -465,6 +465,14 @@ The invariants:
   mirror records only on partitioned seeds.) `--break demote-lossy` is the kill
   — a demotion fence standing over a body in no `_quarantine/` copy — and
   `conserve` and `slow-repair` red it alongside their own oracle;
+- **record state** — at quiescence every filename on every bucket classifies,
+  through the real `replicate::classify_record`, to a finished state: no
+  unsettled freeze, delete or demotion, no `.superseding` body, no bare body
+  and no sidecar or companion without one. Every other oracle reads bytes,
+  views or claims, and each exempts a tombstoned or frozen name, so a delete
+  that crashed with its body still standing passed all of them. No allowance:
+  ~100k seeds across the rotating, partitioned, fault-injected and denylist
+  profiles left none standing. `--break torn-delete` is the kill;
 - **staleness** — bounded agreement, on a clock. See below.
 
 ### Bounded staleness: how long "converged" is allowed to take
@@ -1560,6 +1568,7 @@ storage and never the schedule.
 | `attest` | an acked artifact's sidecar re-points at a digest no body has, fleet-wide, with every view re-pointed to match — the bytes, the buckets and the re-render all stay healthy | `SELF_CONSISTENCY: bucket … serves … while its own sidecar publishes` | 4 |
 | `global-pair` | the two halves of the global index pulled apart at the pre-audit check-point: `simple/index.html` names a package `simple/index.json` does not, fleet-wide | `GLOBAL_PAIR: bucket … do not name the same packages` | 1 |
 | `relist` | a fully-denied package put back into both global halves and given a per-package view again, on every bucket that still stores its artifacts (needs `--excludes 100`, which is what configures a denylist at all) | `DELIST: bucket … still lists the excluded package` | 4 |
+| `torn-delete` | a body stood back up under an acked-deleted filename's tombstone on every bucket — a delete that crashed between its tombstone and its body drop, which nothing finished. Every byte oracle exempts a tombstoned name and the buckets still agree | `RECORD_STATE: bucket … torn at quiescence as Tombstoned { settled: false }` | 2 |
 
 **`global-pair` and `relist` are the delist lane's legs** (see *The delist lane*
 above). They are two different claims and neither can stand in for the other:

@@ -476,6 +476,10 @@ jobs:
           check origin-demoted "ORIGIN_TERMINALITY: bucket 0 claims" --nodes 2 --buckets 1 --ops 80
           check mirror-served "ORIGIN_TERMINALITY: bucket 0 still serves" --nodes 2 --buckets 1 --ops 80
           check split     "never left split"           --nodes 2 --buckets 2 --ops 80
+          # A crashed delete nobody finished — the tombstone and a body beside
+          # it, fleet-wide. Every byte oracle exempts a tombstoned name and the
+          # buckets agree, so only the record's own classification can see it.
+          check torn-delete "RECORD_STATE: bucket"     --nodes 2 --buckets 1 --ops 80
           # The only oracle anywhere that re-hashes a body. The break pulls the
           # bytes and the published sha256 apart from the *sidecar* side and
           # re-points the views at the new digest, so every other oracle — and

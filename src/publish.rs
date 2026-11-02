@@ -547,7 +547,43 @@ pub(crate) async fn legacy_upload(
     // Pin the storage context once for the whole upload (design §3): the origin
     // claim, artifact/sidecar writes, and commit marker all land on this handle.
     let pinned = state.pin();
-    publish_record(&state, &pinned, req).await
+    match publish_record(&state, &pinned, req).await {
+        Ok(ok) => Ok(ok.into_response()),
+        Err((code, msg)) => match upload_conflict(code, &msg) {
+            Some(kind) => Ok((code, [(UPLOAD_CONFLICT_HEADER, kind)], msg).into_response()),
+            None => Err((code, msg)),
+        },
+    }
+}
+
+/// Response header naming which 409 an upload got: [`CONFLICT_EXISTS`] (the
+/// filename already holds bytes — an idempotent re-offer) or
+/// [`CONFLICT_FENCED`] (deleted or frozen on purpose). Any other 409 is a write
+/// the server refused, and carries none. `sync` reads it to tell a skip from a
+/// failure without parsing the message.
+pub(crate) const UPLOAD_CONFLICT_HEADER: &str = "x-pypiron-upload-conflict";
+pub(crate) const CONFLICT_EXISTS: &str = "exists";
+pub(crate) const CONFLICT_FENCED: &str = "fenced";
+
+/// Message starts of the two 409s [`UPLOAD_CONFLICT_HEADER`] names. Wire
+/// contract: sync clients from before the header match on this text, so
+/// rewording it breaks them against this server.
+const FILE_EXISTS: &str = "File already exists";
+const FILENAME_FENCED: &str = "frozen or deleted";
+
+/// Which named upload conflict a `publish_record` refusal is, if any. Also
+/// sync's fallback for a server too old to send [`UPLOAD_CONFLICT_HEADER`]:
+/// those bodies are byte-identical.
+pub(crate) fn upload_conflict(code: StatusCode, msg: &str) -> Option<&'static str> {
+    if code != StatusCode::CONFLICT {
+        None
+    } else if msg.starts_with(FILE_EXISTS) {
+        Some(CONFLICT_EXISTS)
+    } else if msg.contains(FILENAME_FENCED) {
+        Some(CONFLICT_FENCED)
+    } else {
+        None
+    }
 }
 
 /// Acquire write-budget permits iff this backend buffers the artifact body in RAM
@@ -839,10 +875,7 @@ pub async fn publish_record(
             if let Err(e) = intent.commit().await {
                 warn!(error=?e, "legacy: failed to close duplicate-upload intent marker");
             }
-            return Err((
-                StatusCode::CONFLICT,
-                format!("File already exists: {filename}"),
-            ));
+            return Err((StatusCode::CONFLICT, format!("{FILE_EXISTS}: {filename}")));
         }
         Err(e) => {
             return Err((
@@ -1035,7 +1068,7 @@ pub async fn publish_record(
             }
             return Err((
                 StatusCode::CONFLICT,
-                format!("File '{filename}' is frozen or deleted and cannot be reused"),
+                format!("File '{filename}' is {FILENAME_FENCED} and cannot be reused"),
             ));
         }
         // The HEAD never answered, so "fenced" is a guess — and freeing an
@@ -2090,6 +2123,31 @@ mod tests {
     use crate::buckets::{BucketHandle, BucketSet};
 
     use super::*;
+
+    #[test]
+    fn only_the_two_skippable_409s_are_named() {
+        let c = StatusCode::CONFLICT;
+        assert_eq!(
+            upload_conflict(c, &format!("{FILE_EXISTS}: a-1.0.tar.gz")),
+            Some(CONFLICT_EXISTS)
+        );
+        assert_eq!(
+            upload_conflict(
+                c,
+                &format!("File 'a' is {FILENAME_FENCED} and cannot be reused")
+            ),
+            Some(CONFLICT_FENCED)
+        );
+        // The text pre-header sync clients match on, verbatim.
+        assert_eq!(FILE_EXISTS, "File already exists");
+        assert_eq!(FILENAME_FENCED, "frozen or deleted");
+        // A refused write (the file did not land) must stay a failure.
+        assert_eq!(
+            upload_conflict(c, "Package 'a' changed origin during upload"),
+            None
+        );
+        assert_eq!(upload_conflict(StatusCode::BAD_REQUEST, FILE_EXISTS), None);
+    }
 
     #[test]
     fn artifact_filenames_stop_at_the_length_the_download_path_serves() {

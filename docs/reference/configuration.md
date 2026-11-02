@@ -524,7 +524,7 @@ pending repairs, not bytes.
 | `/simple/` | read | Package index. |
 | `/files/<pkg>/<file>` | read | Artifact bytes. |
 | `/files/<pkg>/<filename>/upload-time` | admin | `POST` JSON with `sha256` and RFC 3339 `upload-time` to repair a private file's date. Refuses hash mismatches and deleted/quarantined files. |
-| `/legacy/` | uploader/admin | Upload API. `POST /simple/`, `POST /simple`, and `POST /` upload too, so publishers configured for pypicloud keep working. |
+| `/legacy/` | uploader/admin | Upload API. `POST /simple/`, `POST /simple`, and `POST /` upload too, so publishers configured for pypicloud keep working. A `409` for a filename that already exists carries `x-pypiron-upload-conflict: exists`; one for a filename deleted or frozen on purpose carries `fenced`. |
 | `/health` | open | Liveness: the process is up. Always `200` while serving (a Kubernetes `livenessProbe`). |
 | `/ready` | open | Readiness: this node can serve reads. Point your load balancer and a Kubernetes `readinessProbe` here. |
 | `/metrics` | open | Prometheus metrics. |

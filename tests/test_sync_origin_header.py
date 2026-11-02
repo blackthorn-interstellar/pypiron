@@ -16,6 +16,10 @@ serving the name.
 This drives the REAL binary against a real destination through a forwarder that
 mangles the header three ways, and asserts the migration still fails — via the
 server's own 403, which is the fail-closed backstop.
+
+The same forwarder rewrites upload 409s to show sync reads the
+`x-pypiron-upload-conflict` header, not the message, to tell a skip from a
+refused write — and still understands a server too old to send it.
 """
 
 from __future__ import annotations
@@ -26,12 +30,13 @@ import threading
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Dict, Iterator, Optional, Tuple
+from typing import Callable, Dict, Iterator, List, Optional, Tuple
 
 import pytest
 
 from .helpers import (
     find_free_port,
+    http_request_auth,
     make_wheel,
     origin_owner,
     sha256_file,
@@ -50,6 +55,8 @@ ORIGIN_HEADER = "x-pypiron-origin"
 #   blank  - a proxy that blanks rather than removes
 #   bogus  - a state this client's build doesn't know
 HEADER_TREATMENTS = [("strip", None), ("blank", ""), ("bogus", "banana")]
+
+Headers = List[Tuple[str, str]]
 
 # Per-hop headers a forwarder owns rather than copies.
 _HOP_BY_HOP = {
@@ -154,6 +161,9 @@ class _ManglingHandler(BaseHTTPRequestHandler):
         self.server.mangled += seen
         if seen and self.server.replacement is not None:
             out.append((ORIGIN_HEADER, self.server.replacement))
+        if status == 409 and self.server.rewrite is not None:
+            out, payload = self.server.rewrite(out, payload)
+            self.server.conflicts += 1
         self.send_response(status)
         for k, v in out:
             self.send_header(k, v)
@@ -169,11 +179,19 @@ class _ManglingHandler(BaseHTTPRequestHandler):
 class _ManglingForwarder(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, address, target: str, replacement: Optional[str]):
+    def __init__(
+        self,
+        address,
+        target: str,
+        replacement: Optional[str],
+        rewrite: Optional[Callable[[Headers, bytes], Tuple[Headers, bytes]]] = None,
+    ):
         super().__init__(address, _ManglingHandler)
         self.target = target.rstrip("/")
         self.replacement = replacement
+        self.rewrite = rewrite
         self.mangled = 0
+        self.conflicts = 0
 
 
 @contextlib.contextmanager
@@ -272,3 +290,94 @@ def test_as_private_onto_mirror_fails_when_dest_reports_no_readable_origin(
         sidecar = json.loads((pkg_dir / f"{wheel.name}.meta.json").read_text())
         assert sidecar["sha256"] == local_sha
         assert sha256_file(pkg_dir / wheel.name) == local_sha
+
+
+# ------------------------- upload conflicts (409) -----------------------------
+
+CONFLICT_HEADER = "x-pypiron-upload-conflict"
+
+
+def _without_conflict_header(out: Headers) -> Headers:
+    return [(k, v) for k, v in out if k.lower() != CONFLICT_HEADER]
+
+
+# How the forwarder rewrites each upload 409, and whether sync must still skip:
+#   reworded   - a newer server that changed the message but names the kind
+#   headerless - a server older than the header: the message is all it says
+#   unknown    - a kind this build doesn't know: the file did not land
+CONFLICT_TREATMENTS = [
+    ("reworded", lambda out, _body: (out, b"Conflict"), True),
+    ("headerless", lambda out, body: (_without_conflict_header(out), body), True),
+    (
+        "unknown",
+        lambda out, body: (_without_conflict_header(out) + [(CONFLICT_HEADER, "banana")], body),
+        False,
+    ),
+]
+
+
+@pytest.mark.parametrize(
+    "label,rewrite,skips", CONFLICT_TREATMENTS, ids=[t[0] for t in CONFLICT_TREATMENTS]
+)
+def test_sync_tells_an_upload_skip_from_a_refusal_by_the_conflict_header(
+    label, rewrite, skips, disk_server, pypiron_bin, tmp_path
+):
+    """A re-offered file the destination already holds, or deleted on purpose,
+    is a skip; sync learns which from the 409's header, not its wording."""
+    package = f"conflict{label}pkg"
+    wheels = [make_wheel(package, v, tmp_path) for v in ("1.0", "2.0")]
+    base_path = "/corp/dev/+simple"
+    routes = {f"/files/{w.name}": ("application/octet-stream", w.read_bytes()) for w in wheels}
+    routes[f"{base_path}/{package}/"] = (
+        "application/vnd.pypi.simple.v1+json",
+        json.dumps(
+            {
+                "meta": {"api-version": "1.0"},
+                "name": package,
+                "files": [
+                    {
+                        "filename": w.name,
+                        "url": f"/files/{w.name}",
+                        "hashes": {"sha256": sha256_file(w)},
+                        "size": w.stat().st_size,
+                    }
+                    for w in wheels
+                ],
+            }
+        ).encode(),
+    )
+    source = _SourceServer(("127.0.0.1", find_free_port()), routes)
+    forwarder = _ManglingForwarder(
+        ("127.0.0.1", find_free_port()), disk_server["base_url"], None, rewrite
+    )
+    with (
+        _serving(source, "fake-source") as source_url,
+        _serving(forwarder, "conflict-mangler") as forwarder_url,
+    ):
+        common = ("--include-package", package, "--as-private")
+        src = f"{source_url}{base_path}"
+        rc, out, err = sync_to(pypiron_bin, disk_server, *common, source=src)
+        assert rc == 0, f"migration failed:\n{out}\n{err}"
+        wait_for_file_in_index(disk_server["simple"], package, wheels[1].name)
+        code, _, _ = http_request_auth(
+            "DELETE",
+            f"{disk_server['base_url']}/files/{package}/{wheels[1].name}",
+            username=disk_server["admin_user"],
+            password=disk_server["admin_password"],
+        )
+        assert code == 204
+
+        # The origin claim is stripped, so sync re-offers both files: one 409
+        # says "already here", the other "deleted on purpose".
+        rc, out, err = sync_to(
+            pypiron_bin, {**disk_server, "base_url": forwarder_url}, *common, source=src
+        )
+    combined = out + err
+    assert forwarder.conflicts == 2, combined
+    if skips:
+        assert rc == 0, combined
+        assert f"skipping {wheels[1].name}" in combined, combined
+        assert "upload refused" not in combined, combined
+    else:
+        assert rc != 0, combined
+        assert "upload refused [409 Conflict]" in combined, combined

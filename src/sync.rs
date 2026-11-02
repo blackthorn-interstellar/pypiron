@@ -3742,18 +3742,28 @@ async fn upload_via_http(
         let req = with_admin_auth(client.post(endpoint).multipart(form), resolved);
         let err = match req.send().await {
             Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
+                let header = resp
+                    .headers()
+                    .get(crate::publish::UPLOAD_CONFLICT_HEADER)
+                    .map(|v| v.to_str().unwrap_or_default().to_owned());
                 let body = error_snippet(resp).await;
                 // Already present (or our own earlier attempt landed), or a
-                // filename the destination deleted on purpose. Any other 409 is
-                // a write the server refused: the file did not land.
-                if body.starts_with("File already exists") {
-                    return Ok(false);
+                // filename the destination deleted on purpose. Any other 409 —
+                // or a kind this build doesn't know — is a write the server
+                // refused: the file did not land. A server too old to send the
+                // header says which in the message.
+                let kind = match &header {
+                    Some(h) => Some(h.as_str()),
+                    None => crate::publish::upload_conflict(reqwest::StatusCode::CONFLICT, &body),
+                };
+                match kind {
+                    Some(crate::publish::CONFLICT_EXISTS) => return Ok(false),
+                    Some(crate::publish::CONFLICT_FENCED) => {
+                        info!("  - skipping {}: {body}", s.file.filename);
+                        return Ok(false);
+                    }
+                    _ => return Err(anyhow!("upload refused [409 Conflict]: {body}")),
                 }
-                if body.contains("frozen or deleted") {
-                    info!("  - skipping {}: {body}", s.file.filename);
-                    return Ok(false);
-                }
-                return Err(anyhow!("upload refused [409 Conflict]: {body}"));
             }
             Ok(resp) if resp.status().is_success() => return Ok(true),
             Ok(resp)

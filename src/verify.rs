@@ -22,10 +22,8 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Args as ClapArgs;
-use futures::StreamExt as _;
-use sha2::{Digest, Sha256};
 
 use crate::app::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::denylist::Denylist;
@@ -508,22 +506,11 @@ async fn stored_sha256(storage: &dyn Storage, key: &str, expected: u64) -> Resul
     // This error travels with its type intact: the caller tells a missing body
     // from a real I/O failure by downcasting to NotFound, which survives a
     // context layer but not a rebuild into a fresh error (`anyhow!("{e}")`).
-    let mut body = storage
-        .serve_artifact(key, None)
-        .await?
-        .into_body()
-        .into_data_stream();
-    let mut hasher = Sha256::new();
-    let mut read = 0u64;
-    while let Some(chunk) = body.next().await {
-        let chunk = chunk.with_context(|| format!("read {key}"))?;
-        read += chunk.len() as u64;
-        hasher.update(&chunk);
-    }
+    let (sha, read) = crate::storage::stream_sha256(storage, key).await?;
     if read != expected {
         anyhow::bail!("read {key}: body ended after {read} of {expected} bytes");
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(sha)
 }
 
 /// The global index must list exactly the packages that have artifacts.

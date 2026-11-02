@@ -36,7 +36,6 @@ use object_store::{
 };
 
 use crate::config::BucketOverride;
-use crate::hash::sha256_hex;
 use crate::range::{parse_range, read_capacity, RangeSpec};
 use crate::sidecar::StoreChecksum;
 
@@ -1028,7 +1027,9 @@ pub trait Storage: Send + Sync {
 
     /// Serve an artifact as an HTTP response, honoring a `Range` header.
     /// Each backend uses its native range machinery (seek for disk, S3's own
-    /// validation for S3). Errors mean "not found" to the caller.
+    /// validation for S3). Errors mean "not found" to the caller. Also the
+    /// trait's streaming read for any whole-body consumer (verify, replication,
+    /// sidecar backfill — see [`stream_sha256`]); `get_bytes` is small files only.
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>>;
 
     /// A presigned GET URL, where the backend supports one (S3). `None` means
@@ -1650,6 +1651,26 @@ impl ArtifactBody<'_> {
     }
 }
 
+/// sha256 and length of what `key` holds, hashed as it streams: memory is one
+/// read buffer whatever the object weighs (an artifact can be 5 GiB, and
+/// `get_bytes` is for small files). A missing key is a typed [`NotFound`],
+/// which survives the context layer for [`is_not_found`].
+pub(crate) async fn stream_sha256(storage: &dyn Storage, key: &str) -> Result<(String, u64)> {
+    use sha2::{Digest, Sha256};
+    let mut body = storage
+        .serve_artifact(key, None)
+        .await?
+        .into_body()
+        .into_data_stream();
+    let (mut hasher, mut read) = (Sha256::new(), 0u64);
+    while let Some(chunk) = body.next().await {
+        let chunk = chunk.with_context(|| format!("read {key}"))?;
+        read += chunk.len() as u64;
+        hasher.update(&chunk);
+    }
+    Ok((format!("{:x}", hasher.finalize()), read))
+}
+
 /// Store an immutable artifact at `key`, then prove the bytes that landed are
 /// the bytes we meant to write — the shared write primitive for the upload path
 /// and the replication copy.
@@ -1719,11 +1740,10 @@ pub async fn store_artifact_verified(
         Existing::Reject => return Ok(false),
         Existing::Repair(sha) => sha,
     };
-    let current = storage
-        .get_bytes(key)
+    let (current_sha, _) = stream_sha256(storage, key)
         .await
         .with_context(|| format!("read back already-present artifact {key}"))?;
-    if sha256_hex(&current) == expected_sha {
+    if current_sha == expected_sha {
         return Ok(false);
     }
     // A wrong-sha body under an immutable key is stale crash debris (e.g. a
@@ -1742,11 +1762,9 @@ pub async fn store_artifact_verified(
         storage.put_bytes(key, correct, content_type),
     )
     .await?;
-    let after = storage
-        .get_bytes(key)
+    let (after_sha, _) = stream_sha256(storage, key)
         .await
         .with_context(|| format!("re-verify repaired artifact {key}"))?;
-    let after_sha = sha256_hex(&after);
     if after_sha != expected_sha {
         bail!(
             "artifact {key} still wrong after repair: stored {after_sha}, expected {expected_sha}"
@@ -1947,33 +1965,35 @@ impl Storage for DiskStorage {
 
     async fn serve_artifact(&self, key: &str, range: Option<&str>) -> Result<Response<Body>> {
         let path = self.resolve(key)?;
-        let md = match fs::metadata(&path).await {
-            Ok(md) => md,
+        // Open, then stat the handle: a stat-then-open pair let a delete in
+        // between surface as an untyped I/O error instead of `NotFound`.
+        let mut file = match fs::File::open(&path).await {
+            Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(NotFound(key.to_string()).into());
             }
-            Err(e) => return Err(anyhow::Error::from(e).context(format!("stat {key}"))),
+            Err(e) => return Err(anyhow::Error::from(e).context(format!("open {key}"))),
         };
+        let md = file
+            .metadata()
+            .await
+            .with_context(|| format!("stat {key}"))?;
         if !md.is_file() {
             return Err(NotFound(key.to_string()).into());
         }
         let size = md.len();
 
         let resp = match parse_range(range, size) {
-            RangeSpec::Full => {
-                let file = fs::File::open(&path).await?;
-                Response::builder()
-                    .status(StatusCode::OK)
-                    .header(header::CONTENT_LENGTH, size)
-                    .header(header::CONTENT_TYPE, "application/octet-stream")
-                    .header(header::ACCEPT_RANGES, "bytes")
-                    .body(Body::from_stream(ReaderStream::with_capacity(
-                        file,
-                        read_capacity(size),
-                    )))?
-            }
+            RangeSpec::Full => Response::builder()
+                .status(StatusCode::OK)
+                .header(header::CONTENT_LENGTH, size)
+                .header(header::CONTENT_TYPE, "application/octet-stream")
+                .header(header::ACCEPT_RANGES, "bytes")
+                .body(Body::from_stream(ReaderStream::with_capacity(
+                    file,
+                    read_capacity(size),
+                )))?,
             RangeSpec::Partial(start, end) => {
-                let mut file = fs::File::open(&path).await?;
                 file.seek(SeekFrom::Start(start)).await?;
                 let len = end - start + 1;
                 Response::builder()
@@ -4440,6 +4460,39 @@ mod tests {
         );
     }
 
+    /// A replication repair compares an already-present body of any size by
+    /// streaming it, both before (is it already right?) and after (did the
+    /// overwrite land?) — never through `get_bytes`, which buffers it whole.
+    #[tokio::test]
+    async fn a_repair_compares_a_large_existing_body_without_buffering_it() {
+        let storage = test_support::InMemStorage::default();
+        let key = "packages/demo/demo-1.0-py3-none-any.whl";
+        let good = vec![7u8; 4096];
+        let sha = crate::hash::sha256_hex(&good);
+        storage.limit_get_bytes(1024);
+
+        storage.insert(key, good.clone());
+        let repair = |body: Vec<u8>| {
+            store_artifact_verified(
+                &storage,
+                key,
+                ArtifactBody::Bytes(body),
+                4096,
+                None,
+                Existing::Repair(&sha),
+            )
+        };
+        assert!(
+            !repair(good.clone()).await.unwrap(),
+            "already right: no repair"
+        );
+
+        storage.insert(key, vec![0u8; 4096]);
+        assert!(repair(good.clone()).await.unwrap(), "wrong body: repaired");
+        storage.limit_get_bytes(0);
+        assert_eq!(storage.get_bytes(key).await.unwrap(), good);
+    }
+
     /// The other half: when the HEAD *does* answer and condemns the object, the
     /// rollback still runs, so an immutable retry is not locked out by a 409
     /// against this writer's own zero-byte debris.
@@ -4670,6 +4723,10 @@ pub mod test_support {
         /// or delete of `key` lands (one-shot) — another writer finishing in
         /// the gap between a caller's decision and its unconditional write.
         before_write: Mutex<Option<(String, ObjectsHook)>>,
+        /// Largest object `get_bytes` will return (0 = no limit). The trait
+        /// reserves it for small files; a caller reading an artifact through
+        /// it fails here instead of buffering gigabytes in production.
+        get_bytes_limit: AtomicU64,
     }
 
     type ObjectsHook = Box<dyn FnOnce(&mut HashMap<String, Vec<u8>>) + Send>;
@@ -4754,8 +4811,31 @@ pub mod test_support {
             self.get_delay_ms
                 .store(delay.as_millis() as u64, Ordering::SeqCst);
         }
-        /// Run `f` over the object map right before the next `put_bytes` or
-        /// `delete_keys` touching `key` applies (one-shot).
+        /// Make `get_bytes` refuse objects larger than `max` bytes; the
+        /// streaming read (`serve_artifact`) is unaffected.
+        pub fn limit_get_bytes(&self, max: u64) {
+            self.get_bytes_limit.store(max, Ordering::SeqCst);
+        }
+        /// Every whole-object read: counted, delayed and failed the same way
+        /// whether it buffers (`get_bytes`) or streams (`serve_artifact`).
+        async fn read(&self, key: &str) -> Result<Vec<u8>> {
+            self.gets.fetch_add(1, Ordering::SeqCst);
+            if self.fail_next_get.swap(false, Ordering::SeqCst) || self.unreadable(key) {
+                anyhow::bail!("injected storage failure");
+            }
+            let delay = self.get_delay_ms.load(Ordering::SeqCst);
+            if delay > 0 {
+                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+            }
+            self.objects
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .ok_or_else(|| NotFound(key.to_string()).into())
+        }
+        /// Run `f` over the object map right before the next `put_bytes`,
+        /// `put_if_absent` or `delete_keys` touching `key` applies (one-shot).
         pub fn before_write_of(
             &self,
             key: &str,
@@ -4806,7 +4886,7 @@ pub mod test_support {
             key: &str,
             _range: Option<&str>,
         ) -> Result<axum::response::Response<axum::body::Body>> {
-            let bytes = self.get_bytes(key).await?;
+            let bytes = self.read(key).await?;
             Ok(Response::builder()
                 .status(200)
                 .body(axum::body::Body::from(bytes))?)
@@ -4840,6 +4920,7 @@ pub mod test_support {
             if self.unwritable(key) {
                 anyhow::bail!("injected storage failure");
             }
+            self.run_before_write(&[key]);
             let mut map = self.objects.lock().unwrap();
             if map.contains_key(key) {
                 return Ok(false);
@@ -4858,20 +4939,15 @@ pub mod test_support {
             self.put_if_absent(key, bytes, content_type).await
         }
         async fn get_bytes(&self, key: &str) -> Result<Vec<u8>> {
-            self.gets.fetch_add(1, Ordering::SeqCst);
-            if self.fail_next_get.swap(false, Ordering::SeqCst) || self.unreadable(key) {
-                anyhow::bail!("injected storage failure");
+            let bytes = self.read(key).await?;
+            let limit = self.get_bytes_limit.load(Ordering::SeqCst);
+            if limit > 0 && bytes.len() as u64 > limit {
+                anyhow::bail!(
+                    "get_bytes is for small objects: {key} is {} bytes",
+                    bytes.len()
+                );
             }
-            let delay = self.get_delay_ms.load(Ordering::SeqCst);
-            if delay > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            }
-            self.objects
-                .lock()
-                .unwrap()
-                .get(key)
-                .cloned()
-                .ok_or_else(|| NotFound(key.to_string()).into())
+            Ok(bytes)
         }
         async fn list_dir_entries(&self, dir_prefix: &str) -> Result<Vec<FileEntry>> {
             let map = self.objects.lock().unwrap();

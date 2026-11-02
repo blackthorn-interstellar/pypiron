@@ -1113,7 +1113,9 @@ its origin regardless. All fields default when absent, so every pre-migration
 sidecar still parses (a legacy/proxy mirror sidecar reads as a cache). Rebuilds
 read sidecars only;
 if a sidecar is missing (legacy file), the rebuild backfills it by hashing the
-artifact once — create-only, so a real write-time sidecar always wins the race.
+artifact as it streams (never held in memory; a body whose length disagrees
+with its listing fails the rebuild) — create-only, so a real write-time sidecar
+always wins the race — then re-hashes it to confirm nothing replaced it.
 A rebuild re-reads only the sidecars whose listing change detector (ETag +
 version, or nanosecond mtime + size on disk) moved since this process last
 parsed them; the parse memo lives in RAM only (src/sidecar_cache.rs), so it is

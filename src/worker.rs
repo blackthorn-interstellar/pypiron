@@ -50,7 +50,7 @@ use crate::sidecar::{
     SIDECAR_SUFFIX, SUPERSEDING_SUFFIX, TOMBSTONE_SUFFIX,
 };
 use crate::sidecar_cache::{PackageSidecars, SidecarCache};
-use crate::storage::{is_not_found, FileEntry, ObjectMeta, Storage};
+use crate::storage::{is_not_found, stream_sha256, FileEntry, ObjectMeta, Storage};
 use crate::transparency::FileShas;
 
 /// Bounded fan-out for storage round-trips during rebuilds and sweeps.
@@ -4376,8 +4376,19 @@ async fn backfill_sidecar(
     filename: &str,
     pkg_origin: Option<&str>,
 ) -> Result<Option<Sidecar>> {
-    let bytes = match storage.get_bytes(&entry.key).await {
-        Ok(bytes) => bytes,
+    // Hashed as it streams: a bare body can be a multi-GiB admin upload, and
+    // up to SIDECAR_READ_CONCURRENCY backfills run at once.
+    let sha256 = match stream_sha256(storage, &entry.key).await {
+        // A body that no longer weighs what the listing said was replaced
+        // between the two; pairing its sha with the listed size would publish
+        // a sidecar that contradicts its own bytes. Nothing is fabricated yet,
+        // so fail the rebuild (markers retained) and let it re-list.
+        Ok((_, read)) if read != entry.size => bail!(
+            "{}: read {read} bytes but the listing said {}; retrying the rebuild",
+            entry.key,
+            entry.size
+        ),
+        Ok((sha256, _)) => sha256,
         // Vanished between the listing and this read (a concurrent delete or a
         // crashed publish clearing unacked debris). Its deleter holds the marker;
         // omit the file and let a later rebuild converge.
@@ -4390,7 +4401,7 @@ async fn backfill_sidecar(
         }
     };
     let sc = Sidecar {
-        sha256: sha256_hex(&bytes),
+        sha256,
         size: entry.size,
         version: infer_version_from_filename(filename).unwrap_or_default(),
         upload_time: entry.last_modified.clone().unwrap_or_default(),
@@ -4430,8 +4441,11 @@ async fn backfill_sidecar(
     // Confirm the body still holds the hashed bytes; otherwise retract the
     // fabrication — comparing first, so a real sidecar that already replaced
     // ours is never the casualty.
-    let confirmed = match storage.get_bytes(&entry.key).await {
-        Ok(now) => sha256_hex(&now) == sc.sha256,
+    // No length check here: a body of a different size is exactly "changed
+    // under us" and must reach the retraction below, not an error that
+    // leaves the fabrication standing.
+    let confirmed = match stream_sha256(storage, &entry.key).await {
+        Ok((now, _)) => now == sc.sha256,
         // Genuinely vanished after we hashed it — the exact hazard this confirm
         // guards; retract.
         Err(e) if is_not_found(&e) => false,
@@ -6445,6 +6459,102 @@ mod tests {
             "the fabricated sidecar must be retracted, not left for the next upload \
              of this immutable filename to inherit as a torn record"
         );
+    }
+
+    fn listed(key: &str, size: u64) -> FileEntry {
+        FileEntry {
+            key: key.to_string(),
+            size,
+            last_modified: Some("2026-01-01T00:00:00Z".to_string()),
+            etag: None,
+        }
+    }
+
+    /// A bare body can be a multi-GiB admin upload, with up to 64 backfills in
+    /// flight per package: the backfill must hash it as it streams. (The fake
+    /// refuses `get_bytes` above 1 KiB, which is the whole-body read it used.)
+    #[tokio::test]
+    async fn a_backfill_hashes_a_large_artifact_without_buffering_it() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = InMemStorage::default();
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+        let body = vec![42u8; 4096];
+        storage.insert(&key, body.clone());
+        storage.limit_get_bytes(1024);
+
+        let sc = backfill_sidecar(
+            &storage,
+            &listed(&key, 4096),
+            FILE,
+            Some(crate::origin::PRIVATE),
+        )
+        .await
+        .unwrap()
+        .expect("an intact body is backfilled");
+
+        assert_eq!(
+            (sc.sha256.as_str(), sc.size),
+            (sha256_hex(&body).as_str(), 4096)
+        );
+        assert!(storage.head_exists(&sidecar_key(&key)).await.unwrap());
+    }
+
+    /// A body that no longer weighs what the listing said was replaced in
+    /// between: hashing it and stamping the listed size would publish a
+    /// sidecar contradicting its own bytes. Fail the rebuild, fabricate nothing.
+    #[tokio::test]
+    async fn a_backfill_refuses_a_body_that_disagrees_with_its_listing() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = InMemStorage::default();
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+        storage.insert(&key, b"artifact".to_vec());
+
+        let error = backfill_sidecar(&storage, &listed(&key, 5), FILE, None)
+            .await
+            .unwrap_err();
+
+        assert!(format!("{error:#}").contains("listing said 5"), "{error:#}");
+        assert!(!storage.head_exists(&sidecar_key(&key)).await.unwrap());
+    }
+
+    /// The confirm read sees a body of a different length than the one it
+    /// hashed: that is "changed under us", so the fabrication is retracted —
+    /// a length mismatch there must not turn into an error that leaves it.
+    #[tokio::test]
+    async fn a_backfill_retracts_when_the_body_is_replaced_with_a_different_length() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = InMemStorage::default();
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+        storage.insert(&key, b"artifact".to_vec());
+        let replaced = key.clone();
+        storage.before_write_of(&sidecar_key(&key), move |objects| {
+            objects.insert(replaced, b"another artifact".to_vec());
+        });
+
+        let backfilled = backfill_sidecar(&storage, &listed(&key, 8), FILE, None)
+            .await
+            .unwrap();
+
+        assert!(backfilled.is_none());
+        assert!(!storage.head_exists(&sidecar_key(&key)).await.unwrap());
+    }
+
+    /// A body that cannot be read is not a body to describe: the rebuild
+    /// fails and nothing is fabricated.
+    #[tokio::test]
+    async fn a_backfill_whose_body_read_fails_fabricates_nothing() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let storage = InMemStorage::default();
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+        storage.insert(&key, b"artifact".to_vec());
+        storage.fail_reads_of(&key);
+
+        backfill_sidecar(&storage, &listed(&key, 8), FILE, None)
+            .await
+            .unwrap_err();
+
+        storage.heal_reads();
+        assert!(!storage.head_exists(&sidecar_key(&key)).await.unwrap());
     }
 
     /// A boot reconcile re-derives every denied name, including one the stamp

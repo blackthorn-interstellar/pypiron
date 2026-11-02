@@ -45,6 +45,7 @@ use crate::render::{
     pep503_global_html, pep503_project_html, pep691_global_json, pep691_project_json, FileMetadata,
     SIMPLE_HTML_CONTENT_TYPE, SIMPLE_JSON_CONTENT_TYPE,
 };
+use crate::replicate::{classify_record, listed, Origin, Record, RecordState};
 use crate::sidecar::{
     is_artifact, sidecar_key, Sidecar, Yanked, FROZEN_SUFFIX, METADATA_SUFFIX, PROVENANCE_SUFFIX,
     SIDECAR_SUFFIX, SUPERSEDING_SUFFIX, TOMBSTONE_SUFFIX,
@@ -4070,11 +4071,9 @@ async fn list_artifacts_for_claim(
     authoring: Option<time::Duration>,
 ) -> Result<(Vec<FileMetadata>, Vec<(String, u64)>)> {
     let backfill_missing = authoring.is_some();
-    let pkg_origin = match crate::origin::read_origin_claim(storage, pkg).await? {
-        Some(crate::origin::OriginState::Private) => Some(crate::origin::PRIVATE),
-        Some(crate::origin::OriginState::Mirror) => Some(crate::origin::MIRROR),
-        Some(crate::origin::OriginState::Unclaimed) | None => None,
-    };
+    let claim: Option<Origin> = crate::origin::read_origin_claim(storage, pkg)
+        .await?
+        .and_then(|state| state.try_into().ok());
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let mut entries = storage.list_dir_entries(&prefix).await?;
     // A `.superseding` marker is a replication supersede that may have written
@@ -4112,20 +4111,6 @@ async fn list_artifacts_for_claim(
         .iter()
         .filter_map(|e| e.key.strip_prefix(&prefix))
         .collect();
-    // Tombstoned filenames leave every index: a delete
-    // that crashed after the tombstone but before the artifact removal converges
-    // to "gone" here, rather than resurrecting the file.
-    let tombstoned: HashSet<&str> = names
-        .iter()
-        .filter_map(|f| f.strip_suffix(TOMBSTONE_SUFFIX))
-        .collect();
-    // Frozen filenames are likewise suppressed: a
-    // byte conflict moved both bodies to `_quarantine/` and dropped a `.frozen`
-    // marker; the name must not resolve on any bucket until a human resolves it.
-    let frozen: HashSet<&str> = names
-        .iter()
-        .filter_map(|f| f.strip_suffix(FROZEN_SUFFIX))
-        .collect();
     // Sidecar reads fan out with bounded concurrency: a 2,000-file package
     // costs 2,000 GETs, and doing them serially put rebuilds at minutes of
     // wall clock on S3. Chunked join_all keeps listing order — index output
@@ -4141,8 +4126,7 @@ async fn list_artifacts_for_claim(
         .iter()
         .filter_map(|entry| {
             let filename = entry.key.strip_prefix(&prefix)?;
-            (is_artifact(filename) && !tombstoned.contains(filename) && !frozen.contains(filename))
-                .then_some((entry, filename))
+            is_artifact(filename).then_some((entry, filename))
         })
         .collect();
     // Each listed sidecar's change detector: a sidecar the last rebuild parsed
@@ -4177,7 +4161,7 @@ async fn list_artifacts_for_claim(
                 entry,
                 filename,
                 &names,
-                pkg_origin,
+                claim,
                 backfill_missing,
                 SidecarMemo {
                     etag,
@@ -4229,28 +4213,34 @@ struct SidecarMemo<'a> {
 }
 
 /// Load one artifact's index entry from its sidecar (backfilling if absent).
-/// `Ok(None)` means "leave it out of the index" — a deliberate omission whose
-/// reason is logged inside. `Err` is an availability failure reading storage: it
-/// must fail the whole rebuild so the package's `_dirty/` markers are retained
-/// and the next tick retries, rather than deriving a wrong (often empty) view
-/// from a transient error and letting the caller consume the markers.
+/// Whether it is listed at all is [`listed`]'s answer over the record, asked
+/// again after a backfill — the sidecar a lost backfill race hands back is
+/// another writer's, and may be a late mirror. `Ok(None)` means "leave it out
+/// of the index" — a deliberate omission whose reason is logged inside. `Err`
+/// is an availability failure reading storage: it must fail the whole rebuild
+/// so the package's `_dirty/` markers are retained and the next tick retries,
+/// rather than deriving a wrong (often empty) view from a transient error and
+/// letting the caller consume the markers.
 async fn load_file_metadata(
     storage: &dyn Storage,
     entry: &FileEntry,
     filename: &str,
     names: &HashSet<&str>,
-    pkg_origin: Option<&str>,
+    claim: Option<Origin>,
     backfill_missing: bool,
     memo: SidecarMemo<'_>,
 ) -> Result<Option<FileMetadata>> {
-    let has_sidecar = names.contains(format!("{filename}{SIDECAR_SUFFIX}").as_str());
-    let mirror_quarantined =
-        names.contains(format!("{filename}{}", crate::sidecar::MIRROR_QUARANTINED_SUFFIX).as_str());
-    if mirror_quarantined && !has_sidecar {
-        warn!(key=%entry.key, "quarantined mirror artifact has no sidecar; omitting from index");
-        return Ok(None);
-    }
-    let sc = if has_sidecar {
+    let has = |suffix: &str| names.contains(format!("{filename}{suffix}").as_str());
+    let record = |sidecar| Record::from_listing(has, sidecar, claim);
+    // A delete or freeze hides the file whatever its sidecar says (a law the
+    // classifier's tests pin), so a fenced body is never read for nothing.
+    let mut rec = record(None);
+    if has(SIDECAR_SUFFIX)
+        && !matches!(
+            classify_record(&rec),
+            RecordState::Tombstoned { .. } | RecordState::Frozen { .. }
+        )
+    {
         let sc = match memo.known {
             Some(sc) => sc.clone(),
             None => match read_listed_sidecar(storage, &entry.key).await? {
@@ -4265,25 +4255,28 @@ async fn load_file_metadata(
                 .sidecars
                 .insert(filename.to_string(), (etag.to_string(), sc.clone()));
         }
-        sc
-    } else if backfill_missing {
-        match backfill_sidecar(storage, entry, filename, pkg_origin).await? {
-            Some(sc) => sc,
+        rec = record(Some(sc));
+    }
+    if backfill_missing && classify_record(&rec) == RecordState::Bare {
+        match backfill_sidecar(storage, entry, filename, claim.map(Origin::as_str)).await? {
+            Some(sc) => rec = record(Some(sc)),
             None => return Ok(None),
         }
-    } else {
+    }
+    if !listed(&rec, claim) {
+        match classify_record(&rec) {
+            // Deliberate and routine: a delete or freeze in progress, or a
+            // read-only render leaving a bare body to the backfill.
+            RecordState::Tombstoned { .. } | RecordState::Frozen { .. } | RecordState::Bare => {}
+            state => {
+                warn!(key=%entry.key, ?state, "artifact is not listable (demoted, or a mirror under a private claim); omitting from index");
+            }
+        }
+        return Ok(None);
+    }
+    let Some(sc) = rec.sidecar else {
         return Ok(None);
     };
-    if pkg_origin == Some(crate::origin::PRIVATE)
-        && sc.origin.as_deref() == Some(crate::origin::MIRROR)
-    {
-        warn!(key=%entry.key, "mirror artifact under private package claim; omitting from index");
-        return Ok(None);
-    }
-    if mirror_quarantined && sc.origin.as_deref() != Some(crate::origin::PRIVATE) {
-        warn!(key=%entry.key, "quarantined mirror artifact remains non-private; omitting from index");
-        return Ok(None);
-    }
     let core_metadata_sha256 = if names.contains(format!("{filename}{METADATA_SUFFIX}").as_str()) {
         match memo.known_metadata {
             Some(sha) => Some(sha.to_string()),
@@ -6515,6 +6508,46 @@ mod tests {
 
         assert!(format!("{error:#}").contains("listing said 5"), "{error:#}");
         assert!(!storage.head_exists(&sidecar_key(&key)).await.unwrap());
+    }
+
+    /// Listing is asked again after a backfill: one that loses its create to
+    /// another writer renders THAT writer's sidecar, and under a private claim
+    /// a mirror one is a late mirror no index may show. Without the race the
+    /// same bare body backfills to private truth and is listed.
+    #[tokio::test]
+    async fn a_backfill_that_loses_to_a_late_mirror_lists_nothing() {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+        for raced in [false, true] {
+            let storage = InMemStorage::default();
+            crate::origin::claim_origin(&storage, "alpha", crate::origin::PRIVATE)
+                .await
+                .unwrap();
+            storage.insert(&key, b"artifact".to_vec());
+            if raced {
+                let late = serde_json::to_vec(&serde_json::json!({
+                    "sha256": sha256_hex(b"artifact"),
+                    "size": 8,
+                    "version": "1.0",
+                    "upload-time": "2026-01-01T00:00:00Z",
+                    "origin": crate::origin::MIRROR,
+                }))
+                .unwrap();
+                let sc_key = sidecar_key(&key);
+                storage.before_write_of(&sc_key.clone(), move |objects| {
+                    objects.insert(sc_key, late);
+                });
+            }
+            let (files, _) = list_artifacts(
+                &storage,
+                &SidecarCache::default(),
+                "alpha",
+                time::Duration::seconds(60),
+            )
+            .await
+            .unwrap();
+            assert_eq!(files.len(), usize::from(!raced), "raced: {raced}");
+        }
     }
 
     /// The confirm read sees a body of a different length than the one it

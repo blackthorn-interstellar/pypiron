@@ -2027,26 +2027,18 @@ fn record_names(
 /// `replicate`'s reader assembles it.
 fn record_from_dump(dump: &BTreeMap<String, Vec<u8>>, pkg: &str, fname: &str) -> Record {
     let akey = format!("packages/{pkg}/{fname}");
-    let has = |suffix: &str| dump.contains_key(&format!("{akey}{suffix}"));
-    Record {
-        sidecar: dump
-            .get(&format!("{akey}.meta.json"))
+    Record::from_listing(
+        |suffix| dump.contains_key(&format!("{akey}{suffix}")),
+        dump.get(&format!("{akey}.meta.json"))
             .and_then(|bytes| serde_json::from_slice(bytes).ok()),
-        has_artifact: dump.contains_key(&akey),
-        has_metadata: has(".metadata"),
-        has_provenance: has(".provenance"),
-        tombstoned: has(".tombstone"),
-        frozen: has(".frozen"),
-        mirror_quarantined: has(".mirror-quarantined"),
-        pkg_origin: dump
-            .get(&format!("packages/{pkg}/.origin"))
+        dump.get(&format!("packages/{pkg}/.origin"))
             .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(bytes).ok())
             .and_then(|doc| {
                 doc.get("origin")
                     .and_then(|o| o.as_str())
                     .and_then(pypiron::replicate::Origin::parse)
             }),
-    }
+    )
 }
 
 /// Run every bucket pair x filename through the real merge decision and tally

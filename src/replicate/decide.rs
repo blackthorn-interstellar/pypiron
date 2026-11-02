@@ -14,7 +14,10 @@
 //! pairs sync in.
 
 use crate::origin::{OriginState, MIRROR, PRIVATE};
-use crate::sidecar::{Sidecar, Yanked};
+use crate::sidecar::{
+    Sidecar, Yanked, FROZEN_SUFFIX, METADATA_SUFFIX, MIRROR_QUARANTINED_SUFFIX, PROVENANCE_SUFFIX,
+    SUPERSEDING_SUFFIX, TOMBSTONE_SUFFIX,
+};
 use crate::status::{ProjectStatusDoc, VersionedProjectStatus};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,6 +49,14 @@ impl Origin {
             .and_then(|state| state.try_into().ok())
     }
 
+    /// The persisted lowercase form (`"private"`/`"mirror"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Origin::Private => PRIVATE,
+            Origin::Mirror => MIRROR,
+        }
+    }
+
     /// The one origin precedence every merge ranks by: private ≻ mirror.
     /// Private is the operator's own truth; mirror is a copy of upstream.
     pub fn rank(self) -> u8 {
@@ -74,7 +85,7 @@ pub fn claim_join(a: Option<Origin>, b: Option<Origin>) -> Option<Origin> {
 pub(crate) fn is_late_mirror(record: &Record, pkg_origin: Option<Origin>) -> bool {
     pkg_origin == Some(Origin::Private)
         && matches!(
-            record.state(),
+            classify_record(record),
             RecordState::Live {
                 origin: Origin::Mirror,
                 ..
@@ -98,6 +109,8 @@ impl TryFrom<OriginState> for Origin {
 
 /// One bucket's view of a single filename in a package: which of its objects
 /// exist, and (if readable) the sidecar that carries sha256/origin/yank state.
+/// Raw facts only — what they *mean* is [`classify_record`]'s answer, and no
+/// consumer reads the flags to decide anything on its own.
 #[derive(Clone, Debug)]
 pub struct Record {
     pub sidecar: Option<Sidecar>,
@@ -107,34 +120,88 @@ pub struct Record {
     pub tombstoned: bool,
     pub frozen: bool,
     pub mirror_quarantined: bool,
+    /// A `.superseding` marker: a replication supersede may sit between
+    /// writing the body and publishing the sidecar that names it.
+    pub superseding: bool,
     /// Package-level origin, used only as a fallback when a live artifact's
     /// sidecar omits its own `origin` (a legacy/backfilled record).
     pub pkg_origin: Option<Origin>,
 }
 
-/// The normalized state a [`Record`] resolves to for the merge.
+/// What one bucket's objects under `packages/<pkg>/<file>` mean. The one
+/// reading the merge ([`decide`]), the index renderer, the upload-time repair
+/// and the yank all match on, so a new rule lands in one place. Torn states
+/// are named, not left to raw flags: `settled: false` is a crash mid-operation
+/// whose next pass has something left to finish.
+///
+/// `.superseding` is not a state of its own: it marks a [`RecordState::Live`]
+/// record whose body may be ahead of its sidecar, and only a re-hash (the
+/// index rebuild's `finish_interrupted_supersedes`) can say which way it tore.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum RecordState {
-    Tombstoned,
-    Frozen,
+    /// A `.frozen` marker stands: two buckets committed different bytes under
+    /// this name. Settled is the freeze's whole footprint and nothing else —
+    /// the marker, its tombstone, and no body, sidecar, companion or demotion
+    /// fence. Unsettled is a freeze torn mid-way: the tombstone not yet
+    /// written, or the record not yet dropped.
+    Frozen { settled: bool },
+    /// A `.tombstone` with no `.frozen`: deleted for good. Unsettled is a
+    /// delete that crashed mid-removal — the body still standing, or a sidecar,
+    /// companion or now-subsumed demotion fence left beside it.
+    Tombstoned { settled: bool },
     /// A mirror→private demotion: the `.mirror-quarantined` fence stands over
-    /// this filename. Once settled the canonical key is empty and the losing
-    /// body sits in this bucket's own `_quarantine/`; until then a body and its
-    /// mirror sidecar may still be standing. Absent for ordinary union, but a
-    /// private peer may supersede the name directly per artifact.
-    QuarantinedMirror,
+    /// a record that is not private truth. Settled once the canonical key is
+    /// empty (the losing body sits in this bucket's own `_quarantine/`);
+    /// unsettled while a body, sidecar or companion still stands under it.
+    /// A private sidecar under the fence is [`RecordState::Live`] instead — a
+    /// spent fence, which the merge clears.
+    QuarantinedMirror { settled: bool },
+    /// A body and a typed sidecar: the record an index lists. `superseding`
+    /// while a replication supersede may still be installing its sidecar.
     Live {
         sha: String,
         origin: Origin,
+        superseding: bool,
     },
-    /// An artifact with no readable/typed sidecar — never replicated as-is (that
-    /// would fabricate truth, §4); the bucket's own audit backfills a sidecar
-    /// first, promoting it to `Live` on a later pass.
-    Orphan,
-    Absent,
+    /// A body with no sidecar, awaiting its own bucket's backfill. Never
+    /// replicated as-is (that would fabricate truth, §4) nor listed.
+    Bare,
+    /// A body whose sidecar names no typed origin, in a package with no claim
+    /// to fall back to (a legacy record). Listed, but never replicated.
+    Untyped,
+    /// No body and no fence. `debris` when a sidecar or companion was left
+    /// anyway — a crashed sidecar-first copy, or a best-effort companion
+    /// delete — which the audit drops. The merge reads both as absent.
+    Absent { debris: bool },
 }
 
 impl Record {
+    /// Assemble a record from which of a filename's objects exist (`has` is
+    /// asked for each suffix, `""` meaning the body itself), its parsed
+    /// sidecar, and the package claim. The claim is kept only as the fallback
+    /// origin of a body whose sidecar carries none; anywhere else it would
+    /// type a tombstone.
+    pub fn from_listing(
+        has: impl Fn(&str) -> bool,
+        sidecar: Option<Sidecar>,
+        claim: Option<Origin>,
+    ) -> Record {
+        let has_artifact = has("");
+        let needs_fallback =
+            has_artifact && sidecar.as_ref().and_then(|s| s.origin.as_deref()).is_none();
+        Record {
+            has_artifact,
+            has_metadata: has(METADATA_SUFFIX),
+            has_provenance: has(PROVENANCE_SUFFIX),
+            tombstoned: has(TOMBSTONE_SUFFIX),
+            frozen: has(FROZEN_SUFFIX),
+            mirror_quarantined: has(MIRROR_QUARANTINED_SUFFIX),
+            superseding: has(SUPERSEDING_SUFFIX),
+            pkg_origin: claim.filter(|_| needs_fallback),
+            sidecar,
+        }
+    }
+
     pub fn origin(&self) -> Option<Origin> {
         self.sidecar
             .as_ref()
@@ -142,36 +209,54 @@ impl Record {
             .and_then(Origin::parse)
             .or(self.pkg_origin)
     }
+}
 
-    pub fn state(&self) -> RecordState {
-        if self.tombstoned {
-            return RecordState::Tombstoned;
-        }
-        if self.frozen {
-            return RecordState::Frozen;
-        }
-        if self.mirror_quarantined {
-            match self
-                .sidecar
-                .as_ref()
-                .and_then(|sidecar| sidecar.origin.as_deref())
-            {
-                Some(PRIVATE) => {}
-                Some(MIRROR) | None => return RecordState::QuarantinedMirror,
-                Some(_) => {}
-            }
-        }
-        if !self.has_artifact {
-            return RecordState::Absent;
-        }
-        match (self.sidecar.as_ref(), self.origin()) {
-            (Some(sc), Some(origin)) => RecordState::Live {
-                sha: sc.sha256.clone(),
-                origin,
-            },
-            _ => RecordState::Orphan,
-        }
+/// The meaning of one bucket's record. Precedence: freeze ≻ tombstone ≻
+/// demotion fence ≻ body. A freeze and a tombstone read the same whatever the
+/// sidecar says; a demotion fence yields only to a private sidecar.
+pub fn classify_record(r: &Record) -> RecordState {
+    // `.superseding` is deliberately not a leftover: the delete path removes
+    // it, but nothing reaps one beside a bare tombstone, so counting it would
+    // re-fire a settled delete forever.
+    let leftovers = r.has_artifact || r.sidecar.is_some() || r.has_metadata || r.has_provenance;
+    if r.frozen {
+        return RecordState::Frozen {
+            settled: r.tombstoned && !leftovers && !r.mirror_quarantined,
+        };
     }
+    if r.tombstoned {
+        return RecordState::Tombstoned {
+            settled: !leftovers && !r.mirror_quarantined,
+        };
+    }
+    if r.mirror_quarantined && r.sidecar.as_ref().and_then(|s| s.origin.as_deref()) != Some(PRIVATE)
+    {
+        return RecordState::QuarantinedMirror {
+            settled: !leftovers,
+        };
+    }
+    if !r.has_artifact {
+        return RecordState::Absent { debris: leftovers };
+    }
+    match (r.sidecar.as_ref(), r.origin()) {
+        (None, _) => RecordState::Bare,
+        (Some(_), None) => RecordState::Untyped,
+        (Some(sc), Some(origin)) => RecordState::Live {
+            sha: sc.sha256.clone(),
+            origin,
+            superseding: r.superseding,
+        },
+    }
+}
+
+/// Whether an index lists this record: live and not a late mirror. The one
+/// rule the renderer and the sidecar edits share, so an edit is never acked
+/// for a file no index shows. `claim` is the package's origin claim.
+pub fn listed(record: &Record, claim: Option<Origin>) -> bool {
+    matches!(
+        classify_record(record),
+        RecordState::Live { .. } | RecordState::Untyped
+    ) && !is_late_mirror(record, claim)
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -194,7 +279,8 @@ pub enum Verdict {
     /// not agree and the ack claims a durability the fleet does not have
     /// (dev/DESIGN.md's totality principle).
     ///
-    /// Both bugs this cost were the same mistake: `(Orphan, _)` (`fd14f01`) and
+    /// Both bugs this cost were the same mistake: `(Orphan, _)` (`fd14f01`,
+    /// now [`RecordState::Bare`]) and
     /// `(QuarantinedMirror, _)` (`4bb9cb8`), each a pair where one bucket held a
     /// record or a fence and the other had never heard of it. Both read as
     /// harmless no-ops and both acked uploads no peer held. If a new arm cannot
@@ -224,13 +310,15 @@ pub enum Verdict {
     QuarantineLoser(Side),
     /// Both sides committed different bytes under one filename: freeze both.
     Freeze,
-    /// At least one side is tombstoned and the sides disagree: delete the file
-    /// and tombstone both (tombstone ≻ everything).
+    /// At least one side is tombstoned (neither frozen) and the sides
+    /// disagree: delete the file and tombstone both (tombstone ≻ all but a
+    /// freeze).
     Tombstone,
-    /// The `Side` carries a freeze marker the other lacks: propagate the freeze.
+    /// The `Side` holds a settled freeze the other lacks: freeze the other.
     PropagateFreeze(Side),
-    /// Both markers exist but at least one retained canonical body still needs
-    /// its idempotent quarantine copy verified after an interrupted freeze.
+    /// At least one side's freeze is torn — its tombstone missing, or a body,
+    /// sidecar, companion or demotion fence still standing: run the idempotent
+    /// freeze on both, so neither is reported converged half-finished.
     FinishFreeze,
     /// At least one bucket demoted this filename mirror→private, and the pair
     /// is not settled: a peer has never heard of the demotion, or a canonical
@@ -246,74 +334,51 @@ pub enum Verdict {
     SettleMirrorQuarantine,
 }
 
-/// The core merge decision. No I/O, no clocks; every
-/// input is bucket state. Unit-tested exhaustively below.
-/// A tombstoned record with nothing left to clean: no body, no sidecar, no
-/// companions. Only this settles a delete — a sidecar or companion orphaned
-/// beside its tombstone (a delete that crashed between removing the artifact
-/// and removing its companions) must keep re-firing until dropped, or the
-/// debris survives every future diff.
-fn settled_delete(record: &Record) -> bool {
-    !record.has_artifact
-        && record.sidecar.is_none()
-        && !record.has_metadata
-        && !record.has_provenance
-}
-
+/// The core merge decision. No I/O, no clocks; every input is bucket state,
+/// and it reads that state only through [`classify_record`]. Unit-tested
+/// exhaustively below.
 pub fn decide(a: &Record, b: &Record) -> Verdict {
-    // Tombstone ≻ everything. Converged (both tombstoned, nothing left to
-    // clean) is a no-op so a settled delete never re-fires each diff. A
-    // surviving `.mirror-quarantined` is debris here exactly as an orphaned
-    // sidecar is: a tombstone bars the filename permanently, which strictly
-    // subsumes the demotion fence, so the delete path removes it — and until it
-    // is gone the two buckets are one key apart.
-    if a.tombstoned || b.tombstoned {
-        if a.tombstoned
-            && b.tombstoned
-            && a.frozen == b.frozen
-            && !a.mirror_quarantined
-            && !b.mirror_quarantined
-            && settled_delete(a)
-            && settled_delete(b)
-        {
-            return Verdict::Noop;
-        }
-        return Verdict::Tombstone;
-    }
-    // Freeze markers propagate. Both markers are settled only once both live
-    // bodies are gone; a failed delete must be retried on the next pass.
-    match (a.frozen, b.frozen) {
-        (true, true) if a.has_artifact || b.has_artifact => return Verdict::FinishFreeze,
-        (true, true) => return Verdict::Noop,
-        (true, false) => return Verdict::PropagateFreeze(Side::A),
-        (false, true) => return Verdict::PropagateFreeze(Side::B),
-        (false, false) => {}
-    }
-
     use RecordState::*;
-    match (a.state(), b.state()) {
+    match (classify_record(a), classify_record(b)) {
+        // Freeze ≻ tombstone ≻ everything: a freeze carries a tombstone as its
+        // permanent upload fence, and handling the pair as a bare delete would
+        // degrade a fleet-wide freeze one hop at a time. A settled freeze only
+        // needs to reach a peer that lacks it; any torn freeze — a missing
+        // tombstone, a body or debris still standing — finishes on BOTH sides
+        // before the pass may report convergence.
+        (Frozen { settled: true }, Frozen { settled: true }) => Verdict::Noop,
+        (Frozen { .. }, Frozen { .. }) => Verdict::FinishFreeze,
+        (Frozen { settled: true }, _) => Verdict::PropagateFreeze(Side::A),
+        (_, Frozen { settled: true }) => Verdict::PropagateFreeze(Side::B),
+        (Frozen { .. }, _) | (_, Frozen { .. }) => Verdict::FinishFreeze,
+        // Converged (both tombstoned, nothing left to clean) is a no-op so a
+        // settled delete never re-fires each diff. Debris beside a tombstone —
+        // a sidecar, companion or subsumed demotion fence — keeps it firing
+        // until the delete path drops it.
+        (Tombstoned { settled: true }, Tombstoned { settled: true }) => Verdict::Noop,
+        (Tombstoned { .. }, _) | (_, Tombstoned { .. }) => Verdict::Tombstone,
         // Wait for the local audit to backfill a sidecar before comparing —
         // never fabricate cross-bucket truth from a bare artifact (§4). A
         // deferral, never a convergence: the bucket holding the bare artifact
         // holds no record, so whoever asked is still owed one.
-        (Orphan, _) | (_, Orphan) => Verdict::Defer,
-        (Absent, Absent) => Verdict::Noop,
+        (Bare | Untyped, _) | (_, Bare | Untyped) => Verdict::Defer,
+        (Absent { .. }, Absent { .. }) => Verdict::Noop,
         // Every live record copies to an absent peer: private truth, a `sync --to`
         // snapshot, and a proxy-cache fill alike. The snapshot/cache distinction is
         // write-time provenance (it picks the *propagation mechanism* — pre-ack
         // fan-out vs an async `_repl/` note — not *whether* a mirror record
         // replicates). The merge no longer branches on it.
-        (Live { .. }, Absent) => Verdict::Copy(Side::A),
-        (Absent, Live { .. }) => Verdict::Copy(Side::B),
+        (Live { .. }, Absent { .. }) => Verdict::Copy(Side::A),
+        (Absent { .. }, Live { .. }) => Verdict::Copy(Side::B),
         (
             Live {
                 origin: Origin::Private,
                 ..
             },
-            QuarantinedMirror,
+            QuarantinedMirror { .. },
         ) => Verdict::Supersede(Side::A),
         (
-            QuarantinedMirror,
+            QuarantinedMirror { .. },
             Live {
                 origin: Origin::Private,
                 ..
@@ -323,18 +388,20 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
         // still holds a canonical record under it. Anything else — a peer that
         // never heard of the demotion, or a body still standing behind the
         // fence — is an unconverged suppression, not an agreement.
-        (QuarantinedMirror, QuarantinedMirror) if settled_delete(a) && settled_delete(b) => {
-            Verdict::Noop
+        (QuarantinedMirror { settled: true }, QuarantinedMirror { settled: true }) => Verdict::Noop,
+        (QuarantinedMirror { .. }, _) | (_, QuarantinedMirror { .. }) => {
+            Verdict::SettleMirrorQuarantine
         }
-        (QuarantinedMirror, _) | (_, QuarantinedMirror) => Verdict::SettleMirrorQuarantine,
         (
             Live {
                 sha: sa,
                 origin: oa,
+                ..
             },
             Live {
                 sha: sb,
                 origin: ob,
+                ..
             },
         ) => {
             if sa == sb {
@@ -358,9 +425,6 @@ pub fn decide(a: &Record, b: &Record) -> Verdict {
                 }
             }
         }
-        // Tombstoned/Frozen states are resolved before this match; this arm only
-        // exists to keep the match total.
-        (Tombstoned | Frozen, _) | (_, Tombstoned | Frozen) => Verdict::Noop,
     }
 }
 
@@ -516,6 +580,7 @@ pub(crate) mod tests {
             tombstoned: false,
             frozen: false,
             mirror_quarantined: false,
+            superseding: false,
             pkg_origin: None,
         }
     }
@@ -552,6 +617,7 @@ pub(crate) mod tests {
             tombstoned: false,
             frozen: false,
             mirror_quarantined: false,
+            superseding: false,
             pkg_origin: None,
         }
     }
@@ -757,32 +823,71 @@ pub(crate) mod tests {
         let mut t2 = absent();
         t2.tombstoned = true;
         assert_eq!(decide(&t, &t2), Verdict::Noop);
+        // A freeze outranks a tombstone: the bare delete is the side to freeze.
         let mut frozen_tombstone = t2.clone();
         frozen_tombstone.frozen = true;
-        assert_eq!(decide(&t, &frozen_tombstone), Verdict::Tombstone);
+        assert_eq!(
+            decide(&t, &frozen_tombstone),
+            Verdict::PropagateFreeze(Side::B)
+        );
+    }
+
+    /// A settled freeze: the marker and the tombstone it writes, nothing else.
+    fn frozen() -> Record {
+        Record {
+            frozen: true,
+            tombstoned: true,
+            ..absent()
+        }
     }
 
     #[test]
     fn freeze_marker_propagates_then_settles() {
-        let mut f = absent();
-        f.frozen = true;
         assert_eq!(
-            decide(&f, &live("x", PRIVATE)),
+            decide(&frozen(), &live("x", PRIVATE)),
             Verdict::PropagateFreeze(Side::A)
         );
         assert_eq!(
-            decide(&live("x", PRIVATE), &f),
+            decide(&live("x", PRIVATE), &frozen()),
             Verdict::PropagateFreeze(Side::B)
         );
-        let mut f2 = absent();
-        f2.frozen = true;
-        assert_eq!(decide(&f, &f2), Verdict::Noop);
+        assert_eq!(decide(&frozen(), &frozen()), Verdict::Noop);
 
         let mut dirty_a = live("x", PRIVATE);
         dirty_a.frozen = true;
         let mut dirty_b = live("y", PRIVATE);
         dirty_b.frozen = true;
         assert_eq!(decide(&dirty_a, &dirty_b), Verdict::FinishFreeze);
+    }
+
+    #[test]
+    fn a_torn_freeze_missing_its_tombstone_finishes() {
+        // `freeze_side` writes `.frozen` first and the tombstone after it. Two
+        // buckets that both crashed in between used to read as converged —
+        // `Noop` forever, the filename's permanent upload fence never written.
+        let torn = Record {
+            frozen: true,
+            ..absent()
+        };
+        assert_eq!(decide(&torn, &torn.clone()), Verdict::FinishFreeze);
+        assert_eq!(decide(&torn, &frozen()), Verdict::FinishFreeze);
+        // Against an unfrozen peer the torn side must finish too: freezing the
+        // peer alone would report convergence over a half-finished freeze.
+        assert_eq!(decide(&torn, &live("x", PRIVATE)), Verdict::FinishFreeze);
+        assert_eq!(decide(&absent(), &torn), Verdict::FinishFreeze);
+    }
+
+    #[test]
+    fn a_frozen_side_with_debris_finishes_both_sides() {
+        // Frozen and tombstoned, but a sidecar survived the drop: a settled
+        // peer is not enough, the debris side has to be finished as well.
+        let debris = Record {
+            sidecar: Some(sc("x", PRIVATE, Yanked::Flag(false), 0)),
+            ..frozen()
+        };
+        assert_eq!(decide(&debris, &absent()), Verdict::FinishFreeze);
+        assert_eq!(decide(&live("x", PRIVATE), &debris), Verdict::FinishFreeze);
+        assert_eq!(decide(&debris, &frozen()), Verdict::FinishFreeze);
     }
 
     #[test]
@@ -975,14 +1080,8 @@ pub(crate) mod tests {
     fn orphan_artifact_defers() {
         // Artifact present, no sidecar: wait for the local backfill.
         let orphan = Record {
-            sidecar: None,
             has_artifact: true,
-            has_metadata: false,
-            has_provenance: false,
-            tombstoned: false,
-            frozen: false,
-            mirror_quarantined: false,
-            pkg_origin: None,
+            ..absent()
         };
         // A deferral, not a `Noop`: the orphan side holds no record, so the
         // pair is not converged and the caller still owes it one.
@@ -1165,15 +1264,16 @@ pub(crate) mod tests {
 
         let mut records = Vec::new();
         for sidecar in &sidecars {
-            for bits in 0..16u8 {
+            for bits in 0..64u8 {
                 records.push(Record {
                     sidecar: sidecar.clone(),
                     has_artifact: bits & 1 != 0,
-                    has_metadata: false,
+                    has_metadata: bits & 16 != 0,
                     has_provenance: false,
                     tombstoned: bits & 2 != 0,
                     frozen: bits & 4 != 0,
                     mirror_quarantined: bits & 8 != 0,
+                    superseding: bits & 32 != 0,
                     pkg_origin: None,
                 });
             }
@@ -1187,5 +1287,284 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    // ---------------------------------------------------------------------
+    // The classifier. Every consumer — merge, render, edits — reads a record
+    // only through it, so its laws are checked over the whole fact space.
+    // ---------------------------------------------------------------------
+
+    const SUFFIXES: [&str; 7] = [
+        "",
+        METADATA_SUFFIX,
+        PROVENANCE_SUFFIX,
+        TOMBSTONE_SUFFIX,
+        FROZEN_SUFFIX,
+        MIRROR_QUARANTINED_SUFFIX,
+        SUPERSEDING_SUFFIX,
+    ];
+
+    /// A record with exactly the objects named by `suffixes` (`""` = body).
+    fn with(suffixes: &[&str], sidecar: Option<Sidecar>, claim: Option<Origin>) -> Record {
+        Record::from_listing(|suffix| suffixes.contains(&suffix), sidecar, claim)
+    }
+
+    fn untyped() -> Sidecar {
+        Sidecar {
+            origin: None,
+            ..sc("x", PRIVATE, Yanked::Flag(false), 0)
+        }
+    }
+
+    /// Every combination of objects × sidecar kind × claim, as records.
+    fn every_record() -> Vec<Record> {
+        let sidecars = [
+            None,
+            Some(sc("x", PRIVATE, Yanked::Flag(false), 0)),
+            Some(sc("x", MIRROR, Yanked::Flag(false), 0)),
+            Some(untyped()),
+            Some(sc("x", "bogus", Yanked::Flag(false), 0)),
+        ];
+        let mut out = Vec::new();
+        for bits in 0..1u32 << SUFFIXES.len() {
+            let present: Vec<&str> = SUFFIXES
+                .iter()
+                .enumerate()
+                .filter(|(i, _)| bits & (1 << i) != 0)
+                .map(|(_, suffix)| *suffix)
+                .collect();
+            for sidecar in &sidecars {
+                for claim in [None, Some(Origin::Private), Some(Origin::Mirror)] {
+                    out.push(with(&present, sidecar.clone(), claim));
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn classify_record_fences_dominate_and_settled_means_empty() {
+        use RecordState::*;
+        for r in every_record() {
+            let state = classify_record(&r);
+            let leftovers =
+                r.has_artifact || r.sidecar.is_some() || r.has_metadata || r.has_provenance;
+            match &state {
+                Frozen { settled } => {
+                    assert!(r.frozen, "{r:?}");
+                    assert_eq!(
+                        *settled,
+                        r.tombstoned && !leftovers && !r.mirror_quarantined,
+                        "{r:?}"
+                    );
+                }
+                Tombstoned { settled } => {
+                    assert!(r.tombstoned && !r.frozen, "{r:?}");
+                    assert_eq!(*settled, !leftovers && !r.mirror_quarantined, "{r:?}");
+                }
+                QuarantinedMirror { settled } => {
+                    assert!(r.mirror_quarantined && !r.tombstoned && !r.frozen, "{r:?}");
+                    assert_eq!(*settled, !leftovers, "{r:?}");
+                }
+                Live { sha, .. } => {
+                    assert!(r.has_artifact && !r.tombstoned && !r.frozen, "{r:?}");
+                    assert_eq!(
+                        r.sidecar.as_ref().map(|s| s.sha256.as_str()),
+                        Some(sha.as_str())
+                    );
+                }
+                Bare => assert!(r.has_artifact && r.sidecar.is_none(), "{r:?}"),
+                Untyped => assert!(r.has_artifact && r.origin().is_none(), "{r:?}"),
+                Absent { debris } => {
+                    assert!(!r.has_artifact && !r.tombstoned && !r.frozen, "{r:?}");
+                    assert_eq!(*debris, leftovers, "{r:?}");
+                }
+            }
+            if r.frozen || r.tombstoned {
+                // A freeze or a tombstone reads the same whatever the sidecar
+                // says — only its presence (debris) can move `settled`.
+                if let Some(sidecar) = &r.sidecar {
+                    for origin in [Some(PRIVATE), Some(MIRROR), None] {
+                        let swapped = Record {
+                            sidecar: Some(Sidecar {
+                                origin: origin.map(str::to_string),
+                                ..sidecar.clone()
+                            }),
+                            ..r.clone()
+                        };
+                        assert_eq!(classify_record(&swapped), state, "{r:?}");
+                    }
+                }
+            }
+            // Only a live record may be listed; a fence never is.
+            if listed(&r, None) || listed(&r, Some(Origin::Mirror)) {
+                assert!(matches!(state, Live { .. } | Untyped), "{r:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn classify_record_names_every_torn_state() {
+        use RecordState::*;
+        let private = || Some(sc("x", PRIVATE, Yanked::Flag(false), 0));
+        let mirror = || Some(sc("x", MIRROR, Yanked::Flag(false), 0));
+        let live = |origin, superseding| Live {
+            sha: "x".into(),
+            origin,
+            superseding,
+        };
+        let cases: Vec<(&str, Record, RecordState)> = vec![
+            (
+                "crashed delete: tombstone beside a standing body",
+                with(&["", TOMBSTONE_SUFFIX], private(), None),
+                Tombstoned { settled: false },
+            ),
+            (
+                "crashed delete: sidecar left beside a tombstone",
+                with(&[TOMBSTONE_SUFFIX], private(), None),
+                Tombstoned { settled: false },
+            ),
+            (
+                "crashed delete: companion left beside a tombstone",
+                with(&[TOMBSTONE_SUFFIX, METADATA_SUFFIX], None, None),
+                Tombstoned { settled: false },
+            ),
+            (
+                "tombstone over a subsumed demotion fence",
+                with(&[TOMBSTONE_SUFFIX, MIRROR_QUARANTINED_SUFFIX], None, None),
+                Tombstoned { settled: false },
+            ),
+            (
+                "settled delete",
+                with(&[TOMBSTONE_SUFFIX], None, None),
+                Tombstoned { settled: true },
+            ),
+            (
+                "torn freeze: marker, no tombstone, no body",
+                with(&[FROZEN_SUFFIX], None, None),
+                Frozen { settled: false },
+            ),
+            (
+                "torn freeze: marker over a body",
+                with(&["", FROZEN_SUFFIX], private(), None),
+                Frozen { settled: false },
+            ),
+            (
+                "settled freeze",
+                with(&[FROZEN_SUFFIX, TOMBSTONE_SUFFIX], None, None),
+                Frozen { settled: true },
+            ),
+            (
+                "unfinished demotion: fence over a mirror body",
+                with(
+                    &["", MIRROR_QUARANTINED_SUFFIX],
+                    mirror(),
+                    Some(Origin::Private),
+                ),
+                QuarantinedMirror { settled: false },
+            ),
+            (
+                "unfinished demotion: fence over a body with no sidecar",
+                with(
+                    &["", MIRROR_QUARANTINED_SUFFIX],
+                    None,
+                    Some(Origin::Private),
+                ),
+                QuarantinedMirror { settled: false },
+            ),
+            (
+                "settled demotion",
+                with(&[MIRROR_QUARANTINED_SUFFIX], None, Some(Origin::Private)),
+                QuarantinedMirror { settled: true },
+            ),
+            (
+                "spent fence: private truth landed under it",
+                with(
+                    &["", MIRROR_QUARANTINED_SUFFIX],
+                    private(),
+                    Some(Origin::Private),
+                ),
+                live(Origin::Private, false),
+            ),
+            (
+                "supersede in flight: body may be ahead of its sidecar",
+                with(&["", SUPERSEDING_SUFFIX], private(), Some(Origin::Private)),
+                live(Origin::Private, true),
+            ),
+            (
+                "sidecar with no body",
+                with(&[], private(), None),
+                Absent { debris: true },
+            ),
+            (
+                "companion with no body",
+                with(&[PROVENANCE_SUFFIX], None, None),
+                Absent { debris: true },
+            ),
+            (
+                "nothing at all",
+                with(&[], None, None),
+                Absent { debris: false },
+            ),
+            (
+                "bare body awaiting backfill",
+                with(&[""], None, Some(Origin::Private)),
+                Bare,
+            ),
+            (
+                "legacy untyped sidecar, unclaimed package",
+                with(&[""], Some(untyped()), None),
+                Untyped,
+            ),
+            (
+                "legacy untyped sidecar takes the claim",
+                with(&[""], Some(untyped()), Some(Origin::Mirror)),
+                live(Origin::Mirror, false),
+            ),
+        ];
+        for (name, record, expected) in cases {
+            assert_eq!(classify_record(&record), expected, "{name}");
+        }
+    }
+
+    #[test]
+    fn listed_matches_the_render_rules() {
+        let claims = [None, Some(Origin::Private), Some(Origin::Mirror)];
+        for claim in claims {
+            let private = with(&[""], Some(sc("x", PRIVATE, Yanked::Flag(false), 0)), claim);
+            assert!(listed(&private, claim));
+            assert!(listed(&with(&[""], Some(untyped()), claim), claim));
+            assert!(!listed(&with(&[""], None, claim), claim), "bare");
+            for fence in [TOMBSTONE_SUFFIX, FROZEN_SUFFIX] {
+                let fenced = with(
+                    &["", fence],
+                    Some(sc("x", PRIVATE, Yanked::Flag(false), 0)),
+                    claim,
+                );
+                assert!(!listed(&fenced, claim), "{fence}");
+            }
+        }
+        // A late mirror — a mirror record under a private claim — is never
+        // listed, though it classifies live on its own.
+        let late = with(&[""], Some(sc("x", MIRROR, Yanked::Flag(false), 0)), None);
+        assert!(listed(&late, Some(Origin::Mirror)));
+        assert!(!listed(&late, Some(Origin::Private)));
+        // A demotion fence hides everything but private truth.
+        let fenced = |sidecar| {
+            with(
+                &["", MIRROR_QUARANTINED_SUFFIX],
+                sidecar,
+                Some(Origin::Private),
+            )
+        };
+        assert!(!listed(
+            &fenced(Some(sc("x", MIRROR, Yanked::Flag(false), 0))),
+            Some(Origin::Private)
+        ));
+        assert!(!listed(&fenced(Some(untyped())), Some(Origin::Private)));
+        assert!(listed(
+            &fenced(Some(sc("x", PRIVATE, Yanked::Flag(false), 0))),
+            Some(Origin::Private)
+        ));
     }
 }

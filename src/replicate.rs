@@ -152,44 +152,25 @@ async fn record_from_names(
     names: &HashSet<String>,
     pkg_origin: Option<Origin>,
 ) -> Result<Record> {
-    let has_artifact = names.contains(filename);
-    let has_metadata = names.contains(&format!("{filename}{}", crate::sidecar::METADATA_SUFFIX));
-    let has_provenance =
-        names.contains(&format!("{filename}{}", crate::sidecar::PROVENANCE_SUFFIX));
-    let tombstoned = names.contains(&format!("{filename}{TOMBSTONE_SUFFIX}"));
-    let frozen = names.contains(&format!("{filename}{FROZEN_SUFFIX}"));
-    let mirror_quarantined = names.contains(&format!("{filename}{MIRROR_QUARANTINED_SUFFIX}"));
     let sidecar = if names.contains(&format!("{filename}{SIDECAR_SUFFIX}")) {
         let akey = artifact_key(pkg, filename);
-        match storage.get_bytes(&sidecar_key(&akey)).await {
-            Ok(bytes) => Some(
-                serde_json::from_slice::<Sidecar>(&bytes)
-                    .with_context(|| format!("parse sidecar for {akey}"))?,
-            ),
-            Err(e) => return Err(e),
+        let bytes = storage.get_bytes(&sidecar_key(&akey)).await?;
+        let sidecar: Sidecar =
+            serde_json::from_slice(&bytes).with_context(|| format!("parse sidecar for {akey}"))?;
+        if let Some(raw) = sidecar.origin.as_deref() {
+            if Origin::parse(raw).is_none() {
+                bail!("sidecar for {pkg}/{filename} holds an unexpected origin '{raw}'");
+            }
         }
+        Some(sidecar)
     } else {
         None
     };
-    if let Some(raw) = sidecar.as_ref().and_then(|s| s.origin.as_deref()) {
-        if Origin::parse(raw).is_none() {
-            bail!("sidecar for {pkg}/{filename} holds an unexpected origin '{raw}'");
-        }
-    }
-    // The package-origin fallback matters only for a live artifact whose sidecar
-    // lacks a typed origin; otherwise carrying it would wrongly type a tombstone.
-    let needs_fallback =
-        has_artifact && sidecar.as_ref().and_then(|s| s.origin.as_deref()).is_none();
-    Ok(Record {
+    Ok(Record::from_listing(
+        |suffix| names.contains(&format!("{filename}{suffix}")),
         sidecar,
-        has_artifact,
-        has_metadata,
-        has_provenance,
-        tombstoned,
-        frozen,
-        mirror_quarantined,
-        pkg_origin: needs_fallback.then_some(pkg_origin).flatten(),
-    })
+        pkg_origin,
+    ))
 }
 
 /// Build a [`Record`] with its own listing + origin read (the single-file eager
@@ -418,25 +399,13 @@ pub async fn execute(
                 markers::mark_dirty(b, pkg).await?;
             }
         }
+        // Never over a frozen side: `decide` ranks a freeze above a tombstone
+        // and answers the freeze verdicts instead.
         Verdict::Tombstone => {
-            // A freeze carries a tombstone solely as its permanent upload
-            // fence. Preserve and propagate the richer diagnostic marker when
-            // tombstone precedence selects this branch; otherwise the next
-            // pairwise hop would degrade a fleet-wide freeze into a bare delete.
-            let (ca, cb) = if ra.frozen || rb.frozen {
-                freeze_side(a, pkg, filename).await?;
-                freeze_side(b, pkg, filename).await?;
-                (true, true)
-            } else {
-                (
-                    tombstone_side(a, pkg, filename).await?,
-                    tombstone_side(b, pkg, filename).await?,
-                )
-            };
-            if ca {
+            if tombstone_side(a, pkg, filename).await? {
                 markers::mark_dirty(a, pkg).await?;
             }
-            if cb {
+            if tombstone_side(b, pkg, filename).await? {
                 markers::mark_dirty(b, pkg).await?;
             }
         }
@@ -540,7 +509,7 @@ async fn repair_same_sha_companions(
 ) -> Result<(bool, bool)> {
     let (a, b) = stores;
     let (ra, rb) = recs;
-    let (oa, ob) = match (ra.state(), rb.state()) {
+    let (oa, ob) = match (classify_record(ra), classify_record(rb)) {
         (
             RecordState::Live {
                 sha: sha_a,
@@ -1961,7 +1930,7 @@ async fn quarantine_bytes(
 ///
 /// Handing the filename to private truth IS the intended resolution of a
 /// demotion, so the fence never blocks a private upload — and once one lands,
-/// the fence is spent. `Record::state()`, the index renderer
+/// the fence is spent. [`classify_record`], the index renderer
 /// (`worker::load_file_metadata`), the file route (`serve::artifact_visible`)
 /// and `verify`'s oracle all already read straight past a fence with a private
 /// sidecar beside it, so this changes nothing renderable: no dirty marker, no
@@ -1991,7 +1960,7 @@ async fn clear_spent_demotion_fence(
 ) -> Result<()> {
     if !record.mirror_quarantined
         || !matches!(
-            record.state(),
+            classify_record(record),
             RecordState::Live {
                 origin: Origin::Private,
                 ..
@@ -4092,6 +4061,66 @@ mod tests {
         sidecar.upload_epoch_ms = Some(upload_epoch_ms);
         storage.insert(&sidecar_key(&key), serde_json::to_vec(&sidecar).unwrap());
         storage.insert(&crate::origin::origin_key(pkg), b"private".to_vec());
+    }
+
+    /// A freeze verdict reports `Converged` only over two settled freezes. A
+    /// torn side — its tombstone never written, or debris left beside it —
+    /// used to read as converged (`Noop`), or got only its peer frozen
+    /// (`PropagateFreeze`), so the note that owed the repair was consumed with
+    /// the freeze still half-done.
+    #[tokio::test]
+    async fn a_converged_freeze_leaves_both_sides_settled() {
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let torn_marker = |s: &InMemStorage| s.insert(&frozen_key(&key), b"{}".to_vec());
+        let debris = |s: &InMemStorage| {
+            s.insert(&frozen_key(&key), b"{}".to_vec());
+            s.insert(&tombstone_key(&key), b"{}".to_vec());
+            s.insert(
+                &sidecar_key(&key),
+                serde_json::to_vec(&sc("x", PRIVATE, Yanked::Flag(false), 0)).unwrap(),
+            );
+        };
+        let live = |s: &InMemStorage| seed_live(s, "pkg", filename, b"live", PRIVATE);
+        let empty = |_: &InMemStorage| {};
+        type Seed<'a> = &'a dyn Fn(&InMemStorage);
+        let pairs: [(Seed, Seed, Verdict); 4] = [
+            (&torn_marker, &torn_marker, Verdict::FinishFreeze),
+            (&torn_marker, &empty, Verdict::FinishFreeze),
+            (&debris, &live, Verdict::FinishFreeze),
+            (&live, &debris, Verdict::FinishFreeze),
+        ];
+        for (seed_a, seed_b, expected) in pairs {
+            let a = Arc::new(InMemStorage::default());
+            let b = Arc::new(InMemStorage::default());
+            seed_a(&a);
+            seed_b(&b);
+            let state = test_state(a.clone());
+            let left = read_record(a.as_ref(), "pkg", filename).await.unwrap();
+            let right = read_record(b.as_ref(), "pkg", filename).await.unwrap();
+            let verdict = decide(&left, &right);
+            assert_eq!(verdict, expected, "{left:?} vs {right:?}");
+            let converged = execute(
+                &state,
+                (a.as_ref(), b.as_ref()),
+                "pkg",
+                filename,
+                (&left, &right),
+                verdict,
+                ArtifactSource::Bucket,
+            )
+            .await
+            .unwrap();
+            assert_eq!(converged, Convergence::Converged);
+            for side in [a.as_ref(), b.as_ref()] {
+                let record = read_record(side, "pkg", filename).await.unwrap();
+                assert_eq!(
+                    classify_record(&record),
+                    RecordState::Frozen { settled: true },
+                    "Converged over a freeze left a side unfinished: {record:?}"
+                );
+            }
+        }
     }
 
     /// A settled demotion converges the fence to a peer that never held the

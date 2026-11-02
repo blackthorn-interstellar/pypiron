@@ -210,27 +210,22 @@ fn to_sidecar(a: &AbsSidecar) -> Sidecar {
 }
 
 fn to_record(bucket: &BucketAbs, file: u8) -> Record {
+    use pypiron::sidecar::{FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX, TOMBSTONE_SUFFIX};
     let rec = &bucket.files[file as usize];
-    // The package-origin fallback only matters for a live artifact whose
-    // sidecar lacks a typed origin (mirrors record_from_names).
-    let needs_fallback = rec.artifact.is_some() && rec.sidecar.is_none();
-    Record {
-        sidecar: rec.sidecar.as_ref().map(to_sidecar),
-        has_artifact: rec.artifact.is_some(),
-        has_metadata: false,
-        has_provenance: false,
-        tombstoned: rec.tombstoned,
-        frozen: rec.frozen,
-        mirror_quarantined: rec.mirror_q,
-        pkg_origin: if needs_fallback {
-            bucket.pkg_origin.map(|o| match o {
-                MOrigin::Private => ROrigin::Private,
-                MOrigin::Mirror => ROrigin::Mirror,
-            })
-        } else {
-            None
+    Record::from_listing(
+        |suffix| match suffix {
+            "" => rec.artifact.is_some(),
+            TOMBSTONE_SUFFIX => rec.tombstoned,
+            FROZEN_SUFFIX => rec.frozen,
+            MIRROR_QUARANTINED_SUFFIX => rec.mirror_q,
+            _ => false,
         },
-    }
+        rec.sidecar.as_ref().map(to_sidecar),
+        bucket.pkg_origin.map(|o| match o {
+            MOrigin::Private => ROrigin::Private,
+            MOrigin::Mirror => ROrigin::Mirror,
+        }),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -426,14 +421,8 @@ fn apply_verdict(w: &mut World, file: u8, verdict: &Verdict) {
             settle_mirror_quarantine_abs(b, file);
         }
         Verdict::Tombstone => {
-            let (ra, rb) = (a.files[file as usize], b.files[file as usize]);
-            if ra.frozen || rb.frozen {
-                freeze_side_abs(a, file);
-                freeze_side_abs(b, file);
-            } else {
-                tombstone_side_abs(a, file);
-                tombstone_side_abs(b, file);
-            }
+            tombstone_side_abs(a, file);
+            tombstone_side_abs(b, file);
         }
     }
 }
@@ -735,7 +724,7 @@ type Projection = (
 
 fn truth_projection(bucket: &BucketAbs, file: u8) -> Projection {
     let rec = bucket.files[file as usize];
-    // Mirror Record::state()'s precedence: tombstone/freeze markers suppress
+    // Mirror classify_record's precedence: tombstone/freeze markers suppress
     // a record even while its canonical body remains occupied (an interrupted
     // delete leaves exactly that shape). A mirror-quarantine marker suppresses a
     // mirror body (a demotion loser), and under a *private* sidecar it is stale
@@ -1309,7 +1298,7 @@ mod conformance {
                 sidecar: Some(snap(0, true, 2)),
                 ..FileRec::default()
             },
-            // Orphan: bare artifact, no sidecar (crashed writer debris).
+            // Bare: artifact, no sidecar (crashed writer debris).
             FileRec {
                 artifact: Some(0),
                 sidecar: None,
@@ -2196,8 +2185,8 @@ mod viz {
                 let rec = bucket.files[file as usize];
                 // The real resolver's own classifier for this cell, so the cell a
                 // reader sees cannot disagree with what the merge reads.
-                let resolved = match to_record(bucket, file).state() {
-                    RecordState::Live { sha, origin } => {
+                let resolved = match pypiron::replicate::classify_record(&to_record(bucket, file)) {
+                    RecordState::Live { sha, origin, .. } => {
                         format!("Live({origin:?},{})", sha.get(..8).unwrap_or(sha.as_str()))
                     }
                     other => format!("{other:?}"),

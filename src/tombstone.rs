@@ -99,8 +99,8 @@ pub async fn complete_interrupted_deletes(
 /// replication copy (replicate::copy_live) that never reaches its artifact
 /// write. With no artifact to list and no `.tombstone` to trigger
 /// [`complete_interrupted_deletes`], such companions are invisible to every
-/// future rebuild, and the cross-bucket merge reads them as `Absent`
-/// (RecordState maps sidecar-without-artifact to `Absent`) so `decide` returns
+/// future rebuild, and the cross-bucket merge reads them as absent
+/// (`classify_record` names them `Absent { debris: true }`) so `decide` returns
 /// `Noop` — the debris then survives every diff and diverges the buckets
 /// forever. `filenames` are artifact base names the audit already observed with
 /// a companion but no anchoring body/marker in the same listing.

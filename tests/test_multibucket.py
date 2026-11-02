@@ -2218,6 +2218,67 @@ def test_migrate_seeds_backfill_sentinel_and_reconcile_drains_it(
         server_gen.close()
 
 
+def test_a_record_that_cannot_replicate_keeps_the_new_bucket_fenced(
+    minio_three, pypiron_bin, tmp_path_factory
+):
+    """A reconcile pass that leaves a record behind proves nothing. Bucket a holds
+    a legacy record replication cannot copy (a sidecar naming no origin, in a
+    package with no origin claim), so the added bucket c never receives it. The
+    backfill sentinel must stay, and the server must say which bucket is fenced
+    and why, instead of letting c serve region reads with that file missing."""
+    minio = minio_three
+    a, b, c = minio["buckets"]
+    body = "legacy wheel bytes"
+    key = "packages/legacy/legacy-1.0-py3-none-any.whl"
+    minio_put_key_in(minio, a, key, body)
+    sidecar = {
+        "sha256": hashlib.sha256(body.encode()).hexdigest(),
+        "size": len(body),
+        "version": "1.0",
+        "upload-time": "2020-01-01T00:00:00Z",
+    }
+    minio_put_key_in(minio, a, f"{key}.meta.json", json.dumps(sidecar))
+
+    env = _s3_env(minio, "127.0.0.1:0")
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"initial migration failed:\n{out}\n{err}"
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b, c)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"adding a bucket failed:\n{out}\n{err}"
+
+    def _sentinels(bucket) -> list[str]:
+        return [
+            k
+            for k in minio_list_keys_in(minio, bucket)
+            if k.startswith(f"_repl/{s3_repl_tag(c)}/_backfill!")
+        ]
+
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio,
+        extra_env={"PYPIRON_RECONCILE_INTERVAL_SECS": "2"},
+    )
+    server = next(server_gen)
+    try:
+        held = "backfill sentinel held"
+        _eventually(
+            lambda: (
+                server["log_path"].read_text().count(held) >= 2
+                or not (_sentinels(a) or _sentinels(b))
+            ),
+            timeout=30,
+            what="two reconcile passes run",
+        )
+        assert _sentinels(a) and _sentinels(b), "an unproven pass must not drain the fence"
+        log = server["log_path"].read_text()
+        assert "legacy" in log, "the warning names the package holding the fence"
+        assert not minio_key_exists_in(minio, c, key)
+    finally:
+        server_gen.close()
+
+
 def test_migrate_single_to_multi_fences_the_new_empty_bucket(minio_two, pypiron_bin):
     """The single-bucket -> multi-bucket expansion. Single mode never writes a
     topology stamp, so `buckets migrate` has no previous member list to diff and

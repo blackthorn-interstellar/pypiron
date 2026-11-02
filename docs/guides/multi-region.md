@@ -107,6 +107,9 @@ variable replaces only the old bucket list; storage prefixes, endpoints, and
 backend account settings still come from the config.
 
 A new empty bucket stays out of regional reads until its backfill completes.
+A file another bucket can't copy yet, such as one still missing its metadata,
+holds it out too. While that lasts, the server logs a warning naming the bucket
+and the file's package.
 Migration refuses to remove a bucket that is unreachable, has pending repairs,
 or contains the only copy of a file or of a deletion. Add its replacement, let backfill finish,
 then remove the old bucket. It also refuses any change while a pending repair

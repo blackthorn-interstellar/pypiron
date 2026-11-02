@@ -32,7 +32,7 @@ use anyhow::{anyhow, bail, Context as _, Result};
 use futures::StreamExt as _;
 use sha2::{Digest as _, Sha256};
 use tokio::io::AsyncReadExt as _;
-use tracing::{error, warn};
+use tracing::{error, info, warn};
 
 use crate::app::{AppState, PACKAGES_PREFIX};
 use crate::buckets::Pinned;
@@ -2840,7 +2840,9 @@ async fn replicate_record(
         // the same quarantine path as the full diff instead of retrying its
         // note until the daily reconcile. Re-read before deciding whether the
         // note is satisfied: the repair may have deferred another torn record.
-        converge_package(state, src, dst, pkg).await?;
+        // Another filename's deferral is not this note's business: the
+        // re-read and merge below decide whether *this* record converged.
+        let _: Convergence = converge_package(state, src, dst, pkg).await?;
         a = read_record(src, pkg, filename).await?;
         b = read_record(dst, pkg, filename).await?;
     }
@@ -3151,12 +3153,15 @@ pub async fn seed_backfill_sentinel(storage: &dyn Storage, dest_tag: &str) -> Re
     storage.put_bytes(&key, Vec::new(), None).await
 }
 
-/// Remove every backfill sentinel across the fleet. Called only after a fully
-/// clean reconcile pass — which proves every reachable bucket now holds the whole
-/// corpus — so a freshly-added bucket may finally serve region reads. Bounded:
+/// The configured buckets that still have a backfill sentinel standing on some
+/// peer, deleting each one when `drain` is set. Reconcile drains only after a
+/// clean pass — which proves every reachable bucket now holds the whole corpus —
+/// so a freshly-added bucket may finally serve region reads; an unclean pass
+/// lists without draining, to name the buckets it is still fencing. Bounded:
 /// one narrow LIST plus at most one delete per (bucket, dest).
-async fn drain_backfill_sentinels(state: &AppState) -> Result<()> {
+async fn drain_backfill_sentinels(state: &AppState, drain: bool) -> Result<Vec<String>> {
     let handles = state.buckets.handles();
+    let mut fenced = Vec::new();
     let mut failures = Vec::new();
     for handle in handles {
         // Only currently-configured tags are drained; a removed bucket's sentinel
@@ -3171,6 +3176,12 @@ async fn drain_backfill_sentinels(state: &AppState) -> Result<()> {
             {
                 Ok(page) if page.is_empty() => {}
                 Ok(page) => {
+                    if !fenced.contains(&dest.name) {
+                        fenced.push(dest.name.clone());
+                    }
+                    if !drain {
+                        continue;
+                    }
                     let keys: Vec<String> = page.into_iter().map(|obj| obj.key).collect();
                     if let Err(e) = handle.storage.delete_keys(&keys).await {
                         failures.push(format!("{}: {e:#}", handle.name));
@@ -3181,7 +3192,7 @@ async fn drain_backfill_sentinels(state: &AppState) -> Result<()> {
         }
     }
     if failures.is_empty() {
-        Ok(())
+        Ok(fenced)
     } else {
         bail!("backfill sentinel drain failed: {}", failures.join("; "))
     }
@@ -3576,18 +3587,21 @@ pub async fn reconcile(state: &AppState, pinned: &Pinned) -> Result<()> {
     // passes must be sequential. Concurrent peers can read the hub before a
     // later peer freezes it and leave the early peer live until tomorrow.
     let handles = state.buckets.handles();
-    // A pass is "clean" only if every peer was diffed and every diff succeeded.
-    // A skipped (ineligible) peer or a failed diff leaves a bucket unproven, so
-    // the backfill sentinels must not drain: a freshly-added bucket might still
-    // be missing that peer's unique content.
-    let mut clean = true;
+    // A pass is "clean" only if every peer was diffed, every diff succeeded and
+    // no merge deferred. A skipped (ineligible) peer, a failed diff or a record
+    // the merge declined (bare or untyped) leaves a bucket unproven, so the
+    // backfill sentinels must not drain: a freshly-added bucket might still be
+    // missing that peer's unique content. Each reason is kept for the log that
+    // says why a sentinel is still standing.
+    let mut unproven: Vec<String> = Vec::new();
+    let left = &handles[pinned.index].name;
     for _ in 0..2 {
         for (index, handle) in handles.iter().enumerate() {
             if index == pinned.index {
                 continue;
             }
             if !bucket_eligible(state, index) {
-                clean = false;
+                unproven.push(format!("{}: not eligible", handle.name));
                 continue;
             }
             let result = tokio::select! {
@@ -3600,19 +3614,43 @@ pub async fn reconcile(state: &AppState, pinned: &Pinned) -> Result<()> {
                     Err(anyhow!("reconcile pair became topology-ineligible"))
                 }
             };
-            if let Err(e) = result {
-                error!(left=%handles[pinned.index].name, right=%handles[index].name, error=?e, "reconcile: pairwise diff failed");
-                clean = false;
+            match result {
+                Ok(deferred) if deferred.is_empty() => {}
+                Ok(deferred) => unproven.push(format!(
+                    "{left}<->{}: {} package(s) deferred ({}{})",
+                    handle.name,
+                    deferred.len(),
+                    deferred
+                        .iter()
+                        .take(5)
+                        .cloned()
+                        .collect::<Vec<_>>()
+                        .join(", "),
+                    if deferred.len() > 5 { ", ..." } else { "" },
+                )),
+                Err(e) => {
+                    error!(left=%left, right=%handle.name, error=?e, "reconcile: pairwise diff failed");
+                    unproven.push(format!("{left}<->{}: {e:#}", handle.name));
+                }
             }
         }
     }
     // A fully clean pass proves every reachable bucket now holds the whole
     // corpus (two passes converge the pinned star both directions), so any
     // freshly-added bucket has caught up: drop its backfill sentinel and let
-    // read affinity return region reads to it.
-    if clean {
-        if let Err(e) = drain_backfill_sentinels(state).await {
+    // read affinity return region reads to it. An unclean pass keeps them and
+    // names the buckets it is still fencing, and why.
+    let clean = unproven.is_empty();
+    match drain_backfill_sentinels(state, clean).await {
+        Ok(fenced) if !clean && !fenced.is_empty() => {
+            warn!(fenced=?fenced, reasons=?unproven, "reconcile: backfill sentinel held; these buckets serve no region reads until a clean pass");
+        }
+        Ok(_) => {}
+        Err(e) if clean => {
             warn!(error=?e, "reconcile: fleet converged but backfill sentinel drain failed; retrying next pass");
+        }
+        Err(e) => {
+            warn!(error=?e, reasons=?unproven, "reconcile: pass not clean and the backfill sentinels could not be listed");
         }
     }
     state
@@ -3725,11 +3763,13 @@ async fn package_member_names(storage: &dyn Storage, pkg: &str) -> Result<HashSe
 /// Diff two buckets' private truth and converge them through the merge rules.
 /// Both `packages/` trees are walked page by page and merged by package name, so
 /// neither full listing is ever resident (v1 review finding); every package on
-/// either side is converged exactly once, in sorted order.
-async fn diff_pair(state: &AppState, a: &dyn Storage, b: &dyn Storage) -> Result<()> {
+/// either side is converged exactly once, in sorted order. Returns the packages
+/// whose merge deferred: they did not converge, so the pass proves nothing.
+async fn diff_pair(state: &AppState, a: &dyn Storage, b: &dyn Storage) -> Result<Vec<String>> {
     let mut scan_a = PackageScan::new(a);
     let mut scan_b = PackageScan::new(b);
     let mut failures = Vec::new();
+    let mut deferred = Vec::new();
     loop {
         let next_a = scan_a.peek().await?.map(str::to_string);
         let next_b = scan_b.peek().await?.map(str::to_string);
@@ -3759,13 +3799,17 @@ async fn diff_pair(state: &AppState, a: &dyn Storage, b: &dyn Storage) -> Result
                 }
             },
         };
-        if let Err(error) = converge_package(state, a, b, &pkg).await {
-            error!(package=%pkg, error=?error, "reconcile: package diff failed; continuing");
-            failures.push(format!("{pkg}: {error:#}"));
+        match converge_package(state, a, b, &pkg).await {
+            Ok(Convergence::Converged) => {}
+            Ok(Convergence::Deferred) => deferred.push(pkg),
+            Err(error) => {
+                error!(package=%pkg, error=?error, "reconcile: package diff failed; continuing");
+                failures.push(format!("{pkg}: {error:#}"));
+            }
         }
     }
     if failures.is_empty() {
-        Ok(())
+        Ok(deferred)
     } else {
         bail!("package diffs failed: {}", failures.join("; "))
     }
@@ -3773,13 +3817,14 @@ async fn diff_pair(state: &AppState, a: &dyn Storage, b: &dyn Storage) -> Result
 
 /// Converge one package across the two buckets through the merge rules. Called
 /// once per package by [`diff_pair`]; re-lists fresh member names because the
-/// paged scan that discovered the package may predate a writer.
+/// paged scan that discovered the package may predate a writer. `Deferred` when
+/// any filename's merge declined, so the caller cannot mistake it for proof.
 async fn converge_package(
     state: &AppState,
     a: &dyn Storage,
     b: &dyn Storage,
     pkg: &str,
-) -> Result<()> {
+) -> Result<Convergence> {
     require_replication_unfenced(state)?;
     // The flat scan that discovered the package may predate a writer;
     // use fresh member listings for the per-package convergence pass.
@@ -3805,8 +3850,10 @@ async fn converge_package(
         reconcile_project_status(state, a, b, pkg).await?;
     }
 
-    let mut converged = false;
+    let mut converged = None;
     for _ in 0..3 {
+        // A late-mirror retry replays every filename, so it starts over.
+        let mut outcome = Convergence::Converged;
         let mut filenames: Vec<String> = candidate_filenames(&a_names)
             .union(&candidate_filenames(&b_names))
             .cloned()
@@ -3845,11 +3892,7 @@ async fn converge_package(
                 break;
             }
             let verdict = decide(&ra, &rb);
-            // Tier 3 holds no ack open and has no note to consume, so a
-            // deferral needs no repair record of its own: the next cadence
-            // re-diffs, by which time the orphan side's own audit has
-            // backfilled the sidecar the decision was waiting on.
-            let _: Convergence = execute(
+            let result = execute(
                 state,
                 (a, b),
                 pkg,
@@ -3859,17 +3902,36 @@ async fn converge_package(
                 ArtifactSource::Bucket,
             )
             .await?;
+            if result == Convergence::Deferred {
+                // A deferral keeps the pass from proving convergence (the
+                // backfill sentinel rides on that proof). A bare side gets
+                // the rebuild signal the marker sweep sends, since its own
+                // rebuild is what backfills the sidecar the merge waits on.
+                // An untyped side gets none: no rebuild can type it.
+                let (sa, sb) = (classify_record(&ra), classify_record(&rb));
+                for (side, state_of) in [(a, &sa), (b, &sb)] {
+                    if *state_of == RecordState::Bare {
+                        markers::mark_dirty(side, pkg).await?;
+                    }
+                }
+                if sa == RecordState::Untyped || sb == RecordState::Untyped {
+                    warn!(package=%pkg, filename=%filename, left=?sa, right=?sb, "reconcile: record has a sidecar with no origin in a package with no origin claim; it never replicates and keeps new buckets fenced until an operator deletes or re-publishes it");
+                } else {
+                    info!(package=%pkg, filename=%filename, left=?sa, right=?sb, "reconcile: merge deferred until the bare side's rebuild writes its sidecar");
+                }
+                outcome = Convergence::Deferred;
+            }
         }
         if retry_after_late_mirror {
             continue;
         }
-        converged = true;
+        converged = Some(outcome);
         break;
     }
-    if !converged {
-        bail!("package '{pkg}' kept exposing mirror records under a private claim");
+    match converged {
+        Some(outcome) => Ok(outcome),
+        None => bail!("package '{pkg}' kept exposing mirror records under a private claim"),
     }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -5799,9 +5861,11 @@ mod tests {
             let state = two_bucket_state(private.clone(), destination.clone());
 
             match direction {
-                None => diff_pair(&state, private.as_ref(), destination.as_ref())
-                    .await
-                    .unwrap(),
+                None => {
+                    diff_pair(&state, private.as_ref(), destination.as_ref())
+                        .await
+                        .unwrap();
+                }
                 Some(from_mirror) => {
                     let (src, dst) = if from_mirror {
                         (destination.as_ref(), private.as_ref())
@@ -6524,6 +6588,76 @@ mod tests {
             !region_owed_no_notes(&reordered, 0).await,
             "a name-keyed sentinel follows its bucket across a reorder; c stays fenced",
         );
+    }
+
+    /// A deferred merge is not convergence. Bucket `a` holds a bare body (a
+    /// publish that crashed before its sidecar) the new bucket `b` lacks; the
+    /// merge defers, so reconcile must keep b's backfill sentinel, and must ask
+    /// a's rebuild to backfill the sidecar. Once it has, the next pass copies
+    /// the file and only then drains the fence.
+    #[tokio::test]
+    async fn a_deferred_merge_holds_the_backfill_sentinel() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let key = artifact_key("pkg", "pkg-1.whl");
+        a.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+        a.insert(&key, b"body".to_vec());
+        let b_sentinel = backfill_sentinel_prefix(&crate::counters::bucket_tag("b"));
+        seed_backfill_sentinel(a.as_ref(), &crate::counters::bucket_tag("b"))
+            .await
+            .unwrap();
+        let state = two_bucket_state(a.clone(), b.clone());
+
+        reconcile(&state, &state.pin()).await.unwrap();
+        assert!(
+            !a.list_all(&b_sentinel).await.unwrap().is_empty(),
+            "a deferred merge must not drain the new bucket's fence"
+        );
+        assert!(!b.head_exists(&key).await.unwrap());
+        assert!(
+            !a.list_all(&format!("{}pkg!", crate::app::DIRTY_PREFIX))
+                .await
+                .unwrap()
+                .is_empty(),
+            "the bare side is signalled to rebuild"
+        );
+
+        // The rebuild backfills the sidecar; the next pass converges and drains.
+        a.insert(
+            &sidecar_key(&key),
+            serde_json::to_vec(&sc(&sha256_hex(b"body"), PRIVATE, Yanked::Flag(false), 0)).unwrap(),
+        );
+        reconcile(&state, &state.pin()).await.unwrap();
+        assert!(b.head_exists(&key).await.unwrap());
+        assert!(a.list_all(&b_sentinel).await.unwrap().is_empty());
+    }
+
+    /// An untyped record (a sidecar with no origin, in a package with no claim)
+    /// never replicates, so it holds the fence; no rebuild can type it, so it
+    /// gets no rebuild signal either.
+    #[tokio::test]
+    async fn an_untyped_record_holds_the_backfill_sentinel() {
+        let a = Arc::new(InMemStorage::default());
+        let b = Arc::new(InMemStorage::default());
+        let key = artifact_key("pkg", "pkg-1.whl");
+        a.insert(&key, b"body".to_vec());
+        let mut sidecar = sc(&sha256_hex(b"body"), PRIVATE, Yanked::Flag(false), 0);
+        sidecar.origin = None;
+        a.insert(&sidecar_key(&key), serde_json::to_vec(&sidecar).unwrap());
+        let b_sentinel = backfill_sentinel_prefix(&crate::counters::bucket_tag("b"));
+        seed_backfill_sentinel(a.as_ref(), &crate::counters::bucket_tag("b"))
+            .await
+            .unwrap();
+        let state = two_bucket_state(a.clone(), b.clone());
+
+        reconcile(&state, &state.pin()).await.unwrap();
+        assert!(!a.list_all(&b_sentinel).await.unwrap().is_empty());
+        assert!(!b.head_exists(&key).await.unwrap());
+        assert!(a
+            .list_all(crate::app::DIRTY_PREFIX)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     /// F25, the second failure mode: a bucket that lands where a since-departed

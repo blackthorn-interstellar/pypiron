@@ -939,7 +939,14 @@ _repl/<dest-tag>/_backfill!<nonce>       # backfill sentinel: an empty read-affi
                                          #   as the repair note: the fence follows its bucket across a
                                          #   reorder. Not a repair note (names no package), so the marker
                                          #   sweep never tries to deliver it — only a clean reconcile
-                                         #   drains it. One bucket: never written.
+                                         #   drains it. Clean = every peer eligible and diffed, no
+                                         #   package diff failed, and no merge deferred (a Bare or
+                                         #   Untyped record on either side). A deferral on a Bare side
+                                         #   marks that bucket dirty so its rebuild backfills the
+                                         #   sidecar; an Untyped record holds the fence until an
+                                         #   operator deletes or re-publishes it. An unclean pass
+                                         #   logs a warning naming the fenced buckets and why. One
+                                         #   bucket: never written.
 _transparency/chain/<seq>.json           # append-only hash-chained audit checkpoint; create-only,
                                          #   CAS-allocated seq (If-None-Match). Commits per-file artifact
                                          #   sha256 deltas, churn-sized like the audit. A WITNESS — never

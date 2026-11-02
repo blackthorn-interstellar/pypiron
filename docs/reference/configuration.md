@@ -525,7 +525,7 @@ pending repairs, not bytes.
 | `/audit.json` | admin | The same audit report as JSON. |
 | `/advisories/feed` | read (GET), admin (PUT) | Advisory snapshot: readers pull it (etag-conditioned); an admin pushes a delivered one. |
 | `/tokens` | read/uploader/admin, or open reader token | Mint install tokens. |
-| `/files/.../yank` | admin | Yank a file. |
+| `/files/.../yank` | admin | Yank a file. `404` if the file is not in the index; `409` if it is deleted, frozen or quarantined. |
 | `DELETE /files/<pkg>/<file>` | admin | Delete a file. Refused for mirrored files — anything that came from an upstream, cached on demand or pulled by `sync` — when you run more than one bucket. |
 | `/project/<pkg>/status` | admin | Set project status. |
 

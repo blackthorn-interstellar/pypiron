@@ -961,6 +961,31 @@ _staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams h
                                          #   .tmp on disk.
 ```
 
+**Per-file record states.** What the objects under one
+`packages/<pkg>/<filename>` mean is decided in one place,
+`replicate::classify_record`; the merge, the index renderer, the yank and the
+upload-time repair all match on its answer and never on the raw markers.
+Precedence is freeze ≻ tombstone ≻ demotion fence ≻ body. `settled: false`
+names a torn state — a crash mid-operation the next pass finishes.
+
+| State | Objects | Listed | Yank / time repair | Merge |
+|---|---|---|---|---|
+| `Frozen{settled}` | `.frozen` (settled: + `.tombstone`, nothing else) | no | 409 | settled pair `Noop`; settled vs. unfrozen `PropagateFreeze`; any torn side `FinishFreeze` on both |
+| `Tombstoned{settled}` | `.tombstone`, no `.frozen` (settled: no body, sidecar, companion or demotion fence) | no | 409 | settled pair `Noop`, else `Tombstone` |
+| `QuarantinedMirror{settled}` | `.mirror-quarantined` over a non-private record (settled: canonical key empty) | no | 409 | settled pair `Noop`; private peer `Supersede`; else `SettleMirrorQuarantine` |
+| `Live{sha, origin, superseding}` | body + typed sidecar (a private sidecar beside a spent demotion fence included) | yes, unless a mirror under a private claim | allowed; 409 while `superseding` | copy / adopt / supersede / freeze |
+| `Bare` | body, no sidecar | no (the authoring rebuild backfills it first) | 404 | `Defer` |
+| `Untyped` | body + sidecar with no origin, package unclaimed | yes | allowed (time repair needs private) | `Defer` |
+| `Absent{debris}` | no body, no fence (debris: a sidecar or companion left, which the audit drops) | no | 404 | `Copy` from a live peer |
+
+`.superseding` is a modifier of `Live`, not a state: only a re-hash can tell
+which way the supersede tore, and the index rebuild's
+`finish_interrupted_supersedes` is what does it. The direct-URL file route and
+the upload fence ask narrower questions over HEADs (is the name fenced? is a
+demoted or late-mirror record being served?) and agree with the table on every
+input they read; `verify` stays an independent oracle of it on purpose.
+
+
 **Replication class (multi-bucket).** Every top-level prefix is classified in one
 registry — `src/layout.rs`, enforced by a unit test so a new prefix without a
 declared class fails CI. Six classes:
@@ -1229,8 +1254,8 @@ Measured against a fabricated full-PyPI-shaped corpus (see
 - Polling `_dirty/` at a ~1s tick costs pennies a day in S3 LIST requests.
 - In single-bucket mode, every steady-state cost scales with what *changed*;
   only the audit (cheap LISTs) and `rebuild-index`/`verify-index` (explicit)
-  scale with what *exists*. Filename non-reuse adds one tombstone HEAD per
-  upload; multi-bucket uploads add one `.frozen` HEAD. Private delete adds its
+  scale with what *exists*. Filename non-reuse adds two concurrent HEADs per
+  upload, the tombstone and `.frozen`. Private delete adds its
   checked origin reads and tombstone write. Single-bucket serving adds no
   origin or visibility-fence reads.
 - Multi-bucket mode adds per-node health probes and failure-only repair-note

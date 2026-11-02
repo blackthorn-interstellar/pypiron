@@ -1010,21 +1010,20 @@ pub async fn publish_record(
         }
     }
 
-    // One post-create tombstone HEAD preserves the single-bucket write path.
-    // Multi-bucket mode also checks `.frozen`, whose first-write ordering makes
-    // every interrupted freeze a durable filename fence. A fenced multi-bucket
-    // loser stays occupied and inert: deleting by key here could erase a private
-    // replacement that landed after this writer's cross-object read.
-    let filename_fenced = if state.buckets.is_multi() {
-        futures::future::try_join(
-            storage.head_exists(&tombstone_key(&key)),
-            storage.head_exists(&frozen_key(&key)),
-        )
-        .await
-        .map(|(tombstoned, frozen)| tombstoned || frozen)
-    } else {
-        storage.head_exists(&tombstone_key(&key)).await
-    };
+    // Two concurrent post-create HEADs: the tombstone, and `.frozen`, whose
+    // first-write ordering makes every interrupted freeze a durable filename
+    // fence — in single-bucket mode too, where a fleet shrunk to one bucket
+    // keeps its freezes and the index and the file route already hide them.
+    // A demotion fence is no bar: a private upload over it is how a demotion
+    // resolves. A fenced multi-bucket loser stays occupied and inert: deleting
+    // by key here could erase a private replacement that landed after this
+    // writer's cross-object read.
+    let filename_fenced = futures::future::try_join(
+        storage.head_exists(&tombstone_key(&key)),
+        storage.head_exists(&frozen_key(&key)),
+    )
+    .await
+    .map(|(tombstoned, frozen)| tombstoned || frozen);
     match filename_fenced {
         Ok(false) => {}
         Ok(true) => {
@@ -1638,6 +1637,89 @@ pub(crate) async fn set_yank(
     .await
 }
 
+/// Refuse a sidecar edit on a file no index shows: the record must be
+/// [`replicate::listed`] — not deleted, frozen or demoted, not a bare body, not
+/// a mirror under a private claim — and not mid-supersede, whose sidecar is
+/// about to be replaced. A timestamp repair further needs private truth.
+/// Companions are not probed: they only tell a settled fence from a torn one.
+async fn check_editable(
+    storage: &dyn Storage,
+    pkg: &str,
+    key: &str,
+    sc: &Sidecar,
+    edit: &SidecarEdit,
+) -> Result<(), (StatusCode, String)> {
+    use replicate::{Origin, RecordState};
+    use sidecar::{FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX, SUPERSEDING_SUFFIX, TOMBSTONE_SUFFIX};
+    const PROBED: [&str; 5] = [
+        "",
+        TOMBSTONE_SUFFIX,
+        FROZEN_SUFFIX,
+        MIRROR_QUARANTINED_SUFFIX,
+        SUPERSEDING_SUFFIX,
+    ];
+    let keys = PROBED.map(|suffix| format!("{key}{suffix}"));
+    let (present, claim) = futures::future::try_join(
+        futures::future::try_join_all(keys.iter().map(|key| storage.head_exists(key))),
+        origin::read_origin_claim(storage, pkg),
+    )
+    .await
+    .map_err(|e| {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("record read failed: {e}"),
+        )
+    })?;
+    let claim: Option<Origin> = claim.and_then(|state| state.try_into().ok());
+    let record = replicate::Record::from_listing(
+        |suffix| {
+            PROBED
+                .iter()
+                .zip(&present)
+                .any(|(p, &hit)| hit && *p == suffix)
+        },
+        Some(sc.clone()),
+        claim,
+    );
+    let state = replicate::classify_record(&record);
+    if !replicate::listed(&record, claim) {
+        return Err(match state {
+            RecordState::Absent { .. } | RecordState::Bare => {
+                (StatusCode::NOT_FOUND, "No such file".into())
+            }
+            _ => (
+                StatusCode::CONFLICT,
+                "file is deleted, frozen or quarantined".into(),
+            ),
+        });
+    }
+    if let RecordState::Live {
+        superseding: true, ..
+    } = state
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "a replication repair is rewriting this file's metadata; retry".into(),
+        ));
+    }
+    if matches!(edit, SidecarEdit::UploadTime { .. })
+        && (claim != Some(Origin::Private)
+            || !matches!(
+                state,
+                RecordState::Live {
+                    origin: Origin::Private,
+                    ..
+                }
+            ))
+    {
+        return Err((
+            StatusCode::CONFLICT,
+            "timestamp repair requires a private artifact".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Both edits consume the observed sidecar with CAS and bump its existing
 /// revision (historically named yank-epoch). Replication adopts the whole
 /// winning sidecar, so a repaired date must advance that revision too.
@@ -1692,6 +1774,9 @@ async fn edit_sidecar(
                     format!("bad sidecar: {e}"),
                 )
             })?;
+            // Checked against truth on every CAS attempt, not just the
+            // caller's possibly stale index.
+            check_editable(storage, pkg, &key, &sc, &edit).await?;
             let changed = match &edit {
                 SidecarEdit::Yank(desired) => {
                     let changed = sc.yanked.normalized() != *desired;
@@ -1702,42 +1787,6 @@ async fn edit_sidecar(
                     sha256,
                     upload_time,
                 } => {
-                    // Check truth on every CAS attempt, not just the CLI's possibly
-                    // stale index. Never repair mirror records or suppressed files.
-                    let owner = origin::read_origin_claim(storage, pkg)
-                        .await
-                        .map_err(|e| internal("read origin", e))?;
-                    if owner != Some(origin::OriginState::Private)
-                        || sc.origin.as_deref().is_some_and(|o| o != origin::PRIVATE)
-                    {
-                        return Err((
-                            StatusCode::CONFLICT,
-                            "timestamp repair requires a private artifact".into(),
-                        ));
-                    }
-                    for fence in [
-                        tombstone_key(&key),
-                        frozen_key(&key),
-                        sidecar::mirror_quarantined_key(&key),
-                    ] {
-                        if storage
-                            .head_exists(&fence)
-                            .await
-                            .map_err(|e| internal("read fence", e))?
-                        {
-                            return Err((
-                                StatusCode::CONFLICT,
-                                "cannot repair a deleted or quarantined artifact".into(),
-                            ));
-                        }
-                    }
-                    if !storage
-                        .head_exists(&key)
-                        .await
-                        .map_err(|e| internal("read artifact", e))?
-                    {
-                        return Err((StatusCode::NOT_FOUND, "No such file".into()));
-                    }
                     if !sc.sha256.eq_ignore_ascii_case(sha256) {
                         return Err((
                             StatusCode::CONFLICT,
@@ -1778,6 +1827,10 @@ async fn edit_sidecar(
             match storage.put_if_match(&sc_key, &etag, out).await {
                 Ok(Some(_)) => {
                     wrote = true;
+                    // The fences are separate objects no sidecar CAS covers: a
+                    // delete or freeze that landed since the check above must
+                    // not be acked — or fanned out — as a successful edit.
+                    check_editable(storage, pkg, &key, &sc, &edit).await?;
                     break;
                 }
                 Ok(None) => continue,
@@ -2304,27 +2357,155 @@ mod tests {
     /// errored one: a fence that HEADs *true* is an answer, so the single-bucket
     /// path still clears the body it created over a spent filename rather than
     /// leaving a live artifact under a deleted name.
+    ///
+    /// A `.frozen` alone is such a fence in single-bucket mode too: a fleet
+    /// shrunk to one bucket keeps its torn freezes, and an upload acked over
+    /// one would be unlisted and 404 by direct URL for good.
     #[tokio::test]
     async fn a_proven_filename_fence_still_frees_the_body_it_created() {
         const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
+        for fence in [tombstone_key(&key), frozen_key(&key)] {
+            let storage = Arc::new(storage::test_support::InMemStorage::default());
+            let state = AppState::headless(storage.clone());
+            let pinned = state.pin();
+            storage.insert(&fence, b"{}".to_vec());
+
+            let (code, _) = publish_record(
+                &state,
+                &pinned,
+                fresh_upload("alpha", FILE, b"artifact".to_vec()),
+            )
+            .await
+            .expect_err("the filename is fenced");
+            assert_eq!(code, StatusCode::CONFLICT, "{fence}");
+
+            assert!(
+                !storage.head_exists(&key).await.unwrap(),
+                "a proven fence must leave no body behind under the spent filename: {fence}"
+            );
+        }
+    }
+
+    const EDITED: &str = "alpha-1.0-py3-none-any.whl";
+
+    /// Objects planted over a seeded record, given its artifact key.
+    type Plant = fn(&storage::test_support::InMemStorage, &str);
+
+    fn sidecar_bytes(origin: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "sha256": crate::hash::sha256_hex(b"artifact"),
+            "size": 8,
+            "version": "1.0",
+            "upload-time": "2026-01-01T00:00:00Z",
+            "origin": origin,
+        }))
+        .unwrap()
+    }
+
+    /// A private package holding one live record, `plant` applied on top.
+    async fn edited_record(plant: Plant) -> (Arc<storage::test_support::InMemStorage>, String) {
         let storage = Arc::new(storage::test_support::InMemStorage::default());
+        let key = format!("{PACKAGES_PREFIX}alpha/{EDITED}");
+        origin::claim_origin(storage.as_ref(), "alpha", origin::PRIVATE)
+            .await
+            .unwrap();
+        storage.insert(&key, b"artifact".to_vec());
+        storage.insert(&sidecar_key(&key), sidecar_bytes(origin::PRIVATE));
+        plant(&storage, &key);
+        (storage, key)
+    }
+
+    async fn yank(storage: &Arc<storage::test_support::InMemStorage>) -> StatusCode {
         let state = AppState::headless(storage.clone());
         let pinned = state.pin();
-        let key = format!("{PACKAGES_PREFIX}alpha/{FILE}");
-        storage.insert(&tombstone_key(&key), b"{}".to_vec());
+        match set_yank(&state, &pinned, "alpha", EDITED, Yanked::Flag(true)).await {
+            Ok(code) => code,
+            Err((code, _)) => code,
+        }
+    }
 
-        let (code, _) = publish_record(
-            &state,
-            &pinned,
-            fresh_upload("alpha", FILE, b"artifact".to_vec()),
-        )
-        .await
-        .expect_err("the filename is fenced");
-        assert_eq!(code, StatusCode::CONFLICT);
+    /// A yank is acked only for a file an index lists. Each of these records
+    /// is hidden from every index, and each used to take the edit with a 200
+    /// — a multi-bucket one then fanning the edited sidecar out.
+    #[tokio::test]
+    async fn a_yank_is_refused_on_a_record_no_index_lists() {
+        let cases: [(&str, Plant, StatusCode); 6] = [
+            (
+                "crashed delete: tombstone beside the live record",
+                |s, k| s.insert(&tombstone_key(k), b"{}".to_vec()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "torn freeze: marker beside the live record",
+                |s, k| s.insert(&frozen_key(k), b"{}".to_vec()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "unsettled demotion: fence over a mirror record",
+                |s, k| {
+                    s.insert(&sidecar::mirror_quarantined_key(k), b"{}".to_vec());
+                    s.insert(&sidecar_key(k), sidecar_bytes(origin::MIRROR));
+                },
+                StatusCode::CONFLICT,
+            ),
+            (
+                "late mirror under the private claim",
+                |s, k| s.insert(&sidecar_key(k), sidecar_bytes(origin::MIRROR)),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "supersede in flight",
+                |s, k| s.insert(&sidecar::superseding_key(k), b"{}".to_vec()),
+                StatusCode::CONFLICT,
+            ),
+            (
+                "sidecar with no body",
+                |s, k| s.remove(k),
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (name, plant, expected) in cases {
+            let (storage, key) = edited_record(plant).await;
+            let before = storage.get_bytes(&sidecar_key(&key)).await.unwrap();
+            assert_eq!(yank(&storage).await, expected, "{name}");
+            assert_eq!(
+                storage.get_bytes(&sidecar_key(&key)).await.unwrap(),
+                before,
+                "{name}: a refused yank must leave the sidecar untouched"
+            );
+        }
+    }
 
-        assert!(
-            !storage.head_exists(&key).await.unwrap(),
-            "a proven fence must leave no body behind under the spent filename"
-        );
+    /// The edits the index does show still go through — a spent demotion
+    /// fence beside private truth included, since every view reads past it.
+    #[tokio::test]
+    async fn a_yank_of_a_listed_record_lands() {
+        let plants: [Plant; 2] = [
+            |_, _| {},
+            |s, k| s.insert(&sidecar::mirror_quarantined_key(k), b"{}".to_vec()),
+        ];
+        for plant in plants {
+            let (storage, key) = edited_record(plant).await;
+            assert_eq!(yank(&storage).await, StatusCode::OK);
+            let sc: Sidecar =
+                serde_json::from_slice(&storage.get_bytes(&sidecar_key(&key)).await.unwrap())
+                    .unwrap();
+            assert_eq!(sc.yanked, Yanked::Flag(true));
+            assert_eq!(sc.yank_epoch, 1);
+        }
+    }
+
+    /// The fences are objects of their own, so the sidecar CAS cannot see a
+    /// delete that lands between the check and the write. The check runs
+    /// again once the write is in: the delete wins and the yank is not acked.
+    #[tokio::test]
+    async fn a_delete_landing_mid_yank_is_not_acked() {
+        let (storage, key) = edited_record(|_, _| {}).await;
+        let tombstone = tombstone_key(&key);
+        storage.before_write_of(&sidecar_key(&key), move |objects| {
+            objects.insert(tombstone, b"{}".to_vec());
+        });
+        assert_eq!(yank(&storage).await, StatusCode::CONFLICT);
     }
 }

@@ -213,3 +213,70 @@ def test_deleted_filename_cannot_be_reused(stocked_server):
     )
     assert status == 409
     assert b"deleted and cannot be reused" in body, body
+
+
+def test_yank_is_refused_on_a_file_no_index_lists(disk_server, tmp_path):
+    """A yank is acked only for a file the index shows. A crashed delete (a
+    tombstone beside the live record), a torn freeze (`.frozen` beside it) and
+    a sidecar whose body is gone are all hidden from every index; each used to
+    take the edit with a 200 and rewrite the sidecar anyway."""
+    server = disk_server
+    creds = {"username": server["user"], "password": server["password"]}
+    pkg = "yankfence"
+    pkg_dir = server["data_dir"] / "packages" / pkg
+    cases = {
+        "1.0": (lambda name: (pkg_dir / f"{name}.tombstone").write_text("{}"), 409),
+        "2.0": (lambda name: (pkg_dir / f"{name}.frozen").write_text("{}"), 409),
+        "3.0": (lambda name: (pkg_dir / name).unlink(), 404),
+    }
+    wheels = {version: make_wheel(pkg, version, tmp_path) for version in [*cases, "4.0"]}
+    for wheel in wheels.values():
+        upload_legacy(server["legacy"], wheel, **creds)
+        wait_for_file_in_index(server["simple"], pkg, wheel.name)
+
+    for version, (plant, expected) in cases.items():
+        name = wheels[version].name
+        plant(name)
+        sidecar = pkg_dir / f"{name}.meta.json"
+        before = sidecar.read_bytes()
+        url = f"{server['base_url']}/files/{pkg}/{name}/yank"
+        code, body, _ = http_request_auth("POST", url, data=b"withdrawn", **creds)
+        assert code == expected, (version, body)
+        assert sidecar.read_bytes() == before, (
+            f"{version}: a refused yank must not edit the sidecar"
+        )
+
+    # The listed file next to them still takes the edit.
+    live = wheels["4.0"].name
+    url = f"{server['base_url']}/files/{pkg}/{live}/yank"
+    code, body, _ = http_request_auth("POST", url, data=b"withdrawn", **creds)
+    assert code == 200, body
+    deadline = time.time() + 15.0
+    while time.time() < deadline:
+        doc = http_get_json(f"{server['simple']}{pkg}/", headers={"Accept": ACCEPT_PEP691})
+        if any(f["filename"] == live and f["yanked"] for f in doc["files"]):
+            break
+        time.sleep(0.2)
+    else:
+        pytest.fail("the listed file's yank never reached the index")
+
+
+def test_frozen_filename_cannot_be_uploaded_on_one_bucket(disk_server, tmp_path):
+    """`.frozen` bars its filename in single-bucket mode too — a fleet shrunk to
+    one bucket keeps its torn freezes. The upload used to pass a tombstone-only
+    check, get acked, and then stay unlisted and 404 by direct URL for good."""
+    server = disk_server
+    creds = {"username": server["user"], "password": server["password"]}
+    pkg = "frozenname"
+    anchor = make_wheel(pkg, "1.0", tmp_path)
+    upload_legacy(server["legacy"], anchor, **creds)
+    wait_for_file_in_index(server["simple"], pkg, anchor.name)
+
+    wheel = make_wheel(pkg, "2.0", tmp_path)
+    pkg_dir = server["data_dir"] / "packages" / pkg
+    (pkg_dir / f"{wheel.name}.frozen").write_text("{}")
+    status, body = upload_legacy(server["legacy"], wheel, expect_status=409, **creds)
+    assert status == 409
+    assert b"frozen or deleted" in body, body
+    assert not (pkg_dir / wheel.name).exists(), "the refused upload must not leave its body"
+    assert http_get(f"{server['base_url']}/files/{pkg}/{wheel.name}")[0] == 404

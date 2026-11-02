@@ -4736,6 +4736,9 @@ pub mod test_support {
             self.objects.lock().unwrap().insert(key.to_string(), bytes);
             self.writes.lock().unwrap().push(key.to_string());
         }
+        pub fn remove(&self, key: &str) {
+            self.objects.lock().unwrap().remove(key);
+        }
         /// Keys written so far, in order (duplicates kept).
         pub fn write_log(&self) -> Vec<String> {
             self.writes.lock().unwrap().clone()
@@ -4835,7 +4838,8 @@ pub mod test_support {
                 .ok_or_else(|| NotFound(key.to_string()).into())
         }
         /// Run `f` over the object map right before the next `put_bytes`,
-        /// `put_if_absent` or `delete_keys` touching `key` applies (one-shot).
+        /// `put_if_absent`, `put_if_match` or `delete_keys` touching `key`
+        /// applies (one-shot).
         pub fn before_write_of(
             &self,
             key: &str,
@@ -5051,6 +5055,7 @@ pub mod test_support {
             if unpack_version(etag).version.is_none() {
                 anyhow::bail!("version required for conditional update: {key}");
             }
+            self.run_before_write(&[key]);
             let mut map = self.objects.lock().unwrap();
             match map.get(key) {
                 Some(current) if cas_token(current) == etag => {

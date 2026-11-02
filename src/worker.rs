@@ -681,7 +681,9 @@ pub async fn run_worker_until(
     // safe — rebuilds are idempotent, and where they straddle a mutation and
     // the staler one lands last, the next audit repairs the view it left
     // (dev/DESIGN.md, "Split-brain is harmless"; the VOPR classifies that
-    // outcome as class 3). Note that no lease separates these two: this
+    // outcome as class 3). When the audit is itself the staler writer it
+    // stores no fingerprint and re-arms the package's dirty marker instead
+    // (`audit_certificate`). Note that no lease separates these two: this
     // concurrency exists on a single, undisputed leader.
     let mut last_audit: Option<Instant> = if state.audit_on_boot {
         None
@@ -1911,11 +1913,11 @@ struct ShardAudit {
 }
 
 /// One package's audit inputs, derived from the flat listing in a single pass:
-/// `(name, fingerprint, has-live-artifacts, has-materialized-view,
-/// interrupted-deletes, orphaned-companions)`. The two trailing lists are the
-/// debris the listing flagged for repair (a crashed delete's remnants, and a
-/// companion stranded beside a vanished artifact).
-type PackageAudit = (String, String, bool, bool, Vec<String>, Vec<String>);
+/// `(name, fingerprint, truth-only fingerprint, has-live-artifacts,
+/// has-materialized-view, interrupted-deletes, orphaned-companions)`. The two
+/// trailing lists are the debris the listing flagged for repair (a crashed
+/// delete's remnants, and a companion stranded beside a vanished artifact).
+type PackageAudit = (String, String, String, bool, bool, Vec<String>, Vec<String>);
 
 /// Audit every package whose name starts with `shard`. `collect_deltas` gathers
 /// transparency-checkpoint deltas (off when `--transparency` is disabled);
@@ -1985,6 +1987,7 @@ async fn audit_shard(
     let mut packages: Vec<PackageAudit> = Vec::with_capacity(by_pkg.len());
     for (pkg, (t, v)) in by_pkg {
         let fp = fingerprint(&t, &v);
+        let truth_fp = fingerprint(&t, &[]);
         // Count artifacts and distinct versions straight off the listing — the
         // same bytes the fingerprint already walked, so the inventory is free.
         let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
@@ -2099,6 +2102,7 @@ async fn audit_shard(
         packages.push((
             pkg,
             fp,
+            truth_fp,
             file_count > 0,
             has_package_view,
             interrupted_deletes,
@@ -2109,13 +2113,14 @@ async fn audit_shard(
     for chunk in packages.chunks(PACKAGE_SWEEP_CONCURRENCY) {
         let jobs = chunk
             .iter()
-            .map(|(pkg, fp, has_artifacts, has_package_view, interrupted_deletes, orphan_companions)| {
+            .map(|(pkg, fp, truth_fp, has_artifacts, has_package_view, interrupted_deletes, orphan_companions)| {
             let fingerprint_unchanged = stored.get(pkg.as_str()) == Some(fp)
                 && interrupted_deletes.is_empty()
                 && orphan_companions.is_empty();
-            let (pkg, fp, has_artifacts, has_package_view, interrupted_deletes, orphan_companions) = (
+            let (pkg, fp, truth_fp, has_artifacts, has_package_view, interrupted_deletes, orphan_companions) = (
                 pkg.clone(),
                 fp.clone(),
+                truth_fp.clone(),
                 *has_artifacts,
                 *has_package_view,
                 interrupted_deletes.clone(),
@@ -2239,15 +2244,27 @@ async fn audit_shard(
                         delta,
                     );
                 }
-                match rebuild_package_excluding(state, storage, &pkg, None).await {
-                    Ok((live_now, shas)) => {
-                        // Fingerprint what the rebuild actually saw/wrote, not
-                        // the pre-rebuild listing — two cheap per-package lists.
-                        let new_fp = package_fingerprint(storage, &pkg).await.ok();
-                        // The rebuild's own sidecar reads produced `shas`; commit
-                        // them (an empty map = the package became dead).
-                        let delta = collect_deltas.then_some(shas);
-                        (pkg, new_fp, live_now, true, maintenance_failed, delta)
+                match rebuild_selected_package(state, storage, &pkg, None, OnFailure::Rearm).await {
+                    Ok(rebuilt) => {
+                        // The rebuild's own sidecar reads produced the shas;
+                        // commit them (an empty map = the package became
+                        // dead). Even an uncertified pass's map is a real
+                        // past state; the next pass commits the newer one.
+                        let delta = collect_deltas.then_some(rebuilt.file_shas);
+                        match certify_audit_rebuild(storage, &pkg, &truth_fp, &rebuilt.views).await {
+                            Some(new_fp) => {
+                                (pkg, Some(new_fp), rebuilt.still_live, true, maintenance_failed, delta)
+                            }
+                            // The view this pass wrote may already be stale
+                            // (truth moved under it) or overwritten by another
+                            // writer: vouch for nothing. No fingerprint means
+                            // the next audit rebuilds it, and "dead, no
+                            // fingerprint" never removes — the tail re-arms the
+                            // package's dirty marker so the tick re-renders it
+                            // from fresh truth. Not `live` either: that liveness
+                            // came from the truth that may have moved.
+                            None => (pkg, None, false, true, maintenance_failed, delta),
+                        }
                     }
                     Err(e) => {
                         // Conservative on failure: leave this package's global
@@ -2446,6 +2463,83 @@ fn fingerprint(truth: &[&ObjectMeta], views: &[&ObjectMeta]) -> String {
         hasher.update([0]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// The fingerprint an audit rebuild may store for `pkg`, or `None` when the
+/// pass cannot vouch for the view it now sees. Re-lists the package and reads
+/// back the views the rebuild rendered; [`audit_certificate`] decides.
+async fn certify_audit_rebuild(
+    storage: &dyn Storage,
+    pkg: &str,
+    walk_truth: &str,
+    rendered: &[(String, Vec<u8>)],
+) -> Option<String> {
+    let (truth, views) = futures::future::try_join(
+        storage.list_all(&format!("{PACKAGES_PREFIX}{pkg}/")),
+        storage.list_all(&format!("{SIMPLE_PREFIX}{pkg}/")),
+    )
+    .await
+    .ok()?;
+    let reads = rendered.iter().map(|(key, _)| storage.get_bytes(key));
+    let read_back: Vec<Option<Vec<u8>>> = futures::future::join_all(reads)
+        .await
+        .into_iter()
+        .map(Result::ok)
+        .collect();
+    audit_certificate(pkg, walk_truth, &truth, &views, rendered, &read_back)
+}
+
+/// What an audit rebuild may record as `pkg`'s fingerprint: the post-rebuild
+/// listing's, but only when that listing provably describes this pass's own
+/// render of unchanged truth. The skip gate trusts a stored fingerprint
+/// forever, and nothing stops the tick (or a sloppy second leader) rebuilding
+/// the same package concurrently, so certifying whatever the post-listing
+/// shows blessed a stale view for good:
+///
+/// - truth moved under the rebuild: a delete lands after its listing, the tick
+///   renders it and consumes the markers, then the audit's older render
+///   overwrites it — and its fingerprint of (new truth, stale view) matches
+///   every later walk;
+/// - another writer's stale view lands after the audit's own write.
+///
+/// So: the truth listed now must be the truth the walk saw (`walk_truth`,
+/// truth-only). Listings run walk → rebuild → here, and every truth write
+/// produces a (key, size, etag) never seen before, so equality means the
+/// rebuild rendered exactly this truth (a write reverted to identical bytes
+/// inside the window is the residual ABA; it renders nothing). And each
+/// package view must be present exactly when rendered, holding the rendered
+/// bytes (`read_back`, aligned with `rendered`).
+fn audit_certificate(
+    pkg: &str,
+    walk_truth: &str,
+    truth: &[ObjectMeta],
+    views: &[ObjectMeta],
+    rendered: &[(String, Vec<u8>)],
+    read_back: &[Option<Vec<u8>>],
+) -> Option<String> {
+    let truth: Vec<&ObjectMeta> = truth.iter().collect();
+    if fingerprint(&truth, &[]) != walk_truth {
+        return None;
+    }
+    let canonical = [
+        format!("{SIMPLE_PREFIX}{pkg}/index.html"),
+        format!("{SIMPLE_PREFIX}{pkg}/index.json"),
+    ];
+    let mut listed: Vec<&str> = views
+        .iter()
+        .map(|view| view.key.as_str())
+        .filter(|key| canonical.iter().any(|c| c == key))
+        .collect();
+    let mut wanted: Vec<&str> = rendered.iter().map(|(key, _)| key.as_str()).collect();
+    listed.sort_unstable();
+    wanted.sort_unstable();
+    let views_are_ours = listed == wanted
+        && read_back.len() == rendered.len()
+        && rendered
+            .iter()
+            .zip(read_back)
+            .all(|((_, bytes), read)| read.as_ref() == Some(bytes));
+    views_are_ours.then(|| fingerprint(&truth, &views.iter().collect::<Vec<_>>()))
 }
 
 /// Re-derive one package's fingerprint from fresh listings (post-rebuild).
@@ -2677,6 +2771,9 @@ pub(crate) struct RebuiltPackage {
     raw_artifacts: Vec<(String, u64)>,
     /// The renderable file→sha256 map (the transparency chain's commitment).
     file_shas: FileShas,
+    /// The package views this rebuild left: key → rendered bytes, empty when
+    /// it removed them. The audit reads them back before trusting a listing.
+    views: Vec<(String, Vec<u8>)>,
 }
 
 /// Rebuild only a package's index views from `storage`'s own truth, touching no
@@ -2767,8 +2864,9 @@ async fn rebuild_package_indexes_inner(
     // is dropped from the index but still counted as stored — matching the
     // audit, so the two inventory writers can't disagree.
     let live = !files.is_empty();
+    let mut views = Vec::new();
     if live {
-        write_pkg_indexes(state, storage, pkg, &files).await?;
+        views = write_pkg_indexes(state, storage, pkg, &files).await?;
     } else {
         let keys = [
             format!("{SIMPLE_PREFIX}{pkg}/index.html"),
@@ -2788,6 +2886,7 @@ async fn rebuild_package_indexes_inner(
         still_live: live,
         raw_artifacts: raw,
         file_shas: shas,
+        views,
     })
 }
 
@@ -4436,7 +4535,7 @@ async fn write_pkg_indexes(
     storage: &dyn Storage,
     pkg: &str,
     files: &[FileMetadata],
-) -> Result<()> {
+) -> Result<Vec<(String, Vec<u8>)>> {
     // Status is per-project truth (PEP 792). A read error propagates — we
     // re-render against the prior index rather than assume `active` and, say,
     // re-expose links for a project that should be quarantined.
@@ -4460,23 +4559,17 @@ async fn write_pkg_indexes(
     let json = pep691_project_json(pkg, render_files, &status);
 
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
-    put_if_changed(
-        state,
-        storage,
-        &format!("{base}index.html"),
-        html.into_bytes(),
-        SIMPLE_HTML_CONTENT_TYPE,
-    )
-    .await?;
-    put_if_changed(
-        state,
-        storage,
-        &format!("{base}index.json"),
-        json.into_bytes(),
-        SIMPLE_JSON_CONTENT_TYPE,
-    )
-    .await?;
-    Ok(())
+    let views = vec![
+        (format!("{base}index.html"), html.into_bytes()),
+        (format!("{base}index.json"), json.into_bytes()),
+    ];
+    for ((key, bytes), ct) in views
+        .iter()
+        .zip([SIMPLE_HTML_CONTENT_TYPE, SIMPLE_JSON_CONTENT_TYPE])
+    {
+        put_if_changed(state, storage, key, bytes.clone(), ct).await?;
+    }
+    Ok(views)
 }
 
 async fn write_global_indexes(
@@ -4967,6 +5060,214 @@ mod tests {
         let dead: Vec<&str> = audit.dead.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(dead, vec![pkg]);
         assert_eq!(audit.skipped, 1);
+    }
+
+    fn meta(key: &str, etag: &str) -> ObjectMeta {
+        ObjectMeta {
+            key: key.to_string(),
+            size: 1,
+            etag: etag.to_string(),
+        }
+    }
+
+    /// Every way a post-rebuild observation can fail to be this pass's own
+    /// render of unchanged truth withholds the certificate; only the exact
+    /// match earns one, and it is the full (truth + views) fingerprint.
+    #[test]
+    fn an_audit_certifies_only_its_own_render_of_unmoved_truth() {
+        let truth = vec![meta("packages/pkg/pkg-1.0.whl", "t1")];
+        let walk = fingerprint(&truth.iter().collect::<Vec<_>>(), &[]);
+        let html = format!("{SIMPLE_PREFIX}pkg/index.html");
+        let json = format!("{SIMPLE_PREFIX}pkg/index.json");
+        let views = vec![meta(&html, "h"), meta(&json, "j")];
+        let rendered = vec![(html.clone(), b"H".to_vec()), (json.clone(), b"J".to_vec())];
+        let ours = vec![Some(b"H".to_vec()), Some(b"J".to_vec())];
+        let full = |views: &[ObjectMeta]| {
+            fingerprint(
+                &truth.iter().collect::<Vec<_>>(),
+                &views.iter().collect::<Vec<_>>(),
+            )
+        };
+
+        assert_eq!(
+            audit_certificate("pkg", &walk, &truth, &views, &rendered, &ours),
+            Some(full(&views))
+        );
+        // A stray non-view object is fingerprinted but not a view mismatch.
+        let mut stray = views.clone();
+        stray.push(meta(&format!("{SIMPLE_PREFIX}pkg/notes.txt"), "n"));
+        assert_eq!(
+            audit_certificate("pkg", &walk, &truth, &stray, &rendered, &ours),
+            Some(full(&stray))
+        );
+        // A dead package certifies its views' absence.
+        assert_eq!(
+            audit_certificate("pkg", &walk, &truth, &[], &[], &[]),
+            Some(full(&[]))
+        );
+
+        let moved = vec![meta("packages/pkg/pkg-1.0.whl", "t2")];
+        let refused = |truth: &[ObjectMeta],
+                       views: &[ObjectMeta],
+                       rendered: &[(String, Vec<u8>)],
+                       read_back: &[Option<Vec<u8>>]| {
+            audit_certificate("pkg", &walk, truth, views, rendered, read_back).is_none()
+        };
+        assert!(refused(&moved, &views, &rendered, &ours), "truth moved");
+        assert!(
+            refused(
+                &truth,
+                &views,
+                &rendered,
+                &[Some(b"H".to_vec()), Some(b"old".to_vec())]
+            ),
+            "a view holds someone else's bytes"
+        );
+        assert!(
+            refused(&truth, &views, &rendered, &[Some(b"H".to_vec()), None]),
+            "a view read failed"
+        );
+        assert!(
+            refused(&truth, &views[..1], &rendered, &ours),
+            "a rendered view is missing"
+        );
+        assert!(
+            refused(&truth, &views, &[], &[]),
+            "a removed view came back"
+        );
+    }
+
+    async fn stored_fingerprints(storage: &InMemStorage, shard: char) -> HashMap<String, String> {
+        let key = format!("{STATE_PREFIX}fp-{shard}.json");
+        serde_json::from_slice(&storage.get_bytes(&key).await.unwrap()).unwrap()
+    }
+
+    async fn package_json(storage: &InMemStorage, pkg: &str) -> String {
+        let bytes = storage
+            .get_bytes(&format!("{SIMPLE_PREFIX}{pkg}/index.json"))
+            .await
+            .unwrap();
+        String::from_utf8(bytes).unwrap()
+    }
+
+    /// A delete lands while the audit renders: the audit's view (still
+    /// listing the file) is written after truth moved. It must not store a
+    /// fingerprint of (new truth, stale view) — that matched every later walk,
+    /// so the skip gate kept the deleted file listed until the package next
+    /// changed — and the next audit must rebuild it.
+    #[tokio::test]
+    async fn an_audit_rebuild_that_raced_a_delete_blesses_nothing() {
+        const KEPT: &str = "pkg-1.0-py3-none-any.whl";
+        const GONE: &str = "pkg-2.0-py3-none-any.whl";
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        seed_private_artifact(&storage, "pkg", KEPT);
+        seed_private_artifact(&storage, "pkg", GONE);
+        let gone = format!("{PACKAGES_PREFIX}pkg/{GONE}");
+        storage.before_write_of(&format!("{SIMPLE_PREFIX}pkg/index.html"), move |objects| {
+            objects.remove(&sidecar_key(&gone));
+            objects.remove(&gone);
+        });
+
+        let audit = audit_shard(&state, storage.as_ref(), 0, 'p', false, false, false, None)
+            .await
+            .unwrap();
+        assert!(
+            package_json(&storage, "pkg").await.contains(GONE),
+            "test setup broken: the race never put a stale view in place"
+        );
+        assert!(!stored_fingerprints(&storage, 'p').await.contains_key("pkg"));
+        assert_eq!(audit.dead, vec![("pkg".to_string(), None)]);
+        assert!(audit.live.is_empty());
+
+        let audit = audit_shard(&state, storage.as_ref(), 0, 'p', false, false, false, None)
+            .await
+            .unwrap();
+        assert_eq!((audit.rebuilt, audit.skipped), (1, 0));
+        let json = package_json(&storage, "pkg").await;
+        assert!(json.contains(KEPT) && !json.contains(GONE), "{json}");
+        assert!(stored_fingerprints(&storage, 'p').await.contains_key("pkg"));
+    }
+
+    /// Truth never moves, but another writer's stale view lands after the
+    /// audit's own write (a sloppy second leader's tick, say). Comparing truth
+    /// alone would certify it; the view read-back refuses.
+    #[tokio::test]
+    async fn an_audit_does_not_certify_a_view_another_writer_overwrote() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        seed_private_artifact(&storage, "pkg", "pkg-1.0-py3-none-any.whl");
+        let html = format!("{SIMPLE_PREFIX}pkg/index.html");
+        let stale = html.clone();
+        storage.before_write_of(&format!("{SIMPLE_PREFIX}pkg/index.json"), move |objects| {
+            objects.insert(stale, b"stale".to_vec());
+        });
+
+        audit_shard(&state, storage.as_ref(), 0, 'p', false, false, false, None)
+            .await
+            .unwrap();
+        assert!(!stored_fingerprints(&storage, 'p').await.contains_key("pkg"));
+
+        let audit = audit_shard(&state, storage.as_ref(), 0, 'p', false, false, false, None)
+            .await
+            .unwrap();
+        assert_eq!((audit.rebuilt, audit.skipped), (1, 0));
+        assert_ne!(storage.get_bytes(&html).await.unwrap(), b"stale".to_vec());
+    }
+
+    /// A brand-new package's first artifact lands while the audit, having
+    /// walked only its origin claim, renders it dead — deleting the view the
+    /// tick just wrote. The full audit must neither re-prove that observation
+    /// into a global-index removal (it used to: its fingerprint was taken
+    /// after its own delete, so the re-proof always matched) nor leave the
+    /// package without a marker to re-render it.
+    #[tokio::test]
+    async fn an_audit_that_raced_a_new_package_keeps_it_listed_and_rearms_it() {
+        const FILE: &str = "pkg-1.0-py3-none-any.whl";
+        let storage = Arc::new(InMemStorage::default());
+        let state = test_app_state(storage.clone(), Duration::from_secs(3600));
+        let pinned = state.pin();
+        storage.insert(&crate::origin::origin_key("pkg"), b"private".to_vec());
+        update_global_index(&state, storage.as_ref(), &["pkg".to_string()], &[])
+            .await
+            .unwrap();
+        let artifact = format!("{PACKAGES_PREFIX}pkg/{FILE}");
+        let sidecar = serde_json::to_vec(&test_sidecar(8, Some(crate::origin::PRIVATE))).unwrap();
+        storage.before_write_of(&format!("{SIMPLE_PREFIX}pkg/index.json"), move |objects| {
+            objects.insert(sidecar_key(&artifact), sidecar);
+            objects.insert(artifact, b"artifact".to_vec());
+        });
+
+        audit(&state, &pinned, false).await.unwrap();
+        assert_eq!(
+            global_html(&storage).await,
+            pep503_global_html(&["pkg".to_string()]),
+            "an uncertified dead observation must not delist the package"
+        );
+        assert!(!dirty_keys(&storage).await.is_empty());
+
+        tick(&state, &pinned).await.unwrap();
+        assert!(package_json(&storage, "pkg").await.contains(FILE));
+    }
+
+    /// Control: with nothing racing, the audit still certifies its rebuild and
+    /// the next pass skips the package — the guard must not bless nothing.
+    #[tokio::test]
+    async fn an_unraced_audit_rebuild_is_certified_and_then_skipped() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        seed_private_artifact(&storage, "pkg", "pkg-1.0-py3-none-any.whl");
+
+        let audit = audit_shard(&state, storage.as_ref(), 0, 'p', false, false, false, None)
+            .await
+            .unwrap();
+        assert_eq!(audit.live, vec!["pkg".to_string()]);
+        assert!(stored_fingerprints(&storage, 'p').await.contains_key("pkg"));
+
+        let audit = audit_shard(&state, storage.as_ref(), 0, 'p', false, false, false, None)
+            .await
+            .unwrap();
+        assert_eq!((audit.rebuilt, audit.skipped), (0, 1));
     }
 
     #[tokio::test]

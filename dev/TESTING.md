@@ -1268,7 +1268,11 @@ from the run's recorded effect history — no replays — into one of three caus
    (a day at the production default). The add direction (a stale write
    re-listing a name a fresher write removed) stays class 3: live observations
    are unverified by design, and its harm is a ghost listing, not a vanished
-   publish.
+   publish. The audit can itself be the staler writer (it races the tick on
+   every leader); it never certifies that: a fingerprint is stored only for a
+   rebuild whose truth listing is unchanged since the walk and whose views read
+   back as its own render, else the package gets no fingerprint and a fresh
+   dirty marker (`audit_certificate`, src/worker.rs).
 
 The taxonomy is applied by **two** analyses, because a repaired view key can
 belong to either of two subsystems. A `simple/<pkg>/index.*` diff is explained
@@ -1889,6 +1893,16 @@ investigation with its own seed census. Reproduce with `--seed 770000370
 --rotate` against a tree whose `op_tick` runs `tokio::join!(tick, audit)` inside
 the lease. Landing the harness change before that is understood would turn the
 nightly lane red for a reason nobody has finished diagnosing.
+
+*Update, 2026-11-02.* The audit-as-stale-writer defect (the audit fingerprinted
+storage after its own write, blessing a view the tick had already superseded,
+and its dead re-proof then delisted a brand-new package) is fixed and pinned by
+in-crate tests (`an_audit_*` in src/worker.rs). Re-running the row-3 harness on
+that tree, `--rotate --start-seed 770000000 --seeds 30000` with `op_tick`
+running `tokio::join!(tick, audit)` inside the lease, is green both with and
+without the fix, `--seed 770000370` included: the 27-seed census no longer
+reproduces, so the VOPR neither corroborates nor refutes the fix. The
+concurrent-audit op is still not landed (roadmap).
 
 So class 3 **stays**, and stays honestly labelled: `--break race` closes the
 *soundness* question — the arm evaluates and prints its finding, on both

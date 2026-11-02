@@ -110,7 +110,12 @@ stored at its last rebuild in `_state/fp-*.json`. Unchanged packages cost
 zero reads; only the diff gets rebuilt. Audit cost scales with churn, not
 corpus size: a full-PyPI-sized tree (17M files) audits for ~$0.25 of LIST
 requests instead of ~$11 of GETs per old-style sweep. `pypiron rebuild-index` is the
-same pass with fingerprints ignored — the rebuild-the-world button. `pypiron
+same pass with fingerprints ignored — the rebuild-the-world button.
+A stored fingerprint certifies the audit's own render of truth that did not
+move: a rebuild whose truth listing changed under it, or whose views no longer
+hold what it wrote (the tick or a second leader got there too), stores none
+and re-arms the package's dirty marker — otherwise the audit, racing the tick,
+could bless its own stale view for good. `pypiron
 verify` is its read-only twin: recompute everything, diff, exit nonzero.
 
 The fingerprint is salted with `render::RENDER_VERSION`. A change to the bytes

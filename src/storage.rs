@@ -4666,7 +4666,13 @@ pub mod test_support {
         /// Impersonate an object-store backend for [`Storage::buffers_uploads_in_ram`]
         /// so a test can exercise the publish path's in-RAM-write concurrency cap.
         buffers_uploads_in_ram: AtomicBool,
+        /// `(key, f)`: run `f` over the object map just before the next write
+        /// or delete of `key` lands (one-shot) — another writer finishing in
+        /// the gap between a caller's decision and its unconditional write.
+        before_write: Mutex<Option<(String, ObjectsHook)>>,
     }
+
+    type ObjectsHook = Box<dyn FnOnce(&mut HashMap<String, Vec<u8>>) + Send>;
 
     impl InMemStorage {
         pub fn insert(&self, key: &str, bytes: Vec<u8>) {
@@ -4748,6 +4754,27 @@ pub mod test_support {
             self.get_delay_ms
                 .store(delay.as_millis() as u64, Ordering::SeqCst);
         }
+        /// Run `f` over the object map right before the next `put_bytes` or
+        /// `delete_keys` touching `key` applies (one-shot).
+        pub fn before_write_of(
+            &self,
+            key: &str,
+            f: impl FnOnce(&mut HashMap<String, Vec<u8>>) + Send + 'static,
+        ) {
+            *self.before_write.lock().unwrap() = Some((key.to_string(), Box::new(f)));
+        }
+        fn run_before_write(&self, keys: &[&str]) {
+            let hook = {
+                let mut armed = self.before_write.lock().unwrap();
+                match armed.as_ref() {
+                    Some((key, _)) if keys.contains(&key.as_str()) => armed.take(),
+                    _ => None,
+                }
+            };
+            if let Some((_, f)) = hook {
+                f(&mut self.objects.lock().unwrap());
+            }
+        }
     }
 
     #[async_trait::async_trait]
@@ -4800,6 +4827,7 @@ pub mod test_support {
             if self.unwritable(key) {
                 anyhow::bail!("injected storage failure");
             }
+            self.run_before_write(&[key]);
             self.insert(key, bytes);
             Ok(())
         }
@@ -4864,6 +4892,7 @@ pub mod test_support {
             if keys.iter().any(|k| self.unwritable(k)) {
                 anyhow::bail!("injected storage failure");
             }
+            self.run_before_write(&keys.iter().map(String::as_str).collect::<Vec<_>>());
             let mut map = self.objects.lock().unwrap();
             for k in keys {
                 map.remove(k);

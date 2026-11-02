@@ -230,9 +230,10 @@ pub struct AdvisoryState {
     /// space on some backends (see [`Storage::head_etag`]).
     pub quarantined_etag: Option<String>,
     /// The envelope epoch of the loaded quarantined set (0 = never loaded, or
-    /// never published). Monotone on this node: a poll, a startup hydration and a
-    /// reseed all refuse a set whose epoch is below this one, so a failover onto a
-    /// bucket holding an older copy can never un-block a live quarantine.
+    /// never published). Monotone on this node: every set that carries an epoch
+    /// enters through [`adopt_quarantined`], which refuses one below this value
+    /// under the write lock, so neither a failover onto a bucket holding an older
+    /// copy nor a poll whose GET raced a local publish can un-block a quarantine.
     pub quarantined_epoch: u64,
     /// True while `quarantined` carries a local arm that no epoch owns yet —
     /// `arm_local_quarantine` edits the live set the instant a status write lands
@@ -1143,7 +1144,10 @@ const QUARANTINED_CAS_ATTEMPTS: usize = 8;
 /// * an unreadable body — including the pre-envelope bare array, which now fails
 ///   to parse on purpose;
 /// * a body at a *lower* epoch than the one in memory — an older copy on a bucket
-///   the last publish never reached.
+///   the last publish never reached, or one read before a local publish landed
+///   while this GET was in flight. The comparison is against the live value,
+///   under the lock ([`adopt_quarantined`]), never the snapshot read before the
+///   await.
 ///
 /// The db and feed identity are carried forward under the lock (see [`reload`]).
 async fn reload_quarantined(
@@ -1171,29 +1175,19 @@ async fn reload_quarantined(
             return Ok(());
         }
     };
-    if stored.epoch < loaded.quarantined_epoch {
-        // Keep the newer set — a quarantine must never un-block by moving
-        // backwards — but adopt the etag so this poll stops re-reading the same
-        // stale body every interval. The leader's reseed writes ours back over it.
+    let epoch = stored.epoch;
+    if let Refused::Older { live } =
+        adopt_quarantined(slot, stored.quarantined.into_iter().collect(), epoch, etag)
+    {
+        // The newer set stays — a quarantine must never un-block by moving
+        // backwards — and the etag was still adopted, so this poll stops
+        // re-reading the same stale body. The leader's reseed writes ours back.
         warn!(
-            stored = stored.epoch,
-            loaded = loaded.quarantined_epoch,
+            stored = epoch,
+            loaded = live,
             "quarantine: the stored set is older than the one in memory; keeping the newer one (reseed will heal the bucket)"
         );
-        swap_quarantined(
-            slot,
-            loaded.quarantined.clone(),
-            loaded.quarantined_epoch,
-            etag,
-        );
-        return Ok(());
     }
-    swap_quarantined(
-        slot,
-        stored.quarantined.into_iter().collect(),
-        stored.epoch,
-        etag,
-    );
     Ok(())
 }
 
@@ -1207,25 +1201,69 @@ pub async fn poll_quarantined(storage: &dyn Storage, slot: &RwLock<Arc<AdvisoryS
     }
 }
 
-/// Swap the quarantined set, its epoch and its etag into the live snapshot,
-/// carrying the db and feed identity forward under the write lock (a refcount
-/// bump each, no deep clone, no await). Callers own the monotonicity check.
-fn swap_quarantined(
+/// Why [`adopt_quarantined`] kept the live set instead of the offered one.
+#[derive(Debug, PartialEq, Eq)]
+enum Refused {
+    /// Nothing refused: the offered set is live now.
+    No,
+    /// The offered epoch is below the live one.
+    Older { live: u64 },
+    /// Same epoch, but this node holds a local arm that epoch does not contain.
+    PendingArm,
+}
+
+/// The one way a set that carries an epoch enters the live snapshot — a poll, a
+/// publish's confirmation and a publish's own write all come through here. The
+/// "never move backwards" decision and the write happen under one write lock
+/// against the LIVE value, never against a snapshot read before an await: a
+/// local publish or arm can land while a poll's GET is in flight, and a check
+/// against the pre-GET snapshot would install the older body over it.
+///
+/// The set and epoch are kept when the offered epoch is lower, or when it is
+/// equal but this node holds an unpublished local arm the offered set lacks — at
+/// the same epoch that arm is newer information than the stored body. An equal
+/// epoch carrying the identical set is a confirmation and clears the flag. Only a
+/// strictly newer epoch overrides a pending arm; that arm's own publish (or the
+/// marker-driven retry behind it) is what puts it back. The etag, a change
+/// detector only, is always adopted, so a refused body is not re-read every poll.
+///
+/// Carries the db and feed identity forward (a refcount bump each, no await).
+fn adopt_quarantined(
     slot: &RwLock<Arc<AdvisoryState>>,
-    quarantined: HashSet<String>,
-    quarantined_epoch: u64,
-    quarantined_etag: Option<String>,
-) {
+    set: HashSet<String>,
+    epoch: u64,
+    etag: Option<String>,
+) -> Refused {
     let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
-    *guard = Arc::new(AdvisoryState {
-        quarantined,
-        quarantined_epoch,
-        quarantined_etag,
-        // This set and this epoch belong together — either we just wrote them or
-        // we just read them — so the re-seed may publish them again.
-        quarantined_unpublished: false,
-        ..(**guard).clone()
+    let refused = if epoch < guard.quarantined_epoch {
+        Refused::Older {
+            live: guard.quarantined_epoch,
+        }
+    } else if epoch == guard.quarantined_epoch
+        && guard.quarantined_unpublished
+        && set != guard.quarantined
+    {
+        Refused::PendingArm
+    } else {
+        Refused::No
+    };
+    *guard = Arc::new(if refused == Refused::No {
+        AdvisoryState {
+            quarantined: set,
+            quarantined_epoch: epoch,
+            quarantined_etag: etag,
+            // This set and this epoch belong together — either we just wrote
+            // them or we just read them — so the re-seed may publish them again.
+            quarantined_unpublished: false,
+            ..(**guard).clone()
+        }
+    } else {
+        AdvisoryState {
+            quarantined_etag: etag,
+            ..(**guard).clone()
+        }
     });
+    refused
 }
 
 /// Add or drop one name in this node's live set without touching storage or the
@@ -1249,27 +1287,6 @@ fn arm_local_quarantine(slot: &RwLock<Arc<AdvisoryState>>, pkg: &str, blocked: b
         // longer matches. Flag it so the re-seed does not hand these bytes to a
         // peer under that epoch; the publish below (or the next poll) clears it.
         quarantined_unpublished: true,
-        ..(**guard).clone()
-    });
-}
-
-/// Adopt a set a publish found already stored, without moving this node
-/// backwards: a confirmation is not a reason to drop a newer set.
-fn adopt_quarantined_if_newer(
-    slot: &RwLock<Arc<AdvisoryState>>,
-    set: &std::collections::BTreeSet<String>,
-    epoch: u64,
-) {
-    let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
-    if epoch < guard.quarantined_epoch {
-        return;
-    }
-    *guard = Arc::new(AdvisoryState {
-        quarantined: set.iter().cloned().collect(),
-        quarantined_epoch: epoch,
-        // Adopted from the stored body at its own epoch, so the pair is again
-        // one the re-seed may republish.
-        quarantined_unpublished: false,
         ..(**guard).clone()
     });
 }
@@ -1402,7 +1419,9 @@ pub async fn publish_quarantined(
             }
         };
         if next == have {
-            adopt_quarantined_if_newer(slot, &next, stored.epoch);
+            // A confirmation is not a reason to drop a newer set. No etag: the
+            // listing etag is a different token from the one just read.
+            adopt_quarantined(slot, next.into_iter().collect(), stored.epoch, None);
             return Ok(());
         }
         // Above the stored epoch AND above anything this node has ever seen, so a
@@ -1449,8 +1468,9 @@ pub async fn publish_quarantined(
         // moved. Adopting it would pin this node's poll to a body it never read
         // — `reload_quarantined` early-returns on an unchanged etag, so it would
         // never learn about the newer set. `None` costs one GET on the next poll
-        // and can never hide a freeze.
-        swap_quarantined(slot, next.into_iter().collect(), epoch, None);
+        // and can never hide a freeze. Adopted through the guarded path: a poll
+        // may have taken a newer epoch while the write-throughs above ran.
+        adopt_quarantined(slot, next.into_iter().collect(), epoch, None);
         return Ok(());
     }
     bail!("could not publish the quarantined set after {QUARANTINED_CAS_ATTEMPTS} attempts")
@@ -2564,7 +2584,7 @@ mod tests {
         hold_fenced_quarantine(&slot, "pkg", true);
         assert!(AdvisoryState::read(&slot).is_quarantined("pkg"));
         // A peer publishes an unrelated change: the poll swaps the whole set.
-        swap_quarantined(&slot, ["newer".to_string()].into(), 2, Some("e2".into()));
+        adopt_quarantined(&slot, ["newer".to_string()].into(), 2, Some("e2".into()));
         let snap = AdvisoryState::read(&slot);
         assert!(snap.is_quarantined("pkg"), "the hold is not the shared set");
         assert!(!snap.quarantined.contains("pkg"), "and never leaks into it");
@@ -2916,9 +2936,109 @@ mod tests {
     #[test]
     fn adopting_a_confirmed_set_never_drags_the_live_set_backwards() {
         let slot = slot_with(&["frozen"], 5);
-        adopt_quarantined_if_newer(&slot, &BTreeSet::new(), 4);
+        adopt_quarantined(&slot, HashSet::new(), 4, None);
         assert_eq!(live_names(&slot), ["frozen"]);
-        adopt_quarantined_if_newer(&slot, &BTreeSet::new(), 5);
+        adopt_quarantined(&slot, HashSet::new(), 5, None);
         assert!(live_names(&slot).is_empty());
+    }
+
+    #[test]
+    fn an_equal_epoch_keeps_a_pending_arm_but_a_matching_set_confirms_it() {
+        let slot = slot_with(&["a"], 5);
+        arm_local_quarantine(&slot, "b", true);
+        // The stored body at epoch 5 predates the arm: keep the arm.
+        assert_eq!(
+            adopt_quarantined(&slot, ["a".to_string()].into(), 5, Some("e".into())),
+            Refused::PendingArm
+        );
+        assert_eq!(live_names(&slot), ["a", "b"]);
+        assert!(AdvisoryState::read(&slot).quarantined_unpublished);
+        assert_eq!(
+            AdvisoryState::read(&slot).quarantined_etag.as_deref(),
+            Some("e")
+        );
+        // A body at 5 that already holds exactly this set confirms it, so the
+        // re-seed is not disabled forever after a failed-then-undone arm.
+        let same: HashSet<String> = ["a".to_string(), "b".to_string()].into();
+        assert_eq!(adopt_quarantined(&slot, same, 5, None), Refused::No);
+        assert!(!AdvisoryState::read(&slot).quarantined_unpublished);
+        // A genuinely newer epoch always wins over a pending arm.
+        arm_local_quarantine(&slot, "c", true);
+        assert_eq!(
+            adopt_quarantined(&slot, HashSet::new(), 6, None),
+            Refused::No
+        );
+        assert!(live_names(&slot).is_empty());
+    }
+
+    /// Storage holding `names` at `epoch`, for the race tests below.
+    async fn holding(names: &[&str], epoch: u64) -> InMemStorage {
+        let storage = InMemStorage::default();
+        let names: Vec<String> = names.iter().map(|name| name.to_string()).collect();
+        put_raw(&storage, encode_quarantined(names.iter(), epoch).unwrap()).await;
+        storage
+    }
+
+    #[tokio::test]
+    async fn a_poll_never_drags_a_publish_that_landed_during_its_get_backwards() {
+        // The poll lists a moved etag and starts a slow GET of the epoch-5 body.
+        // Meanwhile this node freezes `evil` and publishes epoch 6 (onto a bucket
+        // the poll did not read — a failover, or simply the read predating the
+        // write). The poll's body must not then replace epoch 6 with epoch 5.
+        let polled = holding(&["a"], 5).await;
+        let published = holding(&["a"], 5).await;
+        let slot = slot_with(&["a"], 4);
+        polled.set_get_delay(std::time::Duration::from_millis(100));
+        // `join!` polls in order: the poll runs to its delayed GET and parks,
+        // then the publish runs to completion inside that window.
+        let freeze = one("evil", true);
+        let (poll, publish) = tokio::join!(
+            reload_quarantined(&polled, &slot),
+            publish_quarantined(&published, &[], &slot, &freeze)
+        );
+        poll.unwrap();
+        publish.unwrap();
+        assert_eq!(AdvisoryState::read(&slot).quarantined_epoch, 6);
+        assert_eq!(live_names(&slot), ["a", "evil"]);
+    }
+
+    #[tokio::test]
+    async fn a_poll_keeps_a_local_arm_made_during_its_get() {
+        // The stale-body branch used to re-install the pre-GET snapshot, which
+        // dropped an arm made while the GET was in flight.
+        let storage = holding(&[], 2).await;
+        let slot = slot_with(&["frozen"], 5);
+        storage.set_get_delay(std::time::Duration::from_millis(100));
+        tokio::join!(
+            async { reload_quarantined(&storage, &slot).await.unwrap() },
+            async { arm_local_quarantine(&slot, "armed", true) }
+        );
+        assert_eq!(live_names(&slot), ["armed", "frozen"]);
+        assert!(AdvisoryState::read(&slot).quarantined_unpublished);
+    }
+
+    #[tokio::test]
+    async fn a_slow_publish_never_drags_the_node_below_a_set_a_poll_adopted() {
+        // A publish mints epoch 6, and while its peer write-through is in flight a
+        // poll adopts a peer's epoch 7. The publish's final adoption must not
+        // install its own older epoch over it.
+        let selected = holding(&["a"], 5).await;
+        let peer = holding(&["a"], 5).await;
+        let slot = Arc::new(slot_with(&["a"], 5));
+        let polled = Arc::clone(&slot);
+        peer.before_write_of(QUARANTINED_KEY, move |_| {
+            let newer = ["a", "b", "evil"].map(String::from).into();
+            adopt_quarantined(&polled, newer, 7, Some("e7".into()));
+        });
+        let peers = [crate::layout::ReplicaTarget {
+            storage: &peer,
+            name: "peer",
+        }];
+        publish_quarantined(&selected, &peers, &slot, &one("evil", true))
+            .await
+            .unwrap();
+        assert_eq!(stored_names(&selected).await, ["a", "evil"]);
+        assert_eq!(AdvisoryState::read(&slot).quarantined_epoch, 7);
+        assert_eq!(live_names(&slot), ["a", "b", "evil"]);
     }
 }

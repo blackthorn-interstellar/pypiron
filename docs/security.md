@@ -173,6 +173,12 @@ credentials cross an untrusted network.
   comparison.
 - Five failed logins from one address trigger a five-minute lockout by default.
   Lockouts are per server instance and IPv6 clients are grouped by `/64`.
+  Wrong passwords sent at the same time share those five tries: once five are
+  in flight, further logins from that address get `429` until one finishes.
+  Repeating the same credential across parallel requests counts as one try.
+- If tens of thousands of addresses are locked out or mid-login at once, logins
+  from further addresses get `429` until that clears. Existing lockouts are
+  never forgotten.
 - Cross-site state-changing requests are rejected, and every response includes
   `X-Content-Type-Options: nosniff`.
 - Client-supplied forwarding headers are ignored unless `--trusted-proxy` is

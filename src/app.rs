@@ -680,6 +680,14 @@ impl AppState {
         self.uploader_credential().is_none() && self.admin_credential().is_none()
     }
 
+    /// No credential of any kind is configured, so there is nothing to guess:
+    /// whatever a client sends in `Authorization` is attribution at most.
+    fn credential_free(&self) -> bool {
+        self.uploads_disabled()
+            && self.read_credential().is_none()
+            && nonempty(self.token_signing_key.as_deref()).is_none()
+    }
+
     /// The role granted by a valid `__token__` bearer token, if token auth is
     /// configured and the presented token verifies and is unexpired. Returns
     /// None otherwise (no key, not a token request, bad/expired token) — fail
@@ -730,15 +738,16 @@ impl AppState {
         }
     }
 
-    /// Whether the request presents credentials that validly authenticate as some
-    /// role *below* admin (reader or uploader). Distinguishes a wrong-role request
-    /// (→ 403) from an anonymous or bad-credential one (→ 401) at an admin gate.
+    /// Whether the request presents credentials that validly authenticate as
+    /// some role (admin included, via `is_uploader`). Distinguishes a
+    /// wrong-role request (→ 403) from an anonymous or bad-credential one
+    /// (→ 401) at an admin gate, and a login from a guess at the throttle.
     /// Public-read (no read credential configured) is deliberately NOT counted:
     /// an anonymous request on such a server authenticates as nobody, so it still
     /// gets 401, never 403. Constant-time password compares throughout.
-    pub(crate) fn authenticates_below_admin(&self, headers: &HeaderMap) -> bool {
-        // A valid uploader — a real uploader credential, or an uploader/admin
-        // token (admin is already excluded by the caller).
+    pub(crate) fn authenticates(&self, headers: &HeaderMap) -> bool {
+        // A valid uploader — a real uploader credential, an uploader/admin
+        // token, or admin itself.
         if self.is_uploader(headers) {
             return true;
         }
@@ -2042,19 +2051,26 @@ async fn log_requests(
         .get::<ConnectInfo<SocketAddr>>()
         .map(|ci| ci.0.ip());
     // Failed-login throttle: only requests presenting credentials participate —
-    // anonymous traffic can't guess a password and is never held up. Keyed by
-    // the same address the audit log records (the forwarded header behind
-    // `--trusted-proxy`, else the peer), falling back to the peer when the
-    // forwarded value isn't an address.
-    let login_ip = if req.headers().contains_key(header::AUTHORIZATION) {
+    // anonymous traffic can't guess a password and is never held up, nor is
+    // anyone on a server with no credential to guess. Keyed by the same address
+    // the audit log records (the forwarded header behind `--trusted-proxy`, else
+    // the peer), falling back to the peer when the forwarded value isn't an
+    // address. A credential that authenticates as nobody is a guess and
+    // reserves budget before it runs; admission itself never depends on
+    // validity (see `LoginThrottle`).
+    let login = if req.headers().contains_key(header::AUTHORIZATION) && !state.credential_free() {
         client_ip(req.headers(), peer, state.trusted_proxy)
             .parse()
             .ok()
             .or(peer)
+            .map(|ip| {
+                let guess = (!state.authenticates(req.headers()))
+                    .then(|| state.login_throttle.fingerprint(req.headers()));
+                state.login_throttle.admit(ip, guess)
+            })
     } else {
         None
     };
-    let login_refused_secs = login_ip.and_then(|ip| state.login_throttle.blocked_secs(ip));
 
     // Decide up front whether this request could be logged, so the hot read path
     // does no timing or field work.
@@ -2068,7 +2084,7 @@ async fn log_requests(
         !is_read // default audit: mutations only
     };
     if !consider {
-        return run_throttling_logins(&state, req, next, login_ip, login_refused_secs).await;
+        return run_throttling_logins(req, next, login).await;
     }
 
     let clf = state.access_log && matches!(state.access_log_format, AccessLogFormat::Clf);
@@ -2090,7 +2106,7 @@ async fn log_requests(
     };
 
     let start = std::time::Instant::now();
-    let response = run_throttling_logins(&state, req, next, login_ip, login_refused_secs).await;
+    let response = run_throttling_logins(req, next, login).await;
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     let status = response.status();
     let bytes = response
@@ -2153,27 +2169,26 @@ async fn log_requests(
     response
 }
 
-/// Dispatch `req`, feeding the failed-login throttle. A currently-blocked
-/// address is refused before its credential is evaluated, so even a correct
-/// guess during the cooldown confirms nothing; a 401 coming back — a credential
-/// that authenticated as nobody, never a role denial (403) — records one
-/// failure. Both dispatch paths of `log_requests` funnel through here, so
-/// throttled refusals still reach the access log and metrics.
+/// Dispatch `req` under the failed-login throttle's verdict. A refused address
+/// (locked out, or its five-guess budget already reserved by requests in
+/// flight) gets 429 before any handler runs, so even a correct guess confirms
+/// nothing; an admitted wrong credential that comes back 401 — authenticated
+/// as nobody, never a role denial (403) — counts one failure. Both dispatch
+/// paths of `log_requests` funnel through here, so throttled refusals still
+/// reach the access log and metrics.
 async fn run_throttling_logins(
-    state: &AppState,
     req: Request,
     next: Next,
-    login_ip: Option<std::net::IpAddr>,
-    login_refused_secs: Option<u64>,
+    login: Option<Result<crate::auth::LoginAttempt, u64>>,
 ) -> Response<Body> {
-    if let Some(secs) = login_refused_secs {
-        return too_many_logins(secs);
-    }
+    let attempt = match login {
+        Some(Err(secs)) => return too_many_logins(secs),
+        Some(Ok(attempt)) => Some(attempt),
+        None => None,
+    };
     let response = next.run(req).await;
-    if response.status() == StatusCode::UNAUTHORIZED {
-        if let Some(ip) = login_ip {
-            state.login_throttle.record_failure(ip);
-        }
+    if let Some(attempt) = attempt {
+        attempt.finish(response.status() == StatusCode::UNAUTHORIZED);
     }
     response
 }

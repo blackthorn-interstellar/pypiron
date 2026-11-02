@@ -230,7 +230,7 @@ backends are supported. With more than one bucket:
 | `--access-log` | `PYPIRON_ACCESS_LOG` | `false` | Log reads too, not only mutations. |
 | `--access-log-format structured\|clf` | `PYPIRON_ACCESS_LOG_FORMAT` | `structured` | Structured logs or Combined Log Format. |
 | `--trusted-proxy` | `PYPIRON_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For`/`X-Real-IP`. Enable only behind a proxy that replaces these headers; otherwise callers can forge their logged address. [Login throttling](../security.md#login-throttling). |
-| `--login-cooldown-secs N` | `PYPIRON_LOGIN_COOLDOWN_SECS` | `300` | Lock one address for this long after five failed logins; returns `429` with `Retry-After`. Per instance; IPv6 groups by `/64`; `0` disables. |
+| `--login-cooldown-secs N` | `PYPIRON_LOGIN_COOLDOWN_SECS` | `300` | Lock one address for this long after five failed logins, including ones sent at the same time; returns `429` with `Retry-After`. Per instance; IPv6 groups by `/64`; `0` disables. |
 | `--worker-interval-secs N` | `PYPIRON_WORKER_INTERVAL_SECS` | `1` | Index, replication, and bucket-health poll cadence. |
 | `--bucket-leave-failures N` | `PYPIRON_BUCKET_LEAVE_FAILURES` | `3` | Consecutive timeout (including 408), connection, or 5xx failures before selecting the next bucket. |
 | `--bucket-return-healthy-secs N` | `PYPIRON_BUCKET_RETURN_HEALTHY_SECS` | `300` | Healthy time required before returning to a preferred bucket. Startup warns when this may be shorter than catch-up confirmation. |

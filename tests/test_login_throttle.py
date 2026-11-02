@@ -2,11 +2,16 @@
 cooldown of the last, and that address is refused further credential-bearing
 requests with 429 + Retry-After until the cooldown passes. Successes are never
 counted, role denials (403) are not failed logins, anonymous requests and
-probes are never throttled, and 0 disables the throttle."""
+probes are never throttled, and 0 disables the throttle. Guesses sent at the
+same time share the five tries."""
 
 from __future__ import annotations
 
+import select
+import socket
 import time
+from concurrent.futures import ThreadPoolExecutor
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -99,3 +104,94 @@ def test_zero_disables(disk_server_login_cooldown_off):
         assert code == 401, f"attempt {attempt}"
     code, _, _ = http_get(url, headers=_auth_header("reader", "readersecret"))
     assert code == 200
+
+
+def _held_mint(server: dict, user: str, password: str) -> socket.socket:
+    """Send `POST /tokens` headers but hold back the 2-byte body. The handler
+    reads the body before checking the credential, so an admitted guess sits
+    in flight until `_release` sends it."""
+    url = urlsplit(server["base_url"])
+    sock = socket.create_connection((url.hostname, url.port), timeout=10)
+    sock.sendall(
+        (
+            f"POST /tokens HTTP/1.1\r\nHost: {url.netloc}\r\n"
+            f"Authorization: {_encode_basic_auth(user, password)}\r\n"
+            "Content-Type: application/json\r\nContent-Length: 2\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+    )
+    return sock
+
+
+def _status(sock: socket.socket) -> int:
+    data = b""
+    while b"\r\n" not in data:
+        chunk = sock.recv(1024)
+        if not chunk:
+            break
+        data += chunk
+    sock.close()
+    return int(data.split(b" ")[1])
+
+
+def _answered_early(sock: socket.socket) -> bool:
+    """Did the server respond before the body was sent?"""
+    readable, _, _ = select.select([sock], [], [], 3)
+    return bool(readable)
+
+
+def _release(sock: socket.socket) -> int:
+    sock.sendall(b"{}")
+    return _status(sock)
+
+
+def test_concurrent_guesses_share_one_budget(disk_server_login_cooldown):
+    """Ten different wrong passwords in flight at once get five evaluations,
+    not ten: the budget is reserved on admission, not tallied after a 401."""
+    server = disk_server_login_cooldown
+    url = f"{server['simple']}index.json"
+    held = [_held_mint(server, "reader", f"wrong{i}") for i in range(5)]
+    time.sleep(0.5)  # let the server admit the first five
+
+    for i in range(5, 10):
+        sock = _held_mint(server, "reader", f"wrong{i}")
+        assert _answered_early(sock), f"guess {i} was admitted past the budget"
+        assert _status(sock) == 429
+
+    # The right password is refused too while the budget is spoken for —
+    # a 200 here would answer the guess the 429s were meant to withhold.
+    code, _, _ = http_get(url, headers=_auth_header("reader", "readersecret"))
+    assert code == 429
+
+    assert [_release(sock) for sock in held] == [401] * 5
+    code, _, _ = http_get(url, headers=_auth_header("reader", "readersecret"))
+    assert code == 429
+
+
+def test_one_wrong_credential_in_parallel_is_one_guess(disk_server_login_cooldown):
+    """Retrying the same stale credential on parallel requests is one guess:
+    every copy is answered 401 and together they count one failure."""
+    server = disk_server_login_cooldown
+    url = f"{server['simple']}index.json"
+    held = [_held_mint(server, "reader", "stale") for _ in range(10)]
+    time.sleep(0.5)
+    assert not any(_answered_early(sock) for sock in held[-1:])
+    assert [_release(sock) for sock in held] == [401] * 10
+
+    # Four more failures make five: the address locks out on the next try.
+    bad = _auth_header("reader", "stale")
+    for attempt in range(4):
+        code, _, _ = http_get(url, headers=bad)
+        assert code == 401, f"attempt {attempt}"
+    code, _, _ = http_get(url, headers=bad)
+    assert code == 429
+
+
+def test_stale_credential_on_public_reads_is_never_refused(disk_server):
+    """A public-read server ignores the credential on reads; a client with a
+    stale one fetching in parallel is never throttled."""
+    url = f"{disk_server['simple']}index.json"
+    stale = _auth_header("ci+billing", "stale")
+    with ThreadPoolExecutor(max_workers=20) as pool:
+        codes = list(pool.map(lambda _: http_get(url, headers=stale)[0], range(20)))
+    assert codes == [200] * 20

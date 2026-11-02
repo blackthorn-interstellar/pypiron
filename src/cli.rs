@@ -922,9 +922,9 @@ pub struct ServeArgs {
     /// Failed-login cooldown in seconds. An address that fails login five
     /// times, each within this window of the last, is refused further
     /// credential-bearing requests (429 with Retry-After) until the window
-    /// passes. Successful logins are never counted and anonymous requests are
-    /// never throttled. Enforced per instance. 0 disables (rely on an edge
-    /// rate limit instead).
+    /// passes. Guesses sent at the same time share the five tries. Successful
+    /// logins are never counted and anonymous requests are never throttled.
+    /// Enforced per instance. 0 disables (rely on an edge rate limit instead).
     #[arg(
         long,
         env = "PYPIRON_LOGIN_COOLDOWN_SECS",

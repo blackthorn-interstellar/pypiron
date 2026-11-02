@@ -4,6 +4,7 @@
 //! out of `app.rs`; the role predicates themselves stay methods on `AppState`.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasher, RandomState};
 use std::net::IpAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -95,7 +96,7 @@ pub(crate) fn require_admin(
             "This operation is disabled (no admin credential configured)".into(),
         ));
     }
-    if state.authenticates_below_admin(headers) {
+    if state.authenticates(headers) {
         return Err((StatusCode::FORBIDDEN, "Admin credential required".into()));
     }
     Err((StatusCode::UNAUTHORIZED, "Admin credential required".into()))
@@ -151,41 +152,104 @@ pub(crate) const DEFAULT_LOGIN_COOLDOWN_SECS: u64 = 300;
 /// than any real client needs before its operator fixes the credential.
 const LOGIN_FAIL_LIMIT: u32 = 5;
 
-/// Addresses the throttle will track before shedding state. Only a guesser
-/// spread across tens of thousands of addresses in one cooldown window can
-/// reach it — a scale where per-address throttling is moot and the edge/WAF
-/// is the real defense — so past the cap the map fails open (sheds) rather
-/// than growing without bound or refusing addresses it has never seen.
+/// Addresses the throttle will track. Only a guesser spread across tens of
+/// thousands of addresses in one cooldown window can reach it — a scale where
+/// per-address throttling is moot and the edge/WAF is the real defense. Past
+/// it the map sheds partial failure counts but never a lockout or an attempt
+/// still in flight; if those alone fill it, credential-bearing requests from
+/// addresses it isn't tracking are refused (fail closed) rather than the map
+/// growing without bound or forgetting who is locked out.
 const LOGIN_THROTTLE_CAP: usize = 32 * 1024;
 
-/// One address's recent failed-login history. Millisecond epoch timestamps
-/// come from [`clock::now_epoch_millis`] so the deterministic simulator can
-/// drive expiry; the clock is wall time, not monotonic, so an NTP step skews a
-/// cooldown by at most the step, in a known direction, and self-heals.
+/// One wrong credential in flight from an address. Requests repeating the same
+/// credential share the slot (`refs`): sending one guess twice at once is still
+/// one guess, so a stale credential reused across parallel requests costs one
+/// try. `refs == 0` marks the slot free.
+#[derive(Clone, Copy, Default)]
+struct Pending {
+    fp: u64,
+    refs: u32,
+    failed: bool,
+}
+
+/// One address's recent failed-login history plus the wrong credentials it has
+/// in flight. Millisecond epoch timestamps come from [`clock::now_epoch_millis`]
+/// so the deterministic simulator can drive expiry; the clock is wall time, not
+/// monotonic, so an NTP step skews a cooldown by at most the step, in a known
+/// direction, and self-heals.
 #[derive(Clone, Copy, Default)]
 struct FailWindow {
     count: u32,
     last_ms: u64,
     blocked_until_ms: u64,
+    pending: [Pending; LOGIN_FAIL_LIMIT as usize],
+}
+
+impl FailWindow {
+    fn in_flight(&self) -> u32 {
+        self.pending.iter().filter(|p| p.refs > 0).count() as u32
+    }
+
+    /// Holds a lockout or an unfinished attempt: state the throttle must keep.
+    fn live(&self, now_ms: u64) -> bool {
+        self.blocked_until_ms > now_ms || self.in_flight() > 0
+    }
 }
 
 /// Per-address brute-force throttle on failed logins. [`LOGIN_FAIL_LIMIT`]
 /// failures from one address, each within the cooldown of the last, and that
 /// address's credential-bearing requests are refused (429) until the cooldown
 /// passes — without evaluating the credential, so even a correct guess during
-/// the cooldown confirms nothing. Successes are never counted and anonymous
-/// requests never participate, so the throttle cannot lock out an address that
-/// isn't already failing logins. State is per process: each replica enforces
-/// its own budget, bounding a fleet's aggregate at replicas × the limit.
+/// the cooldown confirms nothing.
+///
+/// The budget is reserved before a request runs, not tallied after its 401:
+/// every wrong credential takes a slot on admission, and the failures counted
+/// plus the slots in flight never exceed the limit, so guesses sent at the same
+/// time share the five. Whether a request is admitted never depends on whether
+/// its credential is right — only a wrong one takes a slot, but a full budget
+/// refuses right and wrong alike, or a 429-versus-200 would itself answer the
+/// guess. Successes are never counted and anonymous requests never participate.
+/// State is per process: each replica enforces its own budget, bounding a
+/// fleet's aggregate at replicas × the limit.
 #[derive(Clone)]
 pub struct LoginThrottle {
     cooldown_ms: u64,
     map: Arc<Mutex<HashMap<IpAddr, FailWindow>>>,
+    /// Per-process key for credential fingerprints, so a guesser can't pick
+    /// two credentials that share a slot.
+    fp_key: RandomState,
 }
 
 impl Default for LoginThrottle {
     fn default() -> Self {
         Self::new(Duration::from_secs(DEFAULT_LOGIN_COOLDOWN_SECS))
+    }
+}
+
+/// A credential-bearing request admitted by [`LoginThrottle::admit`]. A wrong
+/// credential holds its slot until [`LoginAttempt::finish`] reports the outcome
+/// or the request is dropped mid-flight (client gone: no answer, no failure).
+pub(crate) struct LoginAttempt {
+    throttle: LoginThrottle,
+    key: IpAddr,
+    /// The wrong credential's fingerprint; None for one that authenticates.
+    guess: Option<u64>,
+    failed: bool,
+}
+
+impl LoginAttempt {
+    /// Settle the attempt: `failed` when the response was a 401.
+    pub(crate) fn finish(mut self, failed: bool) {
+        self.failed = failed;
+    }
+}
+
+impl Drop for LoginAttempt {
+    fn drop(&mut self) {
+        if let Some(fp) = self.guess {
+            self.throttle
+                .release_at(self.key, fp, self.failed, clock::now_epoch_millis());
+        }
     }
 }
 
@@ -195,55 +259,116 @@ impl LoginThrottle {
         Self {
             cooldown_ms: cooldown.as_millis().min(u64::MAX as u128) as u64,
             map: Arc::new(Mutex::new(HashMap::new())),
+            fp_key: RandomState::new(),
         }
     }
 
-    /// Seconds (rounded up, so never a `Retry-After: 0`) until `ip` may
-    /// attempt to log in again, or None when it isn't blocked.
-    pub(crate) fn blocked_secs(&self, ip: IpAddr) -> Option<u64> {
-        self.blocked_secs_at(throttle_key(ip), clock::now_epoch_millis())
+    /// The identity a credential is checked as: the Basic username without its
+    /// `+tag` attribution suffix, plus the password — so `ci+a:pw` and
+    /// `ci+b:pw` are one guess. Any other scheme hashes the raw header.
+    pub(crate) fn fingerprint(&self, headers: &HeaderMap) -> u64 {
+        match basic_credentials(headers) {
+            Some((user, pass)) => {
+                let base = user.split_once('+').map_or(user.as_str(), |(b, _)| b);
+                self.fp_key.hash_one((base, pass.as_str()))
+            }
+            None => self
+                .fp_key
+                .hash_one(headers.get(header::AUTHORIZATION).map(|v| v.as_bytes())),
+        }
     }
 
-    /// Count one failed login from `ip`.
-    pub(crate) fn record_failure(&self, ip: IpAddr) {
-        self.record_failure_at(throttle_key(ip), clock::now_epoch_millis());
+    /// Admit a credential-bearing request from `ip`, or refuse it with the
+    /// `Retry-After` seconds (rounded up, never 0). `guess` is the fingerprint
+    /// of a credential that authenticates as nobody; None for a valid one.
+    pub(crate) fn admit(&self, ip: IpAddr, guess: Option<u64>) -> Result<LoginAttempt, u64> {
+        let key = throttle_key(ip);
+        self.admit_at(key, guess, clock::now_epoch_millis())?;
+        Ok(LoginAttempt {
+            throttle: self.clone(),
+            key,
+            guess,
+            failed: false,
+        })
     }
 
-    fn blocked_secs_at(&self, key: IpAddr, now_ms: u64) -> Option<u64> {
+    /// One atomic step: refuse a blocked or fully-reserved address, else
+    /// reserve a slot for a wrong credential. Refusal depends only on the
+    /// address's state and the credential bytes, never on validity.
+    fn admit_at(&self, key: IpAddr, guess: Option<u64>, now_ms: u64) -> Result<(), u64> {
         if self.cooldown_ms == 0 {
-            return None;
+            return Ok(());
         }
         let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        let w = map.get(&key)?;
+        let Some(w) = map.get_mut(&key) else {
+            if map.len() >= LOGIN_THROTTLE_CAP {
+                map.retain(|_, w| w.live(now_ms));
+                if map.len() >= LOGIN_THROTTLE_CAP {
+                    return Err(self.cooldown_ms.div_ceil(1000));
+                }
+            }
+            if let Some(fp) = guess {
+                let mut w = FailWindow::default();
+                w.pending[0] = Pending {
+                    fp,
+                    refs: 1,
+                    failed: false,
+                };
+                map.insert(key, w);
+            }
+            return Ok(());
+        };
         if w.blocked_until_ms > now_ms {
-            return Some((w.blocked_until_ms - now_ms).div_ceil(1000));
+            return Err((w.blocked_until_ms - now_ms).div_ceil(1000));
         }
-        if now_ms.saturating_sub(w.last_ms) >= self.cooldown_ms {
-            // Fully decayed and unblocked: drop it, so a quiet server's map
-            // returns to empty instead of holding every address that ever
-            // fumbled a password.
-            map.remove(&key);
+        let decayed = now_ms.saturating_sub(w.last_ms) >= self.cooldown_ms;
+        if decayed {
+            // Failures further apart than the cooldown never accumulate.
+            w.count = 0;
         }
-        None
+        if let Some(p) =
+            guess.and_then(|fp| w.pending.iter_mut().find(|p| p.refs > 0 && p.fp == fp))
+        {
+            p.refs += 1;
+            return Ok(());
+        }
+        if w.count + w.in_flight() >= LOGIN_FAIL_LIMIT {
+            return Err(1);
+        }
+        match guess {
+            Some(fp) => {
+                if let Some(p) = w.pending.iter_mut().find(|p| p.refs == 0) {
+                    *p = Pending {
+                        fp,
+                        refs: 1,
+                        failed: false,
+                    };
+                }
+            }
+            // Fully decayed and idle: drop it, so a quiet server's map returns
+            // to empty instead of holding every address that ever fumbled.
+            None if decayed && !w.live(now_ms) => {
+                map.remove(&key);
+            }
+            None => {}
+        }
+        Ok(())
     }
 
-    fn record_failure_at(&self, key: IpAddr, now_ms: u64) {
-        if self.cooldown_ms == 0 {
+    /// Release one reference to `fp`'s slot. When the last one lets go and any
+    /// of them failed, that is one failed login.
+    fn release_at(&self, key: IpAddr, fp: u64, failed: bool, now_ms: u64) {
+        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(w) = map.get_mut(&key) else { return };
+        let Some(p) = w.pending.iter_mut().find(|p| p.refs > 0 && p.fp == fp) else {
+            return;
+        };
+        p.refs -= 1;
+        p.failed |= failed;
+        if p.refs > 0 || !p.failed {
             return;
         }
-        let mut map = self.map.lock().unwrap_or_else(|e| e.into_inner());
-        if map.len() >= LOGIN_THROTTLE_CAP && !map.contains_key(&key) {
-            let cooldown = self.cooldown_ms;
-            map.retain(|_, w| {
-                w.blocked_until_ms > now_ms || now_ms.saturating_sub(w.last_ms) < cooldown
-            });
-            if map.len() >= LOGIN_THROTTLE_CAP {
-                map.clear();
-            }
-        }
-        let w = map.entry(key).or_default();
         if now_ms.saturating_sub(w.last_ms) >= self.cooldown_ms {
-            // Failures further apart than the cooldown never accumulate.
             w.count = 0;
         }
         w.count += 1;
@@ -371,28 +496,42 @@ mod tests {
 
     /// The pure `_at` transitions, driven by hand-rolled clocks — the global
     /// sim-clock override is process-wide and off limits to parallel tests.
+    /// One failed login: a wrong credential admitted, then answered 401.
+    fn fail(t: &LoginThrottle, ip: IpAddr, fp: u64, now: u64) {
+        t.admit_at(ip, Some(fp), now).unwrap();
+        t.release_at(ip, fp, true, now);
+    }
+
+    /// What a valid credential from `ip` gets: Ok, or the Retry-After secs.
+    fn login(t: &LoginThrottle, ip: IpAddr, now: u64) -> Result<(), u64> {
+        t.admit_at(ip, None, now)
+    }
+
+    fn window(t: &LoginThrottle, ip: IpAddr) -> FailWindow {
+        t.map.lock().unwrap()[&ip]
+    }
+
     #[test]
     fn login_throttle_blocks_after_limit_and_expires() {
         let t = LoginThrottle::new(Duration::from_secs(300));
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         let start = 1_000_000;
         for i in 0..4 {
-            t.record_failure_at(ip, start + i * 1_000);
-            assert_eq!(t.blocked_secs_at(ip, start + i * 1_000), None);
+            fail(&t, ip, i, start + i * 1_000);
+            assert_eq!(login(&t, ip, start + i * 1_000), Ok(()));
         }
         // Fifth failure within the window: blocked for the full cooldown,
-        // reported rounded up (never Retry-After: 0).
-        t.record_failure_at(ip, start + 4_000);
-        assert_eq!(t.blocked_secs_at(ip, start + 4_000), Some(300));
-        assert_eq!(t.blocked_secs_at(ip, start + 4_000 + 299_500), Some(1));
+        // reported rounded up (never Retry-After: 0) — the right credential
+        // and a wrong one alike.
+        fail(&t, ip, 4, start + 4_000);
+        assert_eq!(login(&t, ip, start + 4_000), Err(300));
+        assert_eq!(t.admit_at(ip, Some(9), start + 4_000), Err(300));
+        assert_eq!(login(&t, ip, start + 4_000 + 299_500), Err(1));
         // Cooldown over: unblocked, and the stale entry is swept on lookup.
-        assert_eq!(t.blocked_secs_at(ip, start + 4_000 + 300_000), None);
+        assert_eq!(login(&t, ip, start + 4_000 + 300_000), Ok(()));
         assert_eq!(t.len(), 0);
         // Other addresses were never affected.
-        assert_eq!(
-            t.blocked_secs_at("203.0.113.10".parse().unwrap(), start),
-            None
-        );
+        assert_eq!(login(&t, "203.0.113.10".parse().unwrap(), start), Ok(()));
     }
 
     #[test]
@@ -401,8 +540,8 @@ mod tests {
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
         for i in 0..20u64 {
             let now = 1_000_000 + i * 300_000;
-            t.record_failure_at(ip, now);
-            assert_eq!(t.blocked_secs_at(ip, now), None, "attempt {i}");
+            fail(&t, ip, i, now);
+            assert_eq!(login(&t, ip, now), Ok(()), "attempt {i}");
         }
     }
 
@@ -410,10 +549,10 @@ mod tests {
     fn login_throttle_zero_cooldown_disables() {
         let t = LoginThrottle::new(Duration::ZERO);
         let ip: IpAddr = "203.0.113.9".parse().unwrap();
-        for _ in 0..20 {
-            t.record_failure_at(ip, 1_000_000);
+        for i in 0..20 {
+            fail(&t, ip, i, 1_000_000);
         }
-        assert_eq!(t.blocked_secs_at(ip, 1_000_000), None);
+        assert_eq!(login(&t, ip, 1_000_000), Ok(()));
         assert_eq!(t.len(), 0);
     }
 
@@ -435,26 +574,126 @@ mod tests {
     }
 
     #[test]
-    fn login_throttle_sheds_state_at_the_cap() {
+    fn login_throttle_cap_overflow_keeps_blocks() {
+        // A lockout must survive a flood of fresh addresses: filling the map
+        // with live partial counts once wiped every block (`map.clear()`).
         let t = LoginThrottle::new(Duration::from_secs(300));
         let now = 1_000_000;
-        // Distinct live addresses up to the cap, then one more: the sweep finds
-        // nothing expired, so the map sheds entirely rather than growing.
-        for i in 0..LOGIN_THROTTLE_CAP as u32 {
-            t.record_failure_at(IpAddr::V4(std::net::Ipv4Addr::from(i)), now);
+        let blocked: IpAddr = "203.0.113.9".parse().unwrap();
+        for i in 0..5 {
+            fail(&t, blocked, i, now);
+        }
+        for i in 1..LOGIN_THROTTLE_CAP as u32 {
+            fail(&t, IpAddr::V4(std::net::Ipv4Addr::from(i)), 0, now);
         }
         assert_eq!(t.len(), LOGIN_THROTTLE_CAP);
-        t.record_failure_at("203.0.113.9".parse().unwrap(), now);
-        assert_eq!(t.len(), 1);
-        // With the old entries expired instead, the sweep alone makes room:
-        // the cap-filling addresses decay and the newcomer is the survivor.
+        // The newcomer is admitted by shedding partial counts, not the block.
+        let newcomer: IpAddr = "198.51.100.1".parse().unwrap();
+        assert_eq!(t.admit_at(newcomer, Some(7), now), Ok(()));
+        assert_eq!(login(&t, blocked, now), Err(300));
+        assert_eq!(t.len(), 2);
+    }
+
+    #[test]
+    fn login_throttle_full_of_live_entries_refuses_newcomers_blindly() {
+        // Every slot holds an attempt in flight: nothing may be shed, so an
+        // address the map can't track is refused — with the same answer for a
+        // right credential as a wrong one, or the refusal would be an oracle.
+        let t = LoginThrottle::new(Duration::from_secs(300));
+        let now = 1_000_000;
+        for i in 0..LOGIN_THROTTLE_CAP as u32 {
+            t.admit_at(IpAddr::V4(std::net::Ipv4Addr::from(i)), Some(0), now)
+                .unwrap();
+        }
+        let newcomer: IpAddr = "198.51.100.1".parse().unwrap();
+        assert_eq!(t.admit_at(newcomer, Some(7), now), Err(300));
+        assert_eq!(login(&t, newcomer, now), Err(300));
+        assert_eq!(t.len(), LOGIN_THROTTLE_CAP);
+        // Expired partial counts alone are always shed.
         let t = LoginThrottle::new(Duration::from_secs(300));
         for i in 0..LOGIN_THROTTLE_CAP as u32 {
-            t.record_failure_at(IpAddr::V4(std::net::Ipv4Addr::from(i)), now);
+            fail(&t, IpAddr::V4(std::net::Ipv4Addr::from(i)), 0, now);
         }
-        let later = now + 400_000;
-        t.record_failure_at("198.51.100.1".parse().unwrap(), later);
+        assert_eq!(t.admit_at(newcomer, Some(7), now + 400_000), Ok(()));
         assert_eq!(t.len(), 1);
+    }
+
+    #[test]
+    fn login_throttle_bounds_in_flight_guesses() {
+        let t = LoginThrottle::new(Duration::from_secs(300));
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let now = 1_000_000;
+        // Five distinct wrong credentials in flight at once fill the budget.
+        for fp in 1..=5 {
+            assert_eq!(t.admit_at(ip, Some(fp), now), Ok(()), "guess {fp}");
+        }
+        // A sixth is refused, and so is the right credential: admitting it
+        // would turn the 429-versus-200 into an answer.
+        assert_eq!(t.admit_at(ip, Some(6), now), Err(1));
+        assert_eq!(login(&t, ip, now), Err(1));
+        // Repeating an in-flight credential is the same guess: admitted.
+        assert_eq!(t.admit_at(ip, Some(1), now), Ok(()));
+        // A slot freed without a 401 (e.g. a public read) makes room.
+        t.release_at(ip, 2, false, now);
+        assert_eq!(t.admit_at(ip, Some(6), now), Ok(()));
+        // Credential 1 has two holders: one failing frees nothing yet...
+        t.release_at(ip, 1, true, now);
+        assert_eq!(t.admit_at(ip, Some(7), now), Err(1));
+        // ...and the last release counts the pair as one failure.
+        t.release_at(ip, 1, false, now);
+        assert_eq!(window(&t, ip).count, 1);
+        assert_eq!(t.admit_at(ip, Some(7), now), Err(1));
+        for fp in [3, 4, 5, 6] {
+            t.release_at(ip, fp, true, now);
+        }
+        assert_eq!(login(&t, ip, now), Err(300));
+        assert_eq!(t.admit_at(ip, Some(8), now), Err(300));
+    }
+
+    #[test]
+    fn login_throttle_pending_survives_decay() {
+        // A held request outliving the cooldown keeps its entry: sweeping it
+        // would free the slot and lose the failure it is about to report.
+        let t = LoginThrottle::new(Duration::from_secs(300));
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let now = 1_000_000;
+        fail(&t, ip, 1, now);
+        t.admit_at(ip, Some(2), now).unwrap();
+        let later = now + 400_000;
+        assert_eq!(login(&t, ip, later), Ok(()));
+        assert_eq!(t.len(), 1);
+        t.release_at(ip, 2, true, later);
+        assert_eq!(window(&t, ip).count, 1);
+    }
+
+    #[test]
+    fn login_attempt_drop_releases_without_a_failure() {
+        let t = LoginThrottle::new(Duration::from_secs(300));
+        let ip: IpAddr = "203.0.113.9".parse().unwrap();
+        // A request cancelled mid-flight (client gone) frees its slot and
+        // counts nothing: the client never got an answer.
+        let attempt = t.admit(ip, Some(1)).unwrap();
+        assert_eq!(window(&t, ip).in_flight(), 1);
+        drop(attempt);
+        let w = window(&t, ip);
+        assert_eq!((w.count, w.in_flight()), (0, 0));
+        // A finished 401 counts one failure.
+        t.admit(ip, Some(1)).unwrap().finish(true);
+        let w = window(&t, ip);
+        assert_eq!((w.count, w.in_flight()), (1, 0));
+        // A valid credential reserves nothing.
+        t.admit(ip, None).unwrap().finish(true);
+        assert_eq!(window(&t, ip).count, 1);
+    }
+
+    #[test]
+    fn login_fingerprint_ignores_the_attribution_tag() {
+        let t = LoginThrottle::default();
+        let fp = |u, p| t.fingerprint(&basic_headers(u, p));
+        assert_eq!(fp("ci+billing", "pw"), fp("ci+web", "pw"));
+        assert_eq!(fp("ci", "pw"), fp("ci+web", "pw"));
+        assert_ne!(fp("ci", "pw"), fp("ci", "pw2"));
+        assert_ne!(fp("ci", "pw"), fp("cd", "pw"));
     }
 
     #[test]

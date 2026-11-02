@@ -435,7 +435,9 @@ def disk_server_read_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]
 def _start_login_cooldown_server(
     tmp_path_factory, bin_path: Path, cooldown_secs: int
 ) -> Iterator[Dict]:
-    """Read-auth disk server with an explicit failed-login cooldown."""
+    """Read-auth disk server with an explicit failed-login cooldown. It also
+    mints tokens, so `POST /tokens` (which reads its body before checking the
+    credential) can hold a guess in flight."""
     for server in _start_disk_server(
         tmp_path_factory,
         bin_path,
@@ -446,6 +448,8 @@ def _start_login_cooldown_server(
             "readersecret",
             "--login-cooldown-secs",
             str(cooldown_secs),
+            "--token-signing-key",
+            "test-signing-key-0123456789abcdef",
         ],
     ):
         server["read_user"] = "reader"

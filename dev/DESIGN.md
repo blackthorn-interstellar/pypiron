@@ -780,6 +780,17 @@ runtime mismatch leaves reads available and fences mutations. Changing the list
 is explicit: stop the fleet, run `pypiron buckets migrate` with the new list,
 then restart every node on it. Single-bucket mode creates no topology stamp,
 health view, replication work, or probe traffic.
+Startup stamps an unstamped bucket only when every configured bucket answered:
+a silent bucket may hold a newer list, so a first boot during an outage refuses
+rather than guess. A restart where every reachable bucket is stamped proceeds
+through an outage — those stamps are its evidence (it still trusts the highest
+*reachable* generation; a newer one on a silent bucket fences writes when it
+heals). `buckets migrate` likewise refuses when no reachable bucket carries a
+stamp and one did not answer, since the removed buckets can't be learned. After
+committing, migrate re-reads `_repl/` on every kept and removed bucket; a note
+there means a node kept writing, and the command fails with the list committed.
+`origin release` re-runs converge: only still-claimed buckets are released, and
+a failure prints each bucket's freshly read claim.
 Shrinking a multi-bucket fleet to one skips migration: stop the fleet and
 restart with the lone bucket, where topology stamps are dormant.
 
@@ -909,7 +920,8 @@ _leader/lease.json                       # multi-node lease (holder, term, expir
                                          #   own ETag, never a delete, so it cannot clobber a successor)
 _topology/stamp.json                     # multi-bucket only: fail-closed config check — a hash of the
                                          #   ordered bucket identities + operator topology generation,
-                                         #   CAS-written/verified on every reachable bucket at startup.
+                                         #   CAS-written/verified on every reachable bucket at startup;
+                                         #   a bare bucket is stamped only when all buckets answered.
                                          #   One bucket: absent, dormant.
 _format/stamp.json                       # storage-format fence — a single integer the on-disk layout
                                          #   is at. ABSENT == format 1, the permanent rule; never written

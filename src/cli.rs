@@ -407,33 +407,68 @@ pub async fn run_origin_release(args: OriginReleaseArgs) -> Result<()> {
     let pkg = checked_pkg_name(&args.package)
         .ok_or_else(|| anyhow!("invalid package name '{}'", args.package))?;
     let storages = args.storage.build_all_for_write().await?;
+    let buckets: Vec<BucketHandle> = storages
+        .into_iter()
+        .zip(args.storage.bucket_names())
+        .map(|(storage, name)| BucketHandle { storage, name })
+        .collect();
+    let result = release_origin_everywhere(&pkg, &buckets).await;
+    if result.is_err() {
+        // A failed or interrupted run can leave buckets disagreeing; show what
+        // each one holds now, read fresh, so the operator is not guessing.
+        for handle in &buckets {
+            let state = match origin::read_origin_observation(handle.storage.as_ref(), &pkg).await {
+                Ok(Some(observed)) => observed.state.as_str().to_string(),
+                Ok(None) => "no claim".to_string(),
+                Err(error) => format!("unknown ({error:#})"),
+            };
+            eprintln!("origin release '{pkg}': bucket '{}': {state}", handle.name);
+        }
+    }
+    result
+}
+
+async fn release_origin_everywhere(pkg: &str, buckets: &[BucketHandle]) -> Result<()> {
     // Preflight every bucket before the first CAS. Without this, discovering an
     // artifact or outage on bucket B after releasing A would create exactly the
     // partial-origin window this maintenance command exists to avoid.
     let mut targets = Vec::new();
-    for storage in &storages {
-        if let Some(observed) = origin::releasable_for_repurpose(storage.as_ref(), &pkg).await? {
-            targets.push((storage.clone(), observed));
+    let mut already_released = false;
+    for handle in buckets {
+        match origin::releasable_for_repurpose(handle.storage.as_ref(), pkg).await? {
+            Some(observed) if observed.state == origin::OriginState::Unclaimed => {
+                already_released = true
+            }
+            Some(observed) => targets.push((handle, observed)),
+            None => {}
         }
     }
+    // A re-run after an interrupted (or completed) release finishes the job:
+    // only buckets still claimed are released, and none left is success.
     if targets.is_empty() {
-        anyhow::bail!("package '{pkg}' has no live origin claim to release");
+        if already_released {
+            eprintln!("origin claim for '{pkg}' is already released on every bucket");
+            return Ok(());
+        }
+        bail!("package '{pkg}' has no live origin claim to release");
     }
 
     let mut completed = Vec::new();
-    for (storage, observed) in targets {
+    for (handle, observed) in targets {
         let outcome =
-            origin::release_observed_for_repurpose(storage.as_ref(), &pkg, &observed).await;
+            origin::release_observed_for_repurpose(handle.storage.as_ref(), pkg, &observed).await;
         match outcome {
-            Ok(Some(unclaimed)) => completed.push((storage, observed.state, unclaimed)),
+            Ok(Some(unclaimed)) => completed.push((handle, observed.state, unclaimed)),
             Ok(None) => {
-                rollback_origin_releases(&pkg, &completed).await?;
-                anyhow::bail!("package '{pkg}' changed during origin release; no claims released");
+                rollback_origin_releases(pkg, &completed).await?;
+                bail!("package '{pkg}' changed during origin release; no claims released");
             }
             Err(error) => {
-                rollback_origin_releases(&pkg, &completed).await?;
+                rollback_origin_releases(pkg, &completed).await?;
                 return Err(error).context(format!(
-                    "release origin for '{pkg}'; earlier bucket releases were rolled back"
+                    "release origin for '{pkg}' on bucket '{}'; earlier bucket releases were \
+                     rolled back",
+                    handle.name
                 ));
             }
         }
@@ -448,25 +483,30 @@ pub async fn run_origin_release(args: OriginReleaseArgs) -> Result<()> {
 async fn rollback_origin_releases(
     pkg: &str,
     completed: &[(
-        Arc<dyn Storage>,
+        &BucketHandle,
         origin::OriginState,
         origin::OriginObservation,
     )],
 ) -> Result<()> {
     let mut failures = Vec::new();
-    for (storage, original, unclaimed) in completed.iter().rev() {
-        if let Err(error) =
-            origin::restore_released_for_repurpose(storage.as_ref(), pkg, *original, unclaimed)
-                .await
+    for (handle, original, unclaimed) in completed.iter().rev() {
+        if let Err(error) = origin::restore_released_for_repurpose(
+            handle.storage.as_ref(),
+            pkg,
+            *original,
+            unclaimed,
+        )
+        .await
         {
-            failures.push(format!("{error:#}"));
+            failures.push(format!("bucket '{}': {error:#}", handle.name));
         }
     }
     if failures.is_empty() {
         Ok(())
     } else {
-        anyhow::bail!(
-            "origin release failed and rollback was incomplete: {}",
+        bail!(
+            "origin release failed and rollback was incomplete ({}). Stop writes, then run \
+             `pypiron origin release {pkg}` again: it releases only the buckets still claimed",
             failures.join("; ")
         )
     }
@@ -503,6 +543,9 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
     // exists to diff) by which buckets are still empty of corpus. Each is fenced
     // with a backfill sentinel seeded *before* the re-stamp commits (see below).
     let mut added_indices: Vec<usize> = Vec::new();
+    // Buckets this migration drops, kept so their notes are checked again once
+    // the new list is committed.
+    let mut removed_buckets: Vec<BucketHandle> = Vec::new();
     // Refuse to change the topology while any reachable bucket still holds
     // undrained `_repl/` repair notes: a stranded note may be the sole copy of a
     // record not yet replicated, and shrinking/reordering could remove the
@@ -549,10 +592,21 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
         // check every member the new list drops. Unlike a surviving bucket, a
         // removed bucket we cannot reach is a refusal: we must not drop a bucket
         // we could not prove note-free.
-        let previous = buckets
+        let (previous, stamp_unreachable) = buckets
             .stamped_member_names_with(|_, error| is_availability(error))
             .await
             .context("read the previous topology to find buckets being removed")?;
+        // No stamp answered, but a bucket stayed silent: it may hold the current
+        // list, and without that list the buckets being removed cannot be found
+        // or checked. Treating it as a first-ever migration would skip them.
+        if previous.is_none() && !stamp_unreachable.is_empty() {
+            bail!(
+                "no reachable bucket carries a topology stamp and bucket(s) '{}' did not answer, \
+                 so the current list (and any bucket being removed) cannot be learned; bring \
+                 it back and retry",
+                stamp_unreachable.join("', '")
+            );
+        }
         match previous {
             // Buckets in the new list but absent from the previous stamped
             // topology are the ones this migration adds.
@@ -581,6 +635,10 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
                         .build_one_by_identity(removed)
                         .await
                         .with_context(|| format!("connect to removed bucket '{removed}'"))?;
+                    removed_buckets.push(BucketHandle {
+                        storage: storage.clone(),
+                        name: removed.clone(),
+                    });
                     match replicate::first_undrained_repl_note(storage.as_ref()).await {
                         Ok(None) => {}
                         Ok(Some(note)) if args.force => eprintln!(
@@ -735,7 +793,11 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
     }
     let report = buckets
         .migrate_topology_with(|_, error| is_availability(error))
-        .await?;
+        .await
+        .context(
+            "some buckets may already carry the new list; fix the error, then run the same \
+             `pypiron buckets migrate` again",
+        )?;
     let generation = report
         .generation
         .ok_or_else(|| anyhow!("no reachable bucket was available to migrate"))?;
@@ -744,6 +806,26 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
         report.stamped_indices.len(),
         report.unreachable_indices.len()
     );
+
+    // Every node should be stopped, so no note can appear after the pre-check.
+    // One that did means a node is still writing under the old list. The new
+    // list stays committed — undoing it would be the riskier move — but the
+    // command fails so the operator sees it and acts.
+    if !args.force {
+        let problems =
+            repl_notes_after_commit(buckets.handles(), &removed_buckets, &is_availability).await;
+        if !problems.is_empty() {
+            bail!(
+                "the new bucket list is committed (topology generation {generation}), but \
+                 repair notes appeared while migrating, so a node is still running: {}. Stop \
+                 every node. A note on a bucket that stays in the list is retried once nodes \
+                 restart. A note on a removed bucket may be a record's only copy: run \
+                 `pypiron buckets migrate` with the previous list (the removed bucket back in), \
+                 let replication drain, then remove it again.",
+                problems.join("; ")
+            );
+        }
+    }
 
     // The backfill sentinels were already seeded above, before the stamp
     // committed, so a freshly-added bucket is fenced the moment its topology is
@@ -756,6 +838,45 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Repair notes found after `buckets migrate` committed its new list, one line
+/// per problem. The pre-check refused any, so a hit means a node kept writing.
+/// A kept bucket that cannot be reached is only warned about, as the pre-check
+/// skipped it too; a removed bucket that cannot be re-checked is a problem,
+/// because a note there may be a record's only copy.
+async fn repl_notes_after_commit(
+    kept: &[BucketHandle],
+    removed: &[BucketHandle],
+    is_availability: &impl Fn(&anyhow::Error) -> bool,
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    let all = kept
+        .iter()
+        .map(|h| (h, false))
+        .chain(removed.iter().map(|h| (h, true)));
+    for (handle, is_removed) in all {
+        let role = if is_removed {
+            "removed bucket"
+        } else {
+            "bucket"
+        };
+        match replicate::first_undrained_repl_note(handle.storage.as_ref()).await {
+            Ok(None) => {}
+            Ok(Some(note)) => {
+                problems.push(format!("{role} '{}' holds note '{note}'", handle.name))
+            }
+            Err(error) if !is_removed && is_availability(&error) => eprintln!(
+                "migrate: could not re-check bucket '{}' for repair notes: it is unreachable",
+                handle.name
+            ),
+            Err(error) => problems.push(format!(
+                "could not re-check {role} '{}' for repair notes ({error:#})",
+                handle.name
+            )),
+        }
+    }
+    problems
 }
 
 /// Log output format.
@@ -1570,6 +1691,48 @@ mod tests {
         );
         assert_eq!(strip_url_userinfo("/srv/git/r.git"), "/srv/git/r.git");
         assert_eq!(strip_url_userinfo(""), "");
+    }
+
+    #[tokio::test]
+    async fn migrate_recheck_reports_notes_planted_after_the_precheck() {
+        use crate::storage::test_support::InMemStorage;
+        let kept = Arc::new(InMemStorage::default());
+        let gone = Arc::new(InMemStorage::default());
+        let handle = |name: &str, storage: &Arc<InMemStorage>| BucketHandle {
+            storage: storage.clone(),
+            name: name.to_string(),
+        };
+        let kept_list = [handle("a", &kept)];
+        let removed_list = [handle("c", &gone)];
+        let never = |_: &anyhow::Error| false;
+        assert!(repl_notes_after_commit(&kept_list, &removed_list, &never)
+            .await
+            .is_empty());
+
+        // A node still running under the old list writes a note on each side.
+        let tag = crate::counters::bucket_tag("a");
+        kept.insert(&format!("_repl/{tag}/p/p-1.whl!x"), Vec::new());
+        gone.insert(&format!("_repl/{tag}/q/q-1.whl!y"), Vec::new());
+        let problems = repl_notes_after_commit(&kept_list, &removed_list, &never).await;
+        assert_eq!(problems.len(), 2, "{problems:?}");
+        assert!(
+            problems[0].starts_with("bucket 'a' holds note"),
+            "{problems:?}"
+        );
+        assert!(
+            problems[1].starts_with("removed bucket 'c' holds note"),
+            "{problems:?}"
+        );
+
+        // A removed bucket that cannot be re-checked is a problem, never a pass.
+        gone.fail_lists_of("_repl/");
+        let all_down = |_: &anyhow::Error| true;
+        let problems = repl_notes_after_commit(&[], &removed_list, &all_down).await;
+        assert_eq!(problems.len(), 1, "{problems:?}");
+        assert!(
+            problems[0].contains("could not re-check removed bucket 'c'"),
+            "{problems:?}"
+        );
     }
 
     fn parse_serve(args: &[&str]) -> ServeArgs {

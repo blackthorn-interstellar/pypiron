@@ -24,6 +24,10 @@ proxy-upstream = "https://pypi.org"
 Each node needs credentials for every bucket. Start nodes as described in
 [Deploy on cloud storage](standard-cloud.md).
 
+The first start on a new bucket list needs every bucket to answer. If one
+can't be reached, the node refuses to start and names it. After that first
+start, nodes start fine while a bucket is down.
+
 Put a load balancer in front of them:
 
 - Send readiness checks to `/ready`.
@@ -116,6 +120,18 @@ then remove the old bucket. It also refuses any change while a pending repair
 remains, and names that repair. `--force` accepts loss of unique content and
 proceeds past pending repairs: one on a bucket you keep is still retried, one on
 a bucket you remove is abandoned.
+
+Migration also refuses when it can't learn the current list: no bucket it can
+reach carries one and another bucket is down. Bring that bucket back and run it
+again.
+
+If a migration stops partway, run the same command again.
+
+If migration reports repairs that appeared while it ran, the new list is
+already in place and a node is still running. Stop it. A repair on a bucket you
+kept finishes once nodes restart. A repair on a bucket you removed may be the
+only copy of a file: migrate back to the previous list, let replication finish,
+then remove the bucket again.
 
 To evacuate temporarily to one surviving bucket, stop the fleet and restart it
 with that single bucket. Returning to a multi-bucket list requires the migration

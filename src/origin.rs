@@ -423,6 +423,10 @@ pub(crate) async fn release_empty_claim(storage: &dyn Storage, pkg: &str, expect
 /// claim, but only through CAS and only while both truth and write-intent sets
 /// are empty. A post-CAS re-list closes the list/CAS race by restoring the
 /// original owner with a fresh nonce if activity appeared.
+///
+/// Returns the claim as observed — `unclaimed` included, so a re-run can tell
+/// "already released here" from "never claimed" — or `None` when there is no
+/// claim object at all.
 pub async fn releasable_for_repurpose(
     storage: &dyn Storage,
     pkg: &str,
@@ -439,7 +443,7 @@ pub async fn releasable_for_repurpose(
             "package '{pkg}' still has package truth, pending write markers, or replication work"
         );
     }
-    Ok(observed.filter(|value| value.state != OriginState::Unclaimed))
+    Ok(observed)
 }
 
 async fn has_pending_replication_notes(storage: &dyn Storage, pkg: &str) -> Result<bool> {

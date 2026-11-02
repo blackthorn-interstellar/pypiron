@@ -48,6 +48,7 @@ from .conftest import (
     minio_list_keys_in,
     minio_object_sha256,
     minio_put_key_in,
+    prestamp_topology,
     s3_repl_tag,
 )
 from .helpers import (
@@ -760,6 +761,8 @@ def test_boot_with_the_region_bucket_unreachable_reads_from_the_write_bucket(
     minio = minio_two_proxy
     a, b = minio["buckets"]
     faults = minio["faults"]
+    # A restart, not a first boot: a first boot needs every bucket to answer.
+    prestamp_topology(minio, (a, b))
     faults.fail(b)
     server_gen = _start_read_affinity_server(
         tmp_path_factory,

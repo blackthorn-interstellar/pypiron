@@ -43,6 +43,7 @@ from .conftest import (
     minio_object_sha256,
     minio_put_key_in,
     minio_remove_bucket,
+    prestamp_topology,
     s3_buckets_uri,
     s3_repl_tag,
 )
@@ -449,6 +450,8 @@ def test_fresh_startup_skips_a_blackholed_preferred_bucket(
     """Cold boot bounds topology I/O instead of inheriting artifact timeouts."""
     minio = minio_two_proxy
     a, b = minio["buckets"]
+    # A restart, not a first boot: a first boot needs every bucket to answer.
+    prestamp_topology(minio, (a, b))
     minio["faults"].blackhole(a)
     started = time.monotonic()
     server_gen = _start_s3_server(
@@ -1984,13 +1987,65 @@ def test_origin_release_updates_every_empty_bucket_claim(minio_two, pypiron_bin)
     for bucket in minio["buckets"]:
         assert _claim_owner(minio, bucket, pkg) == "unclaimed"
 
-    rc, _, err = run_returncode(
+    # Running it again is safe: nothing is left to release, and that is success.
+    rc, out, err = run_returncode(
         [str(pypiron_bin), "origin", "release", pkg],
+        env=env,
+        timeout=30,
+    )
+    assert rc == 0, f"re-run of a finished release failed:\n{out}\n{err}"
+    assert "already released" in err
+
+    # A name nobody ever claimed is still an error, so a typo does not pass.
+    rc, _, err = run_returncode(
+        [str(pypiron_bin), "origin", "release", "nosuchclaim"],
         env=env,
         timeout=30,
     )
     assert rc != 0
     assert "no live origin claim" in err
+
+
+def test_origin_release_rerun_finishes_a_release_interrupted_between_buckets(
+    minio_two, pypiron_bin
+):
+    """A release killed after the first bucket leaves the claims disagreeing.
+    Running the command again releases only the bucket still claimed."""
+    minio = minio_two
+    a, b = minio["buckets"]
+    pkg = "halfreleased"
+    minio_put_key_in(minio, a, f"packages/{pkg}/.origin", "unclaimed")
+    minio_put_key_in(minio, b, f"packages/{pkg}/.origin", "private")
+
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "origin", "release", pkg],
+        env=_s3_env(minio, "127.0.0.1:0"),
+        timeout=30,
+    )
+    assert rc == 0, f"re-run did not finish the release:\n{out}\n{err}"
+    assert "on 1 bucket(s)" in err, err
+    for bucket in (a, b):
+        assert _claim_owner(minio, bucket, pkg) == "unclaimed"
+
+
+def test_origin_release_failure_prints_each_buckets_state(minio_two, pypiron_bin):
+    """When a release cannot go ahead, the operator sees what every bucket holds."""
+    minio = minio_two
+    a, b = minio["buckets"]
+    pkg = "stillbusy"
+    for bucket in (a, b):
+        minio_put_key_in(minio, bucket, f"packages/{pkg}/.origin", "private")
+    # b still holds a file, so the name is not empty and cannot be released.
+    minio_put_key_in(minio, b, f"packages/{pkg}/{pkg}-1.0.tar.gz", "bytes")
+
+    rc, out, err = run_returncode(
+        [str(pypiron_bin), "origin", "release", pkg],
+        env=_s3_env(minio, "127.0.0.1:0"),
+        timeout=30,
+    )
+    assert rc != 0, f"released a name that still holds a file:\n{out}\n{err}"
+    for bucket in (a, b):
+        assert f"bucket 's3://{bucket}': private" in err, err
 
 
 def test_buckets_migrate_stamps_every_reachable_bucket(minio_two, pypiron_bin):
@@ -2653,6 +2708,57 @@ def _serve_exits(pypiron_bin, minio, bucket_names, *, timeout=30):
         out, _ = proc.communicate(timeout=5)
         raise AssertionError(f"serve did not refuse to start; it stayed up:\n{out}")
     return proc.returncode, out
+
+
+def test_first_boot_refuses_while_a_bucket_is_unreachable(minio_two_proxy, pypiron_bin, tmp_path):
+    """A brand-new bucket list cannot be checked against the fleet while one
+    bucket is silent — it may hold the real list. The node refuses, names the
+    bucket, and stamps nothing; once every bucket answers it boots."""
+    minio = minio_two_proxy
+    a, b = minio["buckets"]
+    minio["faults"].fail(a)
+    try:
+        rc, out = _serve_exits(pypiron_bin, minio, (a, b))
+    finally:
+        minio["faults"].recover(a)
+    assert rc != 0, f"first boot stamped a list while a bucket was down:\n{out}"
+    assert f"'s3://{a}' did not answer" in out and "reachable" in out, out
+    for bucket in (a, b):
+        assert not minio_key_exists_in(minio, bucket, "_topology/stamp.json")
+
+    node = _start_multibucket_node(pypiron_bin, minio, tmp_path, "all-up")
+    try:
+        wait_http_ok(f"{node['base_url']}/simple/index.json", timeout=20)
+    finally:
+        kill_process_tree(node["proc"])
+
+
+def test_migrate_refuses_when_the_only_stamped_bucket_is_unreachable(
+    minio_three_proxy, pypiron_bin
+):
+    """The fleet runs [a, b]. Migrating to [a, c] while a is down sees no stamp
+    on c, so it cannot learn that b is being removed. It must refuse rather than
+    treat the move as a first-ever migration and drop b unchecked."""
+    minio = minio_three_proxy
+    a, b, c = minio["buckets"]
+    env = _s3_env(minio, "127.0.0.1:0")
+    env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, b)
+    rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=30)
+    assert rc == 0, f"initial migration failed:\n{out}\n{err}"
+
+    minio["faults"].fail(a)
+    try:
+        env["PYPIRON_BUCKETS"] = s3_buckets_uri(a, c)
+        rc, out, err = run_returncode([str(pypiron_bin), "buckets", "migrate"], env=env, timeout=60)
+    finally:
+        minio["faults"].recover(a)
+    assert rc != 0, f"migrate dropped b without learning the current list:\n{out}\n{err}"
+    assert f"'s3://{a}' did not answer" in err, err
+    assert not minio_key_exists_in(minio, c, "_topology/stamp.json")
+    for bucket in (a, b):
+        stamp = json.loads(minio_get_key_in(minio, bucket, "_topology/stamp.json"))
+        assert stamp["generation"] == 1
+        assert stamp["buckets"] == [f"s3://{a}", f"s3://{b}"]
 
 
 def test_changed_bucket_list_without_migrate_refuses_to_start(minio_three, pypiron_bin, tmp_path):

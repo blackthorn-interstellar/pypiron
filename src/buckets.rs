@@ -492,6 +492,26 @@ impl BucketSet {
         if reachable.is_empty() {
             bail!("cannot verify topology: no configured bucket is reachable at startup");
         }
+        // Stamping a bare bucket asserts this list is the deployment's. With a
+        // bucket silent, that is a guess: the silent one may hold a newer stamp
+        // (or the only one), and acknowledged uploads would land on a bucket the
+        // fleet never listed. Restarting on fully stamped buckets during an
+        // outage stays allowed — those stamps are the evidence.
+        let unstamped = names_at(
+            &self.handles,
+            reachable
+                .iter()
+                .filter(|(_, c)| c.is_none())
+                .map(|(i, _)| *i),
+        );
+        if !unstamped.is_empty() && !report.unreachable_indices.is_empty() {
+            bail!(
+                "bucket(s) {unstamped} carry no topology stamp and bucket(s) {} did not answer, \
+                 so this bucket list cannot be checked against the deployment before stamping \
+                 it; start once every configured bucket is reachable",
+                names_at(&self.handles, report.unreachable_indices.iter().copied())
+            );
+        }
         let generation = generation.unwrap_or(0);
         let body = encode_stamp(&names, &expected_hash, generation)?;
         // A conflict at the highest generation has no deterministic winner.
@@ -569,17 +589,20 @@ impl BucketSet {
 
     /// The member identities recorded by the highest-generation topology stamp on
     /// any *reachable* bucket in this set, or `None` when no reachable bucket
-    /// carries a stamp yet. `migrate` uses this to learn the *previous* topology
-    /// so a bucket being dropped can be checked for undrained notes before it is
-    /// removed. Availability failures are skipped; every other error fails closed.
+    /// carries a stamp yet, plus the names of the buckets whose stamp could not be
+    /// read. `migrate` uses this to learn the *previous* topology so a bucket
+    /// being dropped can be checked for undrained notes before it is removed.
+    /// Availability failures are skipped (and named); every other error fails
+    /// closed.
     pub async fn stamped_member_names_with<F>(
         &self,
         is_availability: F,
-    ) -> Result<Option<Vec<String>>>
+    ) -> Result<(Option<Vec<String>>, Vec<String>)>
     where
         F: Fn(usize, &anyhow::Error) -> bool,
     {
         let mut best: Option<(u64, Vec<String>)> = None;
+        let mut unreachable = Vec::new();
         for (index, handle) in self.handles.iter().enumerate() {
             match bounded_topology_io(handle.storage.get_with_etag(TOPOLOGY_STAMP_KEY)).await {
                 Ok(Some((bytes, _etag))) => {
@@ -594,6 +617,7 @@ impl BucketSet {
                 Ok(None) => {}
                 Err(error) if topology_error_is_availability(index, &error, &is_availability) => {
                     warn!(bucket=%handle.name, error=%error, "bucket unreachable while reading topology stamp; skipping");
+                    unreachable.push(handle.name.clone());
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -602,7 +626,7 @@ impl BucketSet {
                 }
             }
         }
-        Ok(best.map(|(_, names)| names))
+        Ok((best.map(|(_, names)| names), unreachable))
     }
 
     /// Conservatively verify one bucket after a reachability transition. Use
@@ -847,6 +871,14 @@ impl BucketSet {
         self.set_topology_generation(generation);
         Ok(report)
     }
+}
+
+/// `'a', 'b'` — the quoted names at `indices`, for an operator-facing message.
+fn names_at(handles: &[BucketHandle], indices: impl Iterator<Item = usize>) -> String {
+    indices
+        .map(|index| format!("'{}'", handles[index].name))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 /// Storage key of the topology stamp — the fail-closed record of which buckets a
@@ -1308,12 +1340,68 @@ mod tests {
     // The hang tests run on tokio's paused clock: the runtime skips straight to
     // the TOPOLOGY_IO_TIMEOUT deadline instead of sleeping through it.
     #[tokio::test(start_paused = true)]
-    async fn startup_bounds_a_hung_bucket_as_unreachable() {
-        let reachable = Arc::new(InMemStorage::default());
+    async fn startup_refuses_to_stamp_when_nothing_reachable_is_stamped() {
+        let east = Arc::new(InMemStorage::default());
         let hung = Arc::new(TopologyTestStorage::new());
         hung.hang_reads();
         let set = BucketSet::new(vec![
-            memory_handle("east", &reachable),
+            memory_handle("east", &east),
+            topology_test_handle("west", &hung),
+        ]);
+
+        // West may hold the fleet's real list; stamping east would be a guess.
+        let error = set.verify_topology_with(|_, _| false).await.unwrap_err();
+        assert!(
+            error.to_string().contains("'west' did not answer"),
+            "{error}"
+        );
+        assert!(east
+            .get_with_etag(TOPOLOGY_STAMP_KEY)
+            .await
+            .unwrap()
+            .is_none());
+        assert_eq!(set.topology_generation(), None);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn startup_refuses_to_stamp_a_bare_bucket_beside_a_silent_one() {
+        // East's old stamp matches this list, but silent west may hold a newer
+        // one: north must not be stamped from east's word alone.
+        let east = Arc::new(InMemStorage::default());
+        let north = Arc::new(InMemStorage::default());
+        let hung = Arc::new(TopologyTestStorage::new());
+        hung.hang_reads();
+        seed_stamp(east.as_ref(), &["east", "north", "west"], 3).await;
+        let set = BucketSet::new(vec![
+            memory_handle("east", &east),
+            memory_handle("north", &north),
+            topology_test_handle("west", &hung),
+        ]);
+
+        let error = set.verify_topology_with(|_, _| false).await.unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("'north' carry no topology stamp"),
+            "{error}"
+        );
+        assert!(north
+            .get_with_etag(TOPOLOGY_STAMP_KEY)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    // The hang tests run on tokio's paused clock: the runtime skips straight to
+    // the TOPOLOGY_IO_TIMEOUT deadline instead of sleeping through it.
+    #[tokio::test(start_paused = true)]
+    async fn startup_tolerates_a_hung_bucket_once_a_reachable_stamp_exists() {
+        let east = Arc::new(InMemStorage::default());
+        let hung = Arc::new(TopologyTestStorage::new());
+        hung.hang_reads();
+        seed_stamp(east.as_ref(), &["east", "west"], 0).await;
+        let set = BucketSet::new(vec![
+            memory_handle("east", &east),
             topology_test_handle("west", &hung),
         ]);
 
@@ -1321,7 +1409,7 @@ mod tests {
         // control-I/O timeout is still availability, so east can start alone.
         let report = set.verify_topology_with(|_, _| false).await.unwrap();
         assert_eq!(report.generation, Some(0));
-        assert_eq!(report.stamped_indices, vec![0]);
+        assert_eq!(report.verified_indices, vec![0]);
         assert_eq!(report.unreachable_indices, vec![1]);
         assert_eq!(set.topology_generation(), Some(0));
     }

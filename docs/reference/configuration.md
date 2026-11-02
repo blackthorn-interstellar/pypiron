@@ -480,7 +480,7 @@ with 401 on the others.
 | `pypiron verify-index` | Read-only full index check against the selected storage backend. `--deep` re-hashes every stored file too. |
 | `pypiron rebuild-index` | Rebuild every index from stored files. |
 | `pypiron buckets migrate` | Apply a changed `--buckets` list across every reachable bucket. |
-| `pypiron origin release PACKAGE` | Release an empty package name for deliberate private/public repurposing — the only way to flip a mirror-owned name to private; there is no in-place reclaim. Every configured bucket must be reachable and empty for that package. |
+| `pypiron origin release PACKAGE` | Release an empty package name for deliberate private/public repurposing — the only way to flip a mirror-owned name to private; there is no in-place reclaim. Every configured bucket must be reachable and empty for that package. Safe to run again: it releases only buckets still claimed, and succeeds when all are already released. |
 
 Maintenance commands use the same storage flags and `[serve]` configuration as
 the server.
@@ -498,7 +498,10 @@ of the log itself requires Object Lock in COMPLIANCE mode.
 
 `buckets migrate` refuses to drop the only copy of a file or run while repairs
 are pending. Add the replacement, wait for replication, then remove the old
-bucket. `--force` can discard content permanently.
+bucket. `--force` can discard content permanently. If it stops partway, run
+the same command again. If it reports repairs that appeared while it ran, a
+node is still running and the new list is already in place; see
+[Change the list](../guides/multi-region.md#change-the-list-with-stop-migrate-restart).
 
 | Flag | Env | Default | Use |
 | --- | --- | --- | --- |
@@ -508,7 +511,8 @@ bucket. `--force` can discard content permanently.
 
 Stop writes before `origin release`. It refuses a package with any stored file
 except `.origin`, or with pending write/replication work, and conditionally
-releases the claim on each configured bucket.
+releases the claim on each configured bucket. If it stops partway, it prints
+what each bucket holds; run it again.
 
 ## Multi-bucket metrics
 

@@ -222,6 +222,8 @@ pypiron origin release PACKAGE \
   --config /etc/pypiron/pypiron.toml
 ```
 
+If it is interrupted, run the same command again.
+
 Restart the server, then migrate the package. If the destination reserves
 private names (`private-prefix` or `private-patterns`), every migrated name
 must be a reserved one.

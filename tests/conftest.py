@@ -4,6 +4,7 @@ import base64
 import hashlib
 import hmac
 import http.client
+import json
 import os
 import re
 import subprocess
@@ -14,7 +15,7 @@ import uuid
 from email.utils import formatdate
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Sequence, Tuple
 from urllib.parse import quote, unquote, urlencode, urlsplit
 
 import pytest
@@ -1792,7 +1793,8 @@ def s3_server_read_affinity_home_down(
     the write pin's loan rather than a pin B earned. The fault is armed on the
     proxy before the server fixture starts, which is the only way to exercise a
     boot-time outage."""
-    a, _b = minio_two_proxy["buckets"]
+    a, b = minio_two_proxy["buckets"]
+    prestamp_topology(minio_two_proxy, (a, b))
     minio_two_proxy["faults"].fail(a)
     yield from _start_read_affinity_server(
         tmp_path_factory,
@@ -1901,6 +1903,20 @@ def s3_buckets_uri(*names: str) -> str:
     """The PYPIRON_BUCKETS value for an ordered list of MinIO bucket names: each
     becomes an `s3://name` URI (region rides on the shared AWS_REGION knob)."""
     return ",".join(f"s3://{name}" for name in names)
+
+
+def prestamp_topology(minio: Dict, names: Sequence[str]) -> None:
+    """Write the generation-0 topology stamp for `names` onto each of them — the
+    state a fleet's first boot leaves. A node refuses to stamp bare buckets while
+    one is unreachable, so a test that boots into an outage starts from here."""
+    ids = [f"s3://{name}" for name in names]
+    stamp = {
+        "buckets": ids,
+        "hash": hashlib.sha256("\0".join(ids).encode()).hexdigest(),
+        "generation": 0,
+    }
+    for name in names:
+        minio_put_key_in(minio, name, "_topology/stamp.json", json.dumps(stamp))
 
 
 def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:

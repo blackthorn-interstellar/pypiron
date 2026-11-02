@@ -65,13 +65,13 @@ For a private network transfer, save this as `pypiron.toml` beside the list:
 ```toml
 [mirror]
 include-packages-from = "packages.txt"
+include-dependencies = true
 exclude-newer = "7 days"
 
 [sync]
 from = "https://pypi.org"
 to = "https://pypi.internal"
 admin-user = "admin"
-include-dependencies = true
 advisory-feed = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"
 ```
 

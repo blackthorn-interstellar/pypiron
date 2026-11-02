@@ -23,6 +23,7 @@ mod corpus_check;
 pub mod counted_storage;
 pub mod counters;
 pub mod denylist;
+pub mod deps;
 pub mod format;
 pub mod hash;
 pub mod html;

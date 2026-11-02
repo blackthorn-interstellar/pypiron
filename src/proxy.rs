@@ -23,18 +23,19 @@
 //! storage. When upstream is down, callers fall back to the local
 //! materialized index: already-cached packages keep installing.
 
-use std::collections::HashMap;
-use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, bail, Context as _, Result};
-use futures::StreamExt;
+use futures::stream::{self, StreamExt};
 use pep440_rs::VersionSpecifiers;
 use reqwest::Client;
 use tracing::{debug, info, warn};
 
 use crate::app::{AppState, PACKAGES_PREFIX};
+use crate::deps::{self, DepsMemo, Want};
 use crate::hash::sha256_hex;
 use crate::names::infer_version_from_filename;
 use crate::origin;
@@ -68,6 +69,19 @@ const LISTING_MAX_STALE: Duration = Duration::from_secs(3600);
 const MAX_LISTINGS: usize = 8192;
 /// Listing and metadata fetches are small; bound them hard.
 const SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+/// With `include-dependencies`: how often the dependency scope is re-read with
+/// nothing prompting it. A listing fetch that turns up an unread release
+/// prompts a refresh at once; this pass retries releases whose metadata could
+/// not be read.
+const FOLLOW_INTERVAL: Duration = Duration::from_secs(600);
+/// How long a request for a name outside the included packages waits on a
+/// pending dependency refresh before a retryable 503.
+const FOLLOW_WAIT: Duration = Duration::from_secs(20);
+/// Projects, and metadata files within each, read at once while following.
+const FOLLOW_CONCURRENCY: usize = 8;
+/// What the dependency follower has read, so a restart reads only releases
+/// published since. Derived and disposable, like `_sync/cursors.json`.
+pub(crate) const FOLLOW_KEY: &str = "_state/proxy-dependencies.json";
 /// Same retry budget as `sync`: at CDN scale, transient errors are routine.
 const DOWNLOAD_ATTEMPTS: u32 = 3;
 /// Fixed head start every artifact download gets before its size-derived budget
@@ -198,13 +212,16 @@ pub struct Proxy {
     upstream: String,
     mirror: ResolvedMirror,
     /// The package scope as a fast name → version-constraints lookup, derived
-    /// once from `mirror.include_packages`. `None` means no scope is configured (serve
+    /// from `mirror.include_packages`. `None` means no scope is configured (serve
     /// any non-private name — the open-proxy default). A present map is a
     /// fail-closed allowlist: a name absent from it never falls through, and a
     /// name's constraints gate which versions are served. A name may carry
     /// several constraints (duplicate list entries); a version passes if any
-    /// allows it, matching `sync`'s union semantics.
-    scope: Option<HashMap<String, Vec<Option<VersionSpecifiers>>>>,
+    /// allows it, matching `sync`'s union semantics. With `include-dependencies`
+    /// the follower widens it to the included packages' dependency closure.
+    scope: RwLock<Option<Arc<ScopeMap>>>,
+    /// The dependency follower, when `include-dependencies` is on.
+    follow: Option<Follow>,
     /// The `--exclude-package` denylist, shared (via `Arc`) with `AppState` so the
     /// index rebuild, the `/project/` page, and the reconcile all rule through the
     /// same predicate the proxy's own scope check does — no drift.
@@ -226,6 +243,73 @@ pub struct Proxy {
     /// Warm-hit accelerator: artifact keys proven present in local storage, so a
     /// repeat proxied download skips its existence HEAD. See [`PresenceCache`].
     presence: PresenceCache,
+}
+
+type ScopeMap = HashMap<String, Vec<Option<VersionSpecifiers>>>;
+
+/// `include-dependencies` on the proxy: the same closure `sync` mirrors, kept
+/// current in the background by [`Proxy::follow_dependencies`] so a name is in
+/// scope by the time an installer asks for it.
+struct Follow {
+    /// The included names; they keep their own constraints and never wait.
+    listed: HashSet<String>,
+    known: Mutex<Known>,
+    /// The closure last published into the scope.
+    published: Mutex<BTreeMap<String, Want>>,
+    /// Refreshes asked for so far; startup asks the first.
+    asked: AtomicU64,
+    wake: tokio::sync::Notify,
+    /// The `asked` count the last finished refresh started from: every ask up
+    /// to it is reflected in the scope.
+    answered: tokio::sync::watch::Sender<u64>,
+}
+
+#[derive(Default)]
+struct Known {
+    /// project → what its servable releases require.
+    memo: HashMap<String, DepsMemo>,
+    /// Releases whose metadata fetch failed; not re-asked for until the next
+    /// [`FOLLOW_INTERVAL`] pass retries them.
+    failed: HashSet<(String, String)>,
+    /// `memo` changed since it was last saved.
+    dirty: bool,
+}
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct SavedFollow {
+    /// The memo is only good for the upstream it was read from.
+    upstream: String,
+    projects: BTreeMap<String, DepsMemo>,
+}
+
+impl Follow {
+    fn ask(&self) {
+        self.asked.fetch_add(1, Ordering::AcqRel);
+        self.wake.notify_one();
+    }
+
+    /// Wait until every refresh asked for so far has finished.
+    async fn settled(&self) -> Result<()> {
+        let target = self.asked.load(Ordering::Acquire);
+        let mut rx = self.answered.subscribe();
+        tokio::time::timeout(FOLLOW_WAIT, async {
+            rx.wait_for(|&answered| answered >= target).await.is_ok()
+        })
+        .await
+        .ok()
+        .filter(|&ok| ok)
+        .map(|_| ())
+        .ok_or_else(|| anyhow!("still reading the included packages' dependencies; retry shortly"))
+    }
+
+    fn closure(
+        &self,
+        roots: &[crate::sync::PackageSpec],
+        private: &crate::names::PrivateNames,
+    ) -> BTreeMap<String, Want> {
+        let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
+        deps::closure(roots, &known.memo, private)
+    }
 }
 
 /// One artifact key's single-flight state: nothing but the slot mutex. Fill
@@ -709,13 +793,14 @@ pub async fn eligible(state: &AppState, storage: &dyn Storage, pkg: &str) -> Res
     if state.private.matches(pkg) {
         return Ok(false);
     }
-    // The package allowlist is fail-closed and pure (no I/O), so it gates before
-    // the origin read — an unapproved name never even touches storage.
+    // The package allowlist is fail-closed and never reads storage (it may wait
+    // on a pending dependency refresh), so it gates before the origin read — an
+    // unapproved name never even touches storage.
     if let Some(proxy) = &state.proxy {
         if proxy.name_fully_denied(pkg) {
             return Ok(false);
         }
-        if !proxy.name_in_scope(pkg) {
+        if !proxy.in_scope(pkg).await? {
             return Ok(false);
         }
     }
@@ -755,13 +840,25 @@ impl Proxy {
         // Derive the request-time allowlist index once. Empty scope → None, so
         // name_in_scope() short-circuits to "allow all" (the open-proxy default).
         let scope = (!mirror.include_packages.is_empty()).then(|| {
-            let mut map: HashMap<String, Vec<Option<VersionSpecifiers>>> = HashMap::new();
+            let mut map: ScopeMap = HashMap::new();
             for spec in &mirror.include_packages {
                 map.entry(spec.name.clone())
                     .or_default()
                     .push(spec.specifiers.clone());
             }
-            map
+            Arc::new(map)
+        });
+        let follow = (mirror.include_dependencies && scope.is_some()).then(|| Follow {
+            listed: mirror
+                .include_packages
+                .iter()
+                .map(|s| s.name.clone())
+                .collect(),
+            known: Mutex::default(),
+            published: Mutex::default(),
+            asked: AtomicU64::new(1),
+            wake: tokio::sync::Notify::new(),
+            answered: tokio::sync::watch::Sender::new(0),
         });
         let denylist = Arc::new(crate::denylist::Denylist::from_specs(
             &mirror.exclude_packages,
@@ -769,7 +866,8 @@ impl Proxy {
         Ok(Self {
             upstream,
             mirror,
-            scope,
+            scope: RwLock::new(scope),
+            follow,
             denylist,
             client: crate::upstream_tls::apply(
                 Client::builder()
@@ -852,7 +950,22 @@ impl Proxy {
     /// the allowlist. The version axis is enforced separately, per file, in the
     /// listing.
     pub(crate) fn name_in_scope(&self, pkg: &str) -> bool {
-        self.scope.as_ref().is_none_or(|m| m.contains_key(pkg))
+        self.scope().is_none_or(|m| m.contains_key(pkg))
+    }
+
+    fn scope(&self) -> Option<Arc<ScopeMap>> {
+        self.scope.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// [`Self::name_in_scope`], once the dependency scope has caught up with
+    /// every refresh asked for: an installer asks for a new dependency right
+    /// after the listing that revealed it. A dependency's versions can widen
+    /// too, so every name but an included one waits.
+    async fn in_scope(&self, pkg: &str) -> Result<bool> {
+        if let Some(follow) = self.follow.as_ref().filter(|f| !f.listed.contains(pkg)) {
+            follow.settled().await?;
+        }
+        Ok(self.name_in_scope(pkg))
     }
 
     /// True only for a bare (whole-name) exclude — what the pull gate
@@ -874,7 +987,7 @@ impl Proxy {
     /// in the map can't normally happen — treated fail-closed if it does. The
     /// denylist subtracts on top: an excluded file never serves even if in scope.
     fn version_in_scope(&self, pkg: &str, filename: &str) -> bool {
-        let allowed = match self.scope.as_ref() {
+        let allowed = match self.scope() {
             None => true,
             Some(map) => map
                 .get(pkg)
@@ -1721,6 +1834,263 @@ impl Proxy {
         }
     }
 
+    /// Keep the dependency scope current for as long as the server runs: the
+    /// included packages plus everything their servable releases require,
+    /// exactly what `sync --include-dependencies` would mirror. A no-op unless
+    /// `include-dependencies` is on.
+    pub fn follow_dependencies(self: &Arc<Self>, state: Arc<AppState>) {
+        if self.follow.is_none() {
+            return;
+        }
+        let proxy = self.clone();
+        tokio::spawn(async move { proxy.follow_loop(&state).await });
+    }
+
+    async fn follow_loop(&self, state: &AppState) {
+        let Some(follow) = &self.follow else {
+            return;
+        };
+        // What an earlier run read answers startup's ask at once; this
+        // refresh then only catches up on what was published since.
+        if self.load_followed(state, follow).await {
+            let wants = follow.closure(&self.mirror.include_packages, &state.private);
+            self.publish_scope(follow, &wants);
+            follow.answered.send_replace(1);
+        }
+        let mut retried = Instant::now();
+        loop {
+            if retried.elapsed() >= FOLLOW_INTERVAL {
+                follow
+                    .known
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .failed
+                    .clear();
+                retried = Instant::now();
+            }
+            let upto = follow.asked.load(Ordering::Acquire);
+            self.refresh_dependencies(state, follow).await;
+            follow.answered.send_if_modified(|answered| {
+                let newer = upto > *answered;
+                *answered = (*answered).max(upto);
+                newer
+            });
+            if follow.asked.load(Ordering::Acquire) > upto {
+                continue;
+            }
+            let _ = tokio::time::timeout(FOLLOW_INTERVAL, follow.wake.notified()).await;
+        }
+    }
+
+    /// Visit, round by round, every project not yet visited for the versions
+    /// now wanted of it, reading the releases not read before, until nothing
+    /// changes (see [`deps::pending`]).
+    async fn refresh_dependencies(&self, state: &AppState, follow: &Follow) {
+        let mut done: HashSet<(String, Want)> = HashSet::new();
+        loop {
+            let wants = follow.closure(&self.mirror.include_packages, &state.private);
+            self.publish_scope(follow, &wants);
+            let round: Vec<(String, Want)> = wants
+                .into_iter()
+                .filter(|visit| !done.contains(visit))
+                .collect();
+            if round.is_empty() {
+                break;
+            }
+            let names: Vec<String> = round.iter().map(|(name, _)| name.clone()).collect();
+            stream::iter(names)
+                .map(|name| async move { self.follow_project(state, follow, &name).await })
+                .buffer_unordered(FOLLOW_CONCURRENCY)
+                .collect::<()>()
+                .await;
+            done.extend(round);
+        }
+        self.save_followed(state, follow).await;
+    }
+
+    /// Read the requirements of `pkg`'s servable releases not read before. The
+    /// files are exactly what the proxy would serve: the listing is already
+    /// filtered by the mirror filters and the published scope.
+    async fn follow_project(&self, state: &AppState, follow: &Follow, pkg: &str) {
+        // Never ask upstream about a name the server owns, nor one excluded.
+        if self.name_fully_denied(pkg) {
+            return;
+        }
+        match origin::read_origin(state.pin().storage.as_ref(), pkg).await {
+            Ok(Some(owner)) if owner == origin::PRIVATE => return,
+            Ok(_) => {}
+            Err(e) => {
+                warn!(%pkg, error=?e, "proxy: could not read the origin of a dependency; skipping it this pass");
+                return;
+            }
+        }
+        let Some(found) = self.listing(state, pkg).await else {
+            debug!(%pkg, "proxy: a dependency has no upstream listing");
+            return;
+        };
+        let unread = {
+            let mut known = follow.known.lock().unwrap_or_else(|e| e.into_inner());
+            let known = &mut *known;
+            let files = || found.files.iter().filter(|f| !self.fill_refused_by_yank(f));
+            let memo = known.memo.entry(pkg.to_string()).or_default();
+            // Releases no longer served drop out, and what only they required.
+            known.dirty |= memo.keep_only(files());
+            let unread = memo.unread(files());
+            // Owned, so the reads below hold no borrow across an await.
+            unread
+                .into_iter()
+                .map(|(version, file)| (version, file.clone()))
+                .collect::<Vec<_>>()
+        };
+        // `Err` = the fetch failed; `Ok(None)` = no metadata file to read.
+        let read: Vec<_> = stream::iter(unread)
+            .map(|(version, file)| async move {
+                let requires = if file.has_core_metadata() {
+                    self.fetch_metadata_url(pkg, &file)
+                        .await
+                        .map(|bytes| Some(crate::coremeta::parse(&bytes).requires_dist))
+                        .ok_or(())
+                } else {
+                    Ok(None)
+                };
+                (version, requires)
+            })
+            .buffer_unordered(FOLLOW_CONCURRENCY)
+            .collect()
+            .await;
+        let mut known = follow.known.lock().unwrap_or_else(|e| e.into_inner());
+        let known = &mut *known;
+        for (version, requires) in read {
+            match requires {
+                Ok(requires) => {
+                    known
+                        .memo
+                        .entry(pkg.to_string())
+                        .or_default()
+                        .record(version, requires);
+                    known.dirty = true;
+                }
+                Err(()) => {
+                    known.failed.insert((pkg.to_string(), version));
+                }
+            }
+        }
+    }
+
+    /// Make `wants` the scope. A project whose versions changed loses its
+    /// cached listing, which was filtered by the old scope.
+    fn publish_scope(&self, follow: &Follow, wants: &BTreeMap<String, Want>) {
+        let mut published = follow.published.lock().unwrap_or_else(|e| e.into_inner());
+        if *published == *wants {
+            return;
+        }
+        let map: ScopeMap = wants
+            .iter()
+            .map(|(name, want)| {
+                let constraints = match deps::specifiers(want) {
+                    None => vec![None],
+                    Some(specs) => specs.into_iter().map(Some).collect(),
+                };
+                (name.clone(), constraints)
+            })
+            .collect();
+        *self.scope.write().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(map));
+        {
+            let mut listings = self.listings.lock().unwrap_or_else(|e| e.into_inner());
+            for (name, want) in wants {
+                if published.get(name) != Some(want) {
+                    listings.remove(name);
+                }
+            }
+        }
+        info!(
+            projects = wants.len(),
+            dependencies = wants.len().saturating_sub(follow.listed.len()),
+            "proxy: dependency scope widened"
+        );
+        *published = wants.clone();
+    }
+
+    /// A fetched listing with a release the follower has not read yet asks
+    /// for a refresh, so its new dependencies come into scope.
+    fn notice_releases(&self, pkg: &str, files: &[SimpleFile]) {
+        let Some(follow) = &self.follow else {
+            return;
+        };
+        let unread = {
+            let known = follow.known.lock().unwrap_or_else(|e| e.into_inner());
+            let seen = known.memo.get(pkg);
+            files
+                .iter()
+                .filter(|f| !self.fill_refused_by_yank(f))
+                .filter_map(|f| infer_version_from_filename(&f.filename))
+                .any(|v| {
+                    !seen.is_some_and(|m| m.releases.contains_key(&v))
+                        && !known.failed.contains(&(pkg.to_string(), v))
+                })
+        };
+        if unread {
+            follow.ask();
+        }
+    }
+
+    async fn load_followed(&self, state: &AppState, follow: &Follow) -> bool {
+        let bytes = match state.pin().storage.get_bytes(FOLLOW_KEY).await {
+            Ok(bytes) => bytes,
+            Err(e) if crate::storage::is_not_found(&e) => return false,
+            Err(e) => {
+                warn!(error=?e, "proxy: could not read what was followed before; reading every release again");
+                return false;
+            }
+        };
+        match serde_json::from_slice::<SavedFollow>(&bytes) {
+            Ok(saved) if saved.upstream == self.upstream => {
+                let mut known = follow.known.lock().unwrap_or_else(|e| e.into_inner());
+                known.memo = saved.projects.into_iter().collect();
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                warn!(error=?e, "proxy: unreadable dependency memo; reading every release again");
+                false
+            }
+        }
+    }
+
+    /// Best-effort: a lost save only means the next start reads more.
+    async fn save_followed(&self, state: &AppState, follow: &Follow) {
+        if state.mutations_fenced() {
+            return;
+        }
+        let bytes = {
+            let mut known = follow.known.lock().unwrap_or_else(|e| e.into_inner());
+            if !std::mem::take(&mut known.dirty) {
+                return;
+            }
+            serde_json::to_vec(&SavedFollow {
+                upstream: self.upstream.clone(),
+                projects: known
+                    .memo
+                    .iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect(),
+            })
+        };
+        let result = match bytes {
+            Ok(bytes) => {
+                state
+                    .pin()
+                    .storage
+                    .put_bytes(FOLLOW_KEY, bytes, Some("application/json"))
+                    .await
+            }
+            Err(e) => Err(e.into()),
+        };
+        if let Err(e) = result {
+            warn!(error=?e, "proxy: could not save the dependency memo");
+        }
+    }
+
     async fn fetch_listing(&self, state: &AppState, pkg: &str) -> Result<Listing> {
         let Some(index) =
             simple::fetch_index(&self.client, &self.upstream, pkg, Some(SMALL_FETCH_TIMEOUT))
@@ -1763,6 +2133,7 @@ impl Proxy {
             // Best-effort — the byte gate and fill refusal are the guarantees.
             .filter(|f| !advisory_blocks(state, pkg, &f.filename))
             .collect();
+        self.notice_releases(pkg, &files);
         let metas: Vec<FileMetadata> = files.iter().map(SimpleFile::as_file_metadata).collect();
         let render_metas: &[FileMetadata] = if status.status.blocks_downloads() {
             &[]

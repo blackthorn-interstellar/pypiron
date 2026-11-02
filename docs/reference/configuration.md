@@ -331,6 +331,7 @@ hostnames, so its egress policy must enforce hostname restrictions.
 | --- | --- | --- |
 | `include-packages` | `--include-package SPEC` | `PYPIRON_INCLUDE_PACKAGE` |
 | `include-packages-from` | `--include-packages-from FILE` | `PYPIRON_INCLUDE_PACKAGES_FROM` |
+| `include-dependencies` | `--include-dependencies` | `PYPIRON_INCLUDE_DEPENDENCIES` |
 | `exclude-packages` | `--exclude-package SPEC` | `PYPIRON_EXCLUDE_PACKAGE` |
 | `exclude-packages-from` | `--exclude-packages-from FILE` | `PYPIRON_EXCLUDE_PACKAGES_FROM` |
 | `include-format` | `--include-format VALUE` | `PYPIRON_INCLUDE_FORMAT` |
@@ -362,6 +363,17 @@ Rules:
   value is refused because it could erase a stricter value from another config
   layer.
 - Excludes win.
+- `include-dependencies = true` also includes everything the included packages
+  need, so any included release installs with any of its extras on any
+  platform. Each dependency takes every version some requirement allows. Your
+  filters and excludes still apply, and a package you include keeps its own
+  version range. `sync` copies the dependencies; the proxy serves them on
+  request. The proxy works out the dependencies in the background. Until it
+  has (on its first start, or just after an included package publishes a
+  release with a new dependency), a request for a dependency waits up to
+  20 seconds and then gets a 503 to retry. Dependencies come from each
+  release's metadata file, which PyPI provides for wheels. Old releases that
+  only have an sdist are skipped, and `sync` counts them in its summary.
 - `include-format` accepts `wheel`, `sdist`, and `other`.
 - Tag filters match wheel tags and support `*`. They never drop sdists; use
   `include-format = ["wheel"]` for a wheels-only mirror.
@@ -411,7 +423,6 @@ require pypiron 0.0.23 or newer on both the sync client and destination server.
 | `--admin-user USER` | `PYPIRON_SYNC_ADMIN_USER` | none | Destination admin user. |
 | `--admin-pass PASS` | `PYPIRON_SYNC_ADMIN_PASS` | none | Destination admin password. |
 | `--private-prefix PREFIX` | `PYPIRON_PRIVATE_PREFIX` | none | Refuse to mirror `PREFIX` and `PREFIX-*`. Also top-level `private-prefix`. |
-| `--include-dependencies` | `PYPIRON_SYNC_INCLUDE_DEPENDENCIES` | `false` | Also mirror everything the selected packages need, so any of their releases installs, with any extra, on any platform. Each dependency takes every version some requirement allows; your mirror filters and excludes still apply, and a package you list keeps its own version range. Reads each release's metadata file, which PyPI provides for wheels; a release without one is counted in the run summary. Also `[sync].include-dependencies`. |
 | `--as-private` | `PYPIRON_SYNC_AS_PRIVATE` | `false` | Import as private packages. Preserves source upload dates when available; missing dates use migration time. Does not preserve yank state. Public-owned names require emptying and `origin release`. [Migration guide](../guides/migrate.md). |
 | `--repair-upload-times` | `PYPIRON_SYNC_REPAIR_UPLOAD_TIMES` | `false` | With `--as-private`, repair dates of existing private files after SHA-256 comparison. Copies no new files; ignores sync cursors and leaves the advisory feed unchanged. Supports `--dry-run`. CLI/env only. Upgrade both client and server. [Procedure](../guides/migrate.md#repair-upload-dates). |
 | `--private-pattern PATTERN` | `PYPIRON_PRIVATE_PATTERN` | none | Refuse to mirror names matching `PATTERN`; with `--source-kind pypicloud --as-private`, migrate the matching projects instead. Repeatable; comma-separated in the env var. Also top-level `private-patterns`. [Details](#reserved-private-names). |
@@ -421,7 +432,7 @@ require pypiron 0.0.23 or newer on both the sync client and destination server.
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `16` | Packages checked in parallel. Each completed package frees a slot for the next, even while another package is stalled. |
 | `--spool-dir PATH` | `PYPIRON_SYNC_SPOOL_DIR` | system temp | Download spool directory. |
 | `--dry-run` | `PYPIRON_SYNC_DRY_RUN` | `false` | Print work, write nothing. |
-| `--full` | `PYPIRON_SYNC_FULL` | `false` | Ignore cursors and reconcile every selected project. After narrowing a filter or version range with `--include-dependencies`, run it once so dependencies only the dropped releases needed stop being followed. |
+| `--full` | `PYPIRON_SYNC_FULL` | `false` | Ignore cursors and reconcile every selected project. |
 | `--no-progress` | `PYPIRON_SYNC_NO_PROGRESS` | `false` | Hide the live progress line (packages, bytes, rate, time left). |
 | `--allow-legacy-versions` | `PYPIRON_ALLOW_LEGACY_VERSIONS` | `false` | Mirror files without an inferable PEP 440 version. Otherwise they are skipped and counted in the run summary. Applies in sync, because the destination accepts mirror uploads. |
 | `--list-legacy-skips` | `PYPIRON_SYNC_LIST_LEGACY_SKIPS` | `false` | Log each file skipped for a non-PEP-440 version, not just the count. |

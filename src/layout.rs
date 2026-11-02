@@ -359,6 +359,7 @@ mod tests {
             crate::storage::STAGING_PREFIX,
             crate::worker::STATE_PREFIX,
             crate::sync::CURSORS_KEY,
+            crate::proxy::FOLLOW_KEY,
             crate::buckets::TOPOLOGY_STAMP_KEY,
             crate::transparency::CHAIN_PREFIX,
         ] {

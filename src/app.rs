@@ -1535,6 +1535,9 @@ async fn run_serve(
                     } else {
                         format!("{} package(s)", mirror.include_packages.len())
                     };
+                    if mirror.include_dependencies && !mirror.include_packages.is_empty() {
+                        scope.push_str(" and their dependencies");
+                    }
                     // A denylist-only proxy is still "open", so say how many
                     // names are carved out of it — otherwise an erased or
                     // mistyped exclude set looks exactly like a correct one.
@@ -1879,6 +1882,9 @@ async fn run_serve(
     // lease on graceful exit)
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker_handle = tokio::spawn(worker::run_worker_until(state.clone(), shutdown_rx));
+    if let Some(proxy) = &state.proxy {
+        proxy.follow_dependencies(state.clone());
+    }
 
     // serve
     let listener = tokio::net::TcpListener::bind(&cli.bind_addr).await?;

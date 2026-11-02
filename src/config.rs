@@ -71,6 +71,8 @@ pub struct UpstreamConfig {
     pub include_packages: Option<Vec<String>>,
     /// File of package specs, one per line; same syntax as `include-packages`.
     pub include_packages_from: Option<PathBuf>,
+    /// Also include every dependency of the included packages, transitively.
+    pub include_dependencies: Option<bool>,
     /// Package specs to subtract from the include set. Bare names deny the
     /// whole project; version specifiers deny only matching files.
     pub exclude_packages: Option<Vec<String>>,
@@ -223,8 +225,6 @@ pub struct SyncConfig {
     pub allow_insecure_source: Option<bool>,
     /// Migrate into the private namespace instead of mirroring.
     pub as_private: Option<bool>,
-    /// Also mirror the dependencies of every selected package, transitively.
-    pub include_dependencies: Option<bool>,
     /// Download spool directory (default: the system temp dir).
     pub spool_dir: Option<PathBuf>,
     /// Extra CA bundle for source TLS; a relative path resolves next to this file.

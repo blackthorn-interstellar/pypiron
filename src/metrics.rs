@@ -201,6 +201,10 @@ pub struct Metrics {
     /// including a 304). 0 = never — the `pypiron_malware_probe_age_seconds` gauge
     /// is omitted until the first probe lands.
     malware_probe_last_unix: AtomicU64,
+    /// New `MAL-*` advisories the probe gave up reading after its per-advisory
+    /// retry budget. Nonzero means a malware record is not blocked until OSV
+    /// modifies it or a snapshot carries it.
+    malware_probe_skipped: AtomicU64,
 }
 
 impl Metrics {
@@ -234,6 +238,11 @@ impl Metrics {
     pub fn malware_probe_ok(&self) {
         self.malware_probe_last_unix
             .store(unix_now_secs(), Ordering::Relaxed);
+    }
+
+    /// Count one malware advisory the probe skipped as unreadable.
+    pub fn record_malware_probe_skipped(&self) {
+        self.malware_probe_skipped.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Count a request against a project attribution tag. The tag must
@@ -447,6 +456,11 @@ impl Metrics {
                 "pypiron_blocked_downloads_total",
                 "Artifact downloads refused by the malware byte gate (advisory-blocked or quarantined).",
                 &self.blocked_downloads,
+            ),
+            (
+                "pypiron_malware_probe_skipped_total",
+                "New malware advisories the probe could not read after several tries.",
+                &self.malware_probe_skipped,
             ),
             (
                 "pypiron_index_rebuilds_total",

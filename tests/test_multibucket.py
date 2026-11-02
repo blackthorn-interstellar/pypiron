@@ -722,6 +722,96 @@ def test_recovered_topology_mismatch_fences_writes(s3_server_multi_failover, tmp
     assert code == 503
 
 
+def test_topology_fence_stops_proxy_status_writes(s3_server_multi_failover_proxy, tmp_path):
+    """Writes were fenced by HTTP method only, so a proxy listing GET on a fenced
+    node still recorded upstream project status, a dirty marker and the shared
+    quarantined set in its bucket. Fenced, it now writes none of them and holds
+    the upstream quarantine in its own byte gate, where a poll of the shared set
+    cannot drop it."""
+    server = s3_server_multi_failover_proxy
+    upstream = server["upstream"]
+    minio = server["minio"]
+    pkg = "fencedstatus"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    upload_legacy(
+        upstream["legacy"], wheel, username=upstream["user"], password=upstream["password"]
+    )
+    code, _, _ = http_request_auth(
+        "POST",
+        f"{upstream['base_url']}/project/{pkg}/status",
+        username=upstream.get("admin_user", upstream["user"]),
+        password=upstream.get("admin_password", upstream["password"]),
+        data=json.dumps({"status": "quarantined", "reason": "compromised"}).encode(),
+    )
+    assert code == 200
+
+    def upstream_quarantined():
+        code, body, _ = http_get(f"{upstream['simple']}{pkg}/", headers={"Accept": ACCEPT_PEP691})
+        return code == 200 and json.loads(body).get("project-status", {}).get("status") == (
+            "quarantined"
+        )
+
+    _eventually(upstream_quarantined, what="upstream publishes the quarantine")
+
+    # Raise the fence the way a recovered bucket with a foreign stamp does.
+    a, b = _fail_to_second(server)
+    stamp_key = "_topology/stamp.json"
+    stamp = json.loads(minio_get_key_in(minio, a, stamp_key))
+    stamp["buckets"] = ["foreign-topology"]
+    stamp["hash"] = "0" * 64
+    minio_put_key_in(minio, a, stamp_key, json.dumps(stamp))
+    server["faults"].recover(a)
+    _eventually(lambda: _writes_fenced(server), what="topology mismatch raises the fence")
+
+    quarantined_key = "_advisories/quarantined.json"
+    before = {
+        bucket: minio_get_key_in(minio, bucket, quarantined_key)
+        if minio_key_exists_in(minio, bucket, quarantined_key)
+        else None
+        for bucket in (a, b)
+    }
+
+    # First lookup of this name on this node: an upstream fetch, not the cache.
+    code, body, _ = http_get(f"{server['simple']}{pkg}/", headers={"Accept": ACCEPT_PEP691})
+    assert code == 200, "reads stay available while fenced"
+    assert json.loads(body)["project-status"]["status"] == "quarantined"
+    code, _, _ = http_get(f"{server['base_url']}/ready")
+    assert code == 200, "a fenced node stays in rotation"
+
+    for bucket in (a, b):
+        assert not minio_key_exists_in(minio, bucket, f"packages/{pkg}/.project-status.json")
+        assert not [
+            key for key in minio_list_keys_in(minio, bucket) if key.startswith(f"_dirty/{pkg}!")
+        ]
+        current = (
+            minio_get_key_in(minio, bucket, quarantined_key)
+            if minio_key_exists_in(minio, bucket, quarantined_key)
+            else None
+        )
+        assert current == before[bucket], f"{bucket}: the shared quarantined set moved"
+
+    files_url = f"{server['base_url']}/files/{pkg}/{wheel.name}"
+    code, body, _ = http_get(files_url)
+    assert code == 403 and json.loads(body)["error"] == "project quarantined upstream"
+
+    # A peer publishes an unrelated, newer shared set; the poll adopts it whole.
+    minio_put_key_in(
+        minio,
+        b,
+        quarantined_key,
+        json.dumps({"quarantined": ["unrelatedname"], "pypiron-epoch": 99}),
+    )
+    _eventually(
+        lambda: (
+            http_get(f"{server['base_url']}/files/unrelatedname/x-1.0-py3-none-any.whl")[0] == 403
+        ),
+        what="the poll adopts the peer's set",
+    )
+    code, body, _ = http_get(files_url)
+    assert code == 403, "the fenced hold survives a poll of the shared set"
+    assert json.loads(body)["error"] == "project quarantined upstream"
+
+
 def test_three_bucket_outage_uses_next_reachable_bucket(s3_server_three_failover, tmp_path):
     server = s3_server_three_failover
     a, b, c = server["minio"]["buckets"]

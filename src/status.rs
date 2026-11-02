@@ -225,8 +225,27 @@ pub async fn advance_status(
     doc: &ProjectStatusDoc,
     origin: Option<Origin>,
 ) -> Result<u64> {
+    advance_status_if(storage, pkg, doc, origin, |_| true)
+        .await?
+        .ok_or_else(|| anyhow!("unconditional status write for '{pkg}' was declined"))
+}
+
+/// [`advance_status`] for a conditional writer: `keep` judges every fresh read
+/// inside the CAS loop, the same read whose token guards the write, so a
+/// decision is never acted on against an event that landed after it was made.
+/// `None` = `keep` declined the current event.
+pub async fn advance_status_if(
+    storage: &dyn Storage,
+    pkg: &str,
+    doc: &ProjectStatusDoc,
+    origin: Option<Origin>,
+    keep: impl Fn(Option<&VersionedProjectStatus>) -> bool,
+) -> Result<Option<u64>> {
     for _ in 0..STATUS_CAS_ATTEMPTS {
         let current = read_status_versioned(storage, pkg).await?;
+        if !keep(current.as_ref()) {
+            return Ok(None);
+        }
         let epoch = current
             .as_ref()
             .map_or(1, |status| status.epoch.saturating_add(1));
@@ -240,7 +259,7 @@ pub async fn advance_status(
         )
         .await?
         {
-            return Ok(epoch);
+            return Ok(Some(epoch));
         }
     }
     Err(anyhow!(

@@ -246,7 +246,10 @@ pub struct AppState {
     pub bucket_health: Option<Arc<HealthController>>,
     /// A runtime topology mismatch is sticky: reads remain available, but every
     /// HTTP mutation is rejected until the operator fixes configuration and
-    /// restarts. The worker is the only writer of this fence.
+    /// restarts. Writes a read triggers check it too — the proxy's cache fill
+    /// and its upstream-status relay. It stops new writes; one already in
+    /// flight when it rises may still land. The worker is the only writer of
+    /// this fence.
     pub writes_fenced: Arc<std::sync::atomic::AtomicBool>,
     // auth — two roles: uploader (publish) and admin (everything, incl. mirror,
     // delete, yank). Admin is a strict superset of uploader.

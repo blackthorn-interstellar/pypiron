@@ -446,7 +446,7 @@ async fn advisory_panel_rows(
     };
     // A quarantined project is refused wholesale at the byte gate, so its rows are
     // blocked regardless of advisory kind — mirror the /audit report's roll-in.
-    let quarantined = snap.quarantined.contains(pkg);
+    let quarantined = snap.is_quarantined(pkg);
     let mut rows: Vec<html::AdvisoryPanelRow> = Vec::new();
     for version in versions {
         for record in advisories::advisories_for(db, pkg, version) {

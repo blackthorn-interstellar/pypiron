@@ -4645,6 +4645,10 @@ pub mod test_support {
         /// `prefix` start failing — an outage that strikes between a CAS and
         /// the verification that follows it.
         unlistable_after_cas: Mutex<Option<(String, String)>>,
+        /// `(key, bytes)`: the next `get_with_etag(key)` answers with what is
+        /// stored, then installs `bytes` — a writer landing right after the
+        /// caller's read, so its conditional write must lose. One-shot.
+        write_after_read: Mutex<Option<(String, Vec<u8>)>>,
         /// One key whose *mutations* fail until [`InMemStorage::heal_writes`].
         /// The mirror of `unreadable`, and its own hazard class: a write that
         /// errors AFTER the caller has already moved in-memory state or other
@@ -4708,6 +4712,11 @@ pub mod test_support {
         pub fn fail_lists_after_cas(&self, key: &str, prefix: &str) {
             *self.unlistable_after_cas.lock().unwrap() =
                 Some((key.to_string(), prefix.to_string()));
+        }
+        /// Install `bytes` at `key` right after the next `get_with_etag(key)`
+        /// has answered (one-shot): a racing writer between read and CAS.
+        pub fn write_after_read(&self, key: &str, bytes: Vec<u8>) {
+            *self.write_after_read.lock().unwrap() = Some((key.to_string(), bytes));
         }
         fn unlistable(&self, prefix: &str) -> bool {
             self.unlistable
@@ -4889,12 +4898,16 @@ pub mod test_support {
             if self.fail_next_get.swap(false, Ordering::SeqCst) || self.unreadable(key) {
                 anyhow::bail!("injected storage failure");
             }
-            Ok(self
-                .objects
-                .lock()
-                .unwrap()
-                .get(key)
-                .map(|b| (b.clone(), cas_token(b))))
+            let mut map = self.objects.lock().unwrap();
+            let read = map.get(key).map(|b| (b.clone(), cas_token(b)));
+            let mut armed = self.write_after_read.lock().unwrap();
+            if armed.as_ref().is_some_and(|(k, _)| k == key) {
+                if let Some((k, bytes)) = armed.take() {
+                    map.insert(k.clone(), bytes);
+                    self.writes.lock().unwrap().push(k);
+                }
+            }
+            Ok(read)
         }
         async fn head_etag(&self, key: &str) -> Result<Option<String>> {
             if self.unreadable(key) {

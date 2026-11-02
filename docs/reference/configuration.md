@@ -265,6 +265,9 @@ With the advisory feed enabled, use
 `pypiron_advisory_last_refresh_age_seconds`, and
 `pypiron_malware_probe_age_seconds` to alert on stale data or failed polling.
 `pypiron_blocked_downloads_total` counts refused malware downloads.
+`pypiron_malware_probe_skipped_total` counts new malware advisories a node
+could not read after several tries; each is blocked once OSV updates it or a
+newer daily snapshot includes it.
 
 ### Reserved private names
 
@@ -498,7 +501,7 @@ These series appear only when you configure two or more buckets:
 | `pypiron_bucket_read_selected{bucket,index}` | Per-node bucket serving reads: the region bucket while it is healthy and caught up, otherwise the same as `pypiron_bucket_selected`. |
 | `pypiron_bucket_health_alarms_total{bucket,index}` | Storage errors that do not prove an outage, including credentials, permissions, CAS, KMS, quota, and configuration. |
 | `pypiron_bucket_selection_generation` | Number that changes when this node selects another bucket. |
-| `pypiron_bucket_topology_write_fenced` | `1` when a runtime topology mismatch has stopped mutations; reads remain available. |
+| `pypiron_bucket_topology_write_fenced` | `1` when a runtime topology mismatch has stopped writes on this node: uploads and admin changes return `503`, and the proxy stops caching new files and recording upstream project status. Reads continue and `/ready` stays `200`. Restart with the correct bucket list to clear it. |
 
 Alert on any freeze, a non-zero topology fence, persistent health alarms, or a
 backlog that keeps growing after its destination recovers. The backlog counts

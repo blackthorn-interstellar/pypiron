@@ -84,6 +84,11 @@ of returning `404`.
 Order is part of the topology. A node with a different list or order refuses to
 start.
 
+If a bucket comes back while nodes are running and carries a different list,
+those nodes keep serving reads but refuse writes with `503` until you fix the
+list and restart them. `/ready` stays `200`, so the fleet stays in rotation;
+alert on `pypiron_bucket_topology_write_fenced` instead.
+
 ### Change the list with stop, migrate, restart
 
 To add, remove, replace, or reorder a bucket:

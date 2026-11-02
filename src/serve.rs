@@ -1116,7 +1116,7 @@ async fn advisory_byte_gate(
     //     Enforced whenever a quarantine set is loaded, INDEPENDENT of the malware
     //     toggle: `--malware-block=false` disables OSV blocking, not quarantine.
     //   * OSV MAL-* advisory blocking — gated by `--malware-block`.
-    let quarantined = snap.quarantined.contains(pkg);
+    let quarantined = snap.is_quarantined(pkg);
     let version = infer_version_from_filename(artifact_filename);
     let ids: Vec<String> = if state.malware_block {
         // Baseline block set ∪ the per-node probe overlay.

@@ -1664,6 +1664,41 @@ def s3_server_multi_proxy_prefixed(
         upstream_gen.close()
 
 
+@pytest.fixture()
+def s3_server_multi_failover_proxy(
+    tmp_path_factory, pypiron_bin: Path, minio_two_proxy: Dict
+) -> Iterator[Dict]:
+    """`s3_server_multi_failover` that also proxies a disk upstream, polling the
+    shared quarantined set every second."""
+    upstream_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
+    upstream = next(upstream_gen)
+    server_gen = _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two_proxy,
+        extra_env={"PYPIRON_AUDIT_ON_BOOT": "false"},
+        extra_args=[
+            "--bucket-leave-failures",
+            "1",
+            "--bucket-return-healthy-secs",
+            "4",
+            "--quarantine-poll-secs",
+            "1",
+            "--proxy-upstream",
+            upstream["base_url"],
+            "--allow-insecure-upstream",
+            "--exclude-newer",
+            "",
+        ],
+    )
+    try:
+        server = next(server_gen)
+        yield {**server, "upstream": upstream}
+    finally:
+        server_gen.close()
+        upstream_gen.close()
+
+
 # ----------------------- Read-affinity fixtures (read locality) ----------------
 #
 # One node over two region-labeled buckets: writes home to the first bucket

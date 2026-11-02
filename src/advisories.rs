@@ -10,7 +10,7 @@
 //! `_advisories/osv-pypi.zip`, never authored, and a bucket failover must never
 //! disarm it.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
@@ -243,11 +243,22 @@ pub struct AdvisoryState {
     /// nothing in the reader able to order them. Cleared by any swap that lands a
     /// set together with the epoch it was published or read at.
     pub quarantined_unpublished: bool,
+    /// Upstream quarantines this node's proxy observed while its writes were
+    /// fenced, so no durable status or shared-set publish records them. Kept
+    /// apart from `quarantined`, which a poll replaces wholesale, so a peer's
+    /// unrelated publish cannot un-block them. Node-local; gone on restart.
+    pub fenced_holds: Arc<HashSet<String>>,
     /// Unix seconds of the load (0 = never loaded).
     pub loaded_unix: u64,
 }
 
 impl AdvisoryState {
+    /// Whether the PEP 792 quarantine gate blocks `pkg`: the shared set, or a
+    /// hold this node took while fenced.
+    pub fn is_quarantined(&self, pkg: &str) -> bool {
+        self.quarantined.contains(pkg) || self.fenced_holds.contains(pkg)
+    }
+
     /// Read the current snapshot: lock, clone the inner `Arc`, drop the guard.
     /// Recovers a poisoned lock instead of panicking (never a request-path panic).
     pub fn read(slot: &RwLock<Arc<AdvisoryState>>) -> Arc<AdvisoryState> {
@@ -618,6 +629,7 @@ async fn load_from_storage(storage: &dyn Storage) -> Result<Option<AdvisoryState
         quarantined_epoch: loaded.epoch,
         // Read from storage, so the set and the epoch name the same body.
         quarantined_unpublished: false,
+        fenced_holds: Arc::default(),
         loaded_unix: unix_now_secs(),
     }))
 }
@@ -691,6 +703,7 @@ async fn obtain_from_source(storage: &dyn Storage, feed: &str) -> Option<Advisor
         quarantined_epoch: loaded.epoch,
         // Read from storage, so the set and the epoch name the same body.
         quarantined_unpublished: false,
+        fenced_holds: Arc::default(),
         loaded_unix: unix_now_secs(),
     })
 }
@@ -1443,6 +1456,25 @@ pub async fn publish_quarantined(
     bail!("could not publish the quarantined set after {QUARANTINED_CAS_ATTEMPTS} attempts")
 }
 
+/// Hold (or release) `pkg` in this node's fenced-observation set: a proxy that
+/// may not write still makes its own byte gate follow upstream. Memory only.
+pub fn hold_fenced_quarantine(slot: &RwLock<Arc<AdvisoryState>>, pkg: &str, blocked: bool) {
+    let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
+    if guard.fenced_holds.contains(pkg) == blocked {
+        return;
+    }
+    let mut holds = (*guard.fenced_holds).clone();
+    if blocked {
+        holds.insert(pkg.to_string());
+    } else {
+        holds.remove(pkg);
+    }
+    *guard = Arc::new(AdvisoryState {
+        fenced_holds: Arc::new(holds),
+        ..(**guard).clone()
+    });
+}
+
 /// Fold one project's just-written status into the quarantined set: arm this
 /// node's own byte gate immediately, then publish the one-name increment so every
 /// other node picks it up on its next `--quarantine-poll-secs` tick. Both
@@ -1521,6 +1553,27 @@ pub struct ProbeMemo {
     /// Set when a cycle saw a burst of vulnerability advisories too large to
     /// fetch one by one; the worker turns it into an early snapshot refresh.
     reload_requested: bool,
+    /// `MAL-*` ids whose JSON failed to fetch or parse, with the failed attempts
+    /// so far. Retried every cycle, the CSV's 304 included, until one reads or
+    /// its own budget runs out — so one bad record never holds the floor, and
+    /// never shares a budget with an unrelated one.
+    mal_retries: BTreeMap<String, u32>,
+}
+
+/// Probe cycles a `MAL-*` advisory may fail to read before it is skipped (about
+/// ten minutes at the default probe interval).
+const PROBE_MAL_FETCH_ATTEMPTS: u32 = 5;
+
+/// Count one failed read of `id`. True once its budget is spent: the id leaves
+/// the retry set and the caller reports it skipped.
+fn note_mal_failure(retries: &mut BTreeMap<String, u32>, id: &str) -> bool {
+    let attempts = retries.entry(id.to_string()).or_insert(0);
+    *attempts += 1;
+    if *attempts < PROBE_MAL_FETCH_ATTEMPTS {
+        return false;
+    }
+    retries.remove(id);
+    true
 }
 
 impl ProbeMemo {
@@ -1849,9 +1902,11 @@ pub async fn probe(ctx: RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) {
 }
 
 /// The probe cycle proper. Returns whether a cycle ran (a snapshot was loaded);
-/// `false` idles (armed but unfed). Advances `memo` only on a fully successful
-/// cycle — a mid-cycle fetch error leaves the floor and etag untouched, so the
-/// next cycle retries the same window (application is all-or-nothing).
+/// `false` idles (armed but unfed). A CSV failure leaves the floor and etag
+/// untouched, so the next cycle re-walks the window. Once the CSV is read, the
+/// floor advances and every advisory that read is applied; one that did not
+/// read is retried on later cycles up to [`PROBE_MAL_FETCH_ATTEMPTS`], then
+/// skipped with a warning and `pypiron_malware_probe_skipped_total`.
 async fn probe_once(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) -> Result<bool> {
     let snap = AdvisoryState::read(ctx.slot);
     let Some(db) = snap.db.as_ref() else {
@@ -1872,17 +1927,40 @@ async fn probe_once(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) -> R
     };
     let source = ProbeSource::new(&base)?;
     let (scan, etag) = match walk_csv(&source, memo.csv_etag.as_deref(), Some(watermark)).await? {
-        CsvWalk::NotModified => return Ok(true), // fresh, nothing new
+        CsvWalk::NotModified if memo.mal_retries.is_empty() => return Ok(true), // nothing new
+        // Nothing new, but earlier failures are due a retry: an empty scan
+        // keeps the floor and etag where they are.
+        CsvWalk::NotModified => (CsvScan::default(), memo.csv_etag.clone()),
         CsvWalk::Scanned { scan, etag } => (scan, etag),
     };
 
-    // Fetch and classify each fresh MAL advisory. All-or-nothing this cycle: a
-    // failed fetch bails before the floor advances, so the window is retried.
+    // Fetch and classify each fresh MAL advisory, plus the ones still owed a
+    // retry. A failure is per id: it never discards the others' reads.
+    let mut mal_ids: Vec<String> = scan.fresh_mal.iter().map(|(_, id)| id.clone()).collect();
+    for id in memo.mal_retries.keys() {
+        if !mal_ids.contains(id) {
+            mal_ids.push(id.clone());
+        }
+    }
     let mut delta = ProbeDelta::default();
     let mut applied_ids: Vec<String> = Vec::new();
     let mut withdrawn_ids: Vec<String> = Vec::new();
-    for (_, csv_id) in &scan.fresh_mal {
-        let adv = source.fetch_advisory(csv_id).await?;
+    for csv_id in &mal_ids {
+        let adv = match source.fetch_advisory(csv_id).await {
+            Ok(adv) => {
+                memo.mal_retries.remove(csv_id);
+                adv
+            }
+            Err(e) => {
+                if note_mal_failure(&mut memo.mal_retries, csv_id) {
+                    warn!(id = %csv_id, attempts = PROBE_MAL_FETCH_ATTEMPTS, error = %e, "malware probe: advisory unreadable; skipped until OSV modifies it");
+                    ctx.metrics.record_malware_probe_skipped();
+                } else {
+                    debug!(id = %csv_id, error = %e, "malware probe: advisory fetch failed; retrying next cycle");
+                }
+                continue;
+            }
+        };
         let id = if adv.id.is_empty() {
             csv_id.clone()
         } else {
@@ -2382,6 +2460,38 @@ mod tests {
     }
 
     #[test]
+    fn an_unreadable_mal_advisory_is_skipped_on_its_own_budget() {
+        let mut retries = BTreeMap::new();
+        for _ in 1..PROBE_MAL_FETCH_ATTEMPTS {
+            assert!(
+                !note_mal_failure(&mut retries, "MAL-A"),
+                "still owed a retry"
+            );
+        }
+        // Staggered: B starts failing as A nears its limit. A must not wait for B.
+        assert!(!note_mal_failure(&mut retries, "MAL-B"));
+        assert!(
+            note_mal_failure(&mut retries, "MAL-A"),
+            "A's own budget is spent"
+        );
+        assert_eq!(retries.keys().collect::<Vec<_>>(), ["MAL-B"]);
+        assert_eq!(retries["MAL-B"], 1, "B keeps its own count");
+    }
+
+    #[test]
+    fn a_successful_read_resets_the_budget() {
+        let mut retries = BTreeMap::new();
+        note_mal_failure(&mut retries, "MAL-A");
+        note_mal_failure(&mut retries, "MAL-A");
+        retries.remove("MAL-A"); // what a successful read does
+        for _ in 1..PROBE_MAL_FETCH_ATTEMPTS {
+            assert!(!note_mal_failure(&mut retries, "MAL-A"));
+        }
+        assert!(note_mal_failure(&mut retries, "MAL-A"));
+        assert!(retries.is_empty());
+    }
+
+    #[test]
     fn probe_base_only_for_the_osv_all_zip_url() {
         assert_eq!(
             probe_base("https://osv.example/PyPI/all.zip").as_deref(),
@@ -2414,6 +2524,21 @@ mod tests {
             .collect();
         names.sort();
         names
+    }
+
+    #[test]
+    fn a_fenced_hold_survives_a_poll_that_replaces_the_shared_set() {
+        let slot = slot_with(&["other"], 1);
+        hold_fenced_quarantine(&slot, "pkg", true);
+        assert!(AdvisoryState::read(&slot).is_quarantined("pkg"));
+        // A peer publishes an unrelated change: the poll swaps the whole set.
+        swap_quarantined(&slot, ["newer".to_string()].into(), 2, Some("e2".into()));
+        let snap = AdvisoryState::read(&slot);
+        assert!(snap.is_quarantined("pkg"), "the hold is not the shared set");
+        assert!(!snap.quarantined.contains("pkg"), "and never leaks into it");
+        // Upstream lifts it: the hold follows.
+        hold_fenced_quarantine(&slot, "pkg", false);
+        assert!(!AdvisoryState::read(&slot).is_quarantined("pkg"));
     }
 
     fn one(name: &str, blocked: bool) -> QuarantinedEdit {

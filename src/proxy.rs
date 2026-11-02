@@ -1414,7 +1414,7 @@ impl Proxy {
         key: &str,
     ) -> Result<bool> {
         let snap = state.advisory_snapshot();
-        if snap.quarantined.contains(pkg) {
+        if snap.is_quarantined(pkg) {
             warn!(%pkg, %filename, "proxy: project quarantined mid-download; aborting the streamed body");
             return Ok(true);
         }
@@ -1620,15 +1620,28 @@ impl Proxy {
 
     /// Persist the upstream PEP 792 status so the byte gate blocks cached bytes
     /// of an upstream-quarantined project (see the call site). Mirror-origin
-    /// only; an operator-authored (private-origin) status is never clobbered.
+    /// only; an operator-authored (private-origin) status is never clobbered —
+    /// re-judged on every CAS attempt (see [`reconcile_observed_status`]).
     /// Best-effort: a write failure only leaves the durable status one poll
     /// stale — the in-memory listing still renders the freeze.
+    ///
+    /// A read-triggered write, so the HTTP method gate never sees it: a node
+    /// whose writes are fenced records nothing durable here and only holds the
+    /// observation in its own byte gate, which fails closed until restart.
     async fn persist_observed_status(
         &self,
         state: &AppState,
         pkg: &str,
         observed: &crate::status::ProjectStatusDoc,
     ) {
+        if state.mutations_fenced() {
+            crate::advisories::hold_fenced_quarantine(
+                &state.advisories,
+                pkg,
+                observed.status.blocks_downloads(),
+            );
+            return;
+        }
         let pinned = state.pin();
         match reconcile_observed_status(pinned.storage.as_ref(), pkg, observed).await {
             // Only a real status change touches the shared quarantined set: a poll
@@ -1846,38 +1859,45 @@ impl Proxy {
 }
 
 /// Bring the durable `.project-status.json` into line with an observed upstream
-/// status. Writes only on a real change (idempotent under repeated polls), never
-/// clobbers an operator-authored private-origin status, and skips the write when
-/// upstream is the active default and no marker exists. A change marks the
-/// package dirty so its own leader rebuilds the (now file-less, if quarantined)
-/// index. Returns whether it wrote, so the caller only touches the fleet's
-/// quarantined set on a real change.
+/// status. Writes only when [`relay_replaces`] allows it, judged against every
+/// CAS read rather than one earlier snapshot, so an operator event that lands
+/// mid-relay is never overwritten. A change marks the package dirty so its own
+/// leader rebuilds the (now file-less, if quarantined) index. Returns whether it
+/// wrote, so the caller only touches the fleet's quarantined set on a real change.
 async fn reconcile_observed_status(
     storage: &dyn Storage,
     pkg: &str,
     observed: &crate::status::ProjectStatusDoc,
 ) -> Result<bool> {
-    match crate::status::read_status_versioned(storage, pkg).await? {
-        // An operator-authored (private-origin) status is authoritative; the
-        // proxy never overwrites it with a relayed upstream observation.
-        Some(cur) if cur.origin == Some(crate::replicate::Origin::Private) => return Ok(false),
-        // Durable status already reflects upstream: nothing to write.
-        Some(cur) if &cur.doc == observed => return Ok(false),
-        Some(_) => {}
-        // No marker yet and upstream is the active default: absence already
-        // means active, so a write would only add noise.
-        None if observed == &crate::status::ProjectStatusDoc::default() => return Ok(false),
-        None => {}
-    }
-    crate::status::advance_status(
+    let wrote = crate::status::advance_status_if(
         storage,
         pkg,
         observed,
         Some(crate::replicate::Origin::Mirror),
+        |current| relay_replaces(current, observed),
     )
     .await?;
+    if wrote.is_none() {
+        return Ok(false);
+    }
     crate::markers::mark_dirty(storage, pkg).await?;
     Ok(true)
+}
+
+/// May an observed upstream status replace `current`? Never over an
+/// operator-authored (private-origin) event, never as a no-op rewrite, and never
+/// to record the active default where no marker exists (absence already means
+/// active). An untagged or mirror event yields: upstream is authoritative for a
+/// mirror.
+fn relay_replaces(
+    current: Option<&crate::status::VersionedProjectStatus>,
+    observed: &crate::status::ProjectStatusDoc,
+) -> bool {
+    match current {
+        Some(cur) if cur.origin == Some(crate::replicate::Origin::Private) => false,
+        Some(cur) => cur.doc != *observed,
+        None => *observed != crate::status::ProjectStatusDoc::default(),
+    }
 }
 
 /// Read an upstream companion body into memory with a hard ceiling. The local
@@ -2199,5 +2219,103 @@ mod tests {
             len <= 8,
             "presence cache grew to {len} entries past its cap"
         );
+    }
+
+    fn quarantined(reason: &str) -> crate::status::ProjectStatusDoc {
+        crate::status::ProjectStatusDoc {
+            status: crate::status::ProjectStatus::Quarantined,
+            reason: Some(reason.into()),
+        }
+    }
+
+    #[test]
+    fn relay_yields_only_to_operator_events_and_no_ops() {
+        use crate::replicate::Origin::{Mirror, Private};
+        use crate::status::{ProjectStatusDoc, VersionedProjectStatus};
+        let active = ProjectStatusDoc::default();
+        let frozen = quarantined("upstream");
+        let stored = |doc: &ProjectStatusDoc, origin| VersionedProjectStatus {
+            doc: doc.clone(),
+            epoch: 3,
+            origin,
+            etag: "etag".into(),
+        };
+        // (stored event, upstream observation, may the relay write?)
+        let cases = [
+            (Some(stored(&frozen, Some(Private))), &active, false),
+            (Some(stored(&active, Some(Private))), &frozen, false),
+            (Some(stored(&frozen, Some(Mirror))), &active, true),
+            // Untagged yields: upstream is authoritative for a mirror.
+            (Some(stored(&frozen, None)), &active, true),
+            (Some(stored(&frozen, Some(Mirror))), &frozen, false),
+            (None, &active, false),
+            (None, &frozen, true),
+        ];
+        for (current, observed, want) in cases {
+            assert_eq!(
+                relay_replaces(current.as_ref(), observed),
+                want,
+                "stored {current:?} observed {observed:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_never_clobbers_a_private_status_that_lands_mid_cas() {
+        use crate::replicate::Origin::{Mirror, Private};
+        use crate::status::{encode_status, read_status_versioned, status_key};
+        let storage = crate::storage::test_support::InMemStorage::default();
+        crate::status::advance_status(&storage, "pkg", &quarantined("upstream"), Some(Mirror))
+            .await
+            .unwrap();
+        // The operator's private quarantine lands right after the relay's read.
+        let operator = quarantined("operator");
+        storage.write_after_read(
+            &status_key("pkg"),
+            encode_status(&operator, 2, Some(Private)).unwrap(),
+        );
+
+        let wrote =
+            reconcile_observed_status(&storage, "pkg", &crate::status::ProjectStatusDoc::default())
+                .await
+                .unwrap();
+
+        assert!(
+            !wrote,
+            "a relay that lost to an operator event must not arm"
+        );
+        let stored = read_status_versioned(&storage, "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            (stored.doc, stored.epoch, stored.origin),
+            (operator, 2, Some(Private))
+        );
+        assert!(
+            !storage
+                .write_log()
+                .iter()
+                .any(|key| key.starts_with(crate::app::DIRTY_PREFIX)),
+            "a declined relay marks nothing dirty"
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_writes_a_real_change_once() {
+        let storage = crate::storage::test_support::InMemStorage::default();
+        let frozen = quarantined("upstream");
+        assert!(reconcile_observed_status(&storage, "pkg", &frozen)
+            .await
+            .unwrap());
+        // The same observation again is a no-op, not a second event.
+        assert!(!reconcile_observed_status(&storage, "pkg", &frozen)
+            .await
+            .unwrap());
+        let stored = crate::status::read_status_versioned(&storage, "pkg")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!((stored.doc, stored.epoch), (frozen, 1));
     }
 }

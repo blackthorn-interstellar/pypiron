@@ -153,14 +153,15 @@ def _metric_value(text: str, name: str):
     return float(m.group(1)) if m else None
 
 
-def _poll_metric(base_url: str, name: str, *, timeout: float = 20.0):
-    """Poll /metrics until `name` appears; returns its value or None on timeout."""
+def _poll_metric(base_url: str, name: str, *, timeout: float = 20.0, until=lambda _v: True):
+    """Poll /metrics until `name` appears with a value `until` accepts; returns
+    that value or None on timeout."""
     deadline = time.time() + timeout
     while time.time() < deadline:
         code, body, _ = http_get(f"{base_url}/metrics")
         if code == 200:
             value = _metric_value(body.decode(), name)
-            if value is not None:
+            if value is not None and until(value):
                 return value
         time.sleep(0.1)
     return None
@@ -1653,6 +1654,8 @@ class _MutableFeedState:
         self.records = dict(baseline_records)
         self.csv_version = 0
         self.log: list[tuple[str, str]] = []
+        # Ids listed in the CSV whose JSON 404s (an unreadable record).
+        self.broken: set[str] = set()
 
     def csv_body(self) -> bytes:
         rows = sorted(self.records.values(), key=lambda r: r["modified"], reverse=True)
@@ -1693,7 +1696,7 @@ class _ProbeFeedHandler(http.server.BaseHTTPRequestHandler):
                 rec = st.records.get(adv_id)
                 resp = (
                     (200, json.dumps(rec).encode(), "application/json", f'"{adv_id}"')
-                    if rec is not None
+                    if rec is not None and adv_id not in st.broken
                     else (404, b"", "text/plain", None)
                 )
             else:
@@ -1733,6 +1736,18 @@ class _FeedControl:
             rec["modified"] = modified  # a withdrawal bumps modified (reappears atop)
             self._st.records[adv_id] = rec
             self._st.csv_version += 1
+
+    def publish_broken(self, record: dict) -> None:
+        """List `record` in the CSV but 404 its JSON until `heal`."""
+        with self._st.lock:
+            self._st.broken.add(record["id"])
+            self._st.records[record["id"]] = record
+            self._st.csv_version += 1
+
+    def heal(self, adv_id: str) -> None:
+        """Serve the JSON again, leaving the CSV (and its ETag) untouched."""
+        with self._st.lock:
+            self._st.broken.discard(adv_id)
 
     def count(self, method: str, needle: str) -> int:
         with self._st.lock:
@@ -1850,6 +1865,74 @@ def test_probe_blocks_new_mal_ahead_of_daily_feed(tmp_path_factory, pypiron_bin,
             assert _poll_http_status(file_url, {200, 302}, timeout=30), (
                 "withdrawal never un-blocked the file"
             )
+
+
+def test_probe_skips_unreadable_mal_and_blocks_newer(tmp_path_factory, pypiron_bin, tmp_path):
+    """One MAL advisory whose JSON never reads used to abort every probe cycle, so
+    each newer advisory was fetched and dropped until the daily snapshot. Now the
+    newer one blocks on the next cycle, a record that fails briefly is retried
+    and applied once it reads (even with the CSV unchanged), and one that keeps
+    failing is skipped after its own budget, counted, and no longer fetched."""
+    broken_id, flaky_id, good_id = "MAL-2025-79999", "MAL-2025-79998", "MAL-2025-79997"
+    with _probe_feed_server(_baseline_records(), tmp_path) as (feed_url, feed):
+        with advisory_server(
+            tmp_path_factory,
+            pypiron_bin,
+            feed_url,
+            extra_args=["--malware-probe-secs", "1"],
+            extra_env=_DIRECT_EGRESS,
+        ) as server:
+            base = server["base_url"]
+            assert _poll_metric(base, "pypiron_malware_probe_age_seconds") is not None
+            urls = {}
+            for pkg in ("goodmal", "flakymal"):
+                wheel = make_wheel(pkg, "1.0.0", tmp_path)
+                _mirror_upload(server, wheel)
+                wait_for_file_in_index(server["simple"], pkg, wheel.name)
+                urls[pkg] = f"{base}/files/{pkg}/{wheel.name}"
+                assert _poll_http_status(urls[pkg], {200, 302})
+            time.sleep(1.5)
+            zip_before = feed.count("GET", "/all.zip")
+
+            feed.publish_broken(_mal_record(broken_id, "ghostmal", "1.0.0", "2025-01-01T00:00:00Z"))
+            feed.publish_broken(_mal_record(flaky_id, "flakymal", "1.0.0", "2025-01-02T00:00:00Z"))
+            feed.publish(_mal_record(good_id, "goodmal", "1.0.0", "2025-02-01T00:00:00Z"))
+
+            blocked = _poll_http_status(urls["goodmal"], {403}, timeout=15)
+            assert blocked is not None, "an unreadable advisory held back a newer one"
+            assert good_id.encode() in blocked[1]
+            assert _metric_value(_metrics_text(base), "pypiron_malware_probe_skipped_total") == 0, (
+                "the newer advisory must block while the bad one is still being retried"
+            )
+
+            # The flaky record reads on a later retry, with no CSV change at all.
+            deadline = time.time() + 15
+            while feed.count("GET", f"/{flaky_id}.json") < 2 and time.time() < deadline:
+                time.sleep(0.1)
+            assert _poll_http_status(urls["flakymal"], {200, 302}), "blocked before it read"
+            feed.heal(flaky_id)
+            assert _poll_http_status(urls["flakymal"], {403}, timeout=15), (
+                "a record that recovered was never applied"
+            )
+
+            # The broken one is given up on, counted once, and no longer fetched.
+            assert (
+                _poll_metric(base, "pypiron_malware_probe_skipped_total", until=lambda v: v >= 1)
+                == 1
+            )
+            broken_fetches = feed.count("GET", f"/{broken_id}.json")
+            assert broken_fetches >= 5
+            csv_polls = feed.count("GET", "/modified_id.csv")
+            deadline = time.time() + 15
+            while feed.count("GET", "/modified_id.csv") < csv_polls + 3:
+                assert time.time() < deadline, "the probe stopped polling"
+                time.sleep(0.2)
+            assert feed.count("GET", f"/{broken_id}.json") == broken_fetches, "still retried"
+            assert _metric_value(_metrics_text(base), "pypiron_malware_probe_skipped_total") == 1
+
+            assert feed.count("GET", "/all.zip") == zip_before, "recovered via the snapshot"
+            age = _metric_value(_metrics_text(base), "pypiron_malware_probe_age_seconds")
+            assert age is not None and age < 10, "a bad record is not a source outage"
 
 
 def test_probe_backfills_new_mal_after_restart(tmp_path_factory, pypiron_bin, tmp_path):

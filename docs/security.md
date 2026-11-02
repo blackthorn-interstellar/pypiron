@@ -20,6 +20,8 @@ stops downloading even when an old lockfile asks for its direct URL.
 The binary includes a block set for first boot. pypiron refreshes the full OSV
 snapshot daily, and each node checks for new malware advisories every two
 minutes by default. Connected nodes therefore apply new blocks within minutes.
+An advisory pypiron can't read is retried a few times and then skipped, without
+delaying any other new advisory.
 If OSV is unreachable, pypiron continues serving with its last snapshot and
 exposes freshness metrics for alerting.
 

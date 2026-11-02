@@ -1183,6 +1183,9 @@ epoch: with private ≻ mirror regardless of epoch, ordering untagged by epoch
 against both was a three-bucket cycle whose winner depended on sync order.
 Corrupt files and storage
 read failures never default to active.
+A proxy relay is a conditional advance: its never-over-private and no-op guards
+are re-judged against every CAS read, so a private event that lands mid-relay
+is never overwritten.
 Mirror status stays local. When a private claim supersedes a mirror one, the
 copy path reconciles status directly (`reconcile_project_status`, run whenever
 either side is private): reconciliation normalizes a tagged mirror event found

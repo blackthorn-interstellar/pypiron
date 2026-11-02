@@ -292,6 +292,77 @@ def test_unchanged_resync_skips_via_conditional_304(source_dest, pypiron_bin, tm
     assert f"Syncing {pkg}" in (out + err)
 
 
+def _seeded(source, tmp_path, *pkgs: str):
+    """Seed each package on the source; return a package-list file per name."""
+    lists = {}
+    for pkg in pkgs:
+        wheel = _seed(source, pkg, "1.0", tmp_path)
+        wait_for_file_in_index(source["simple"], pkg, wheel.name)
+        lists[pkg] = tmp_path / f"{pkg}.txt"
+        lists[pkg].write_text(f"{pkg}\n")
+    return lists
+
+
+def test_a_bad_cursor_entry_never_wipes_the_memo(source_dest, pypiron_bin, tmp_path):
+    """One entry this sync can't parse (another version's shape) costs only that
+    project; the save merges into the stored memo instead of replacing it."""
+    source, dest = source_dest["source"], source_dest["dest"]
+    lists = _seeded(source, tmp_path, "memoa", "memob")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memoa"])
+    assert rc == 0, out + err
+    memo = dest["data_dir"] / "_sync" / "cursors.json"
+    stored = json.loads(memo.read_text())
+    memo.write_text(json.dumps({**stored, "foreign": {"etag": 7}}))
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memob"])
+    assert rc == 0, out + err
+    merged = json.loads(memo.read_text())
+    assert merged["memoa"] == stored["memoa"]
+    assert merged["foreign"] == {"etag": 7}
+    assert "memob" in merged
+
+
+def test_an_unreadable_memo_is_never_written_over(source_dest, pypiron_bin, tmp_path):
+    source, dest = source_dest["source"], source_dest["dest"]
+    lists = _seeded(source, tmp_path, "memoc", "memod")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memoc"])
+    assert rc == 0, out + err
+    memo = dest["data_dir"] / "_sync" / "cursors.json"
+    torn = memo.read_bytes()[:-5]
+    memo.write_bytes(torn)
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memod"])
+    assert rc == 0, f"a cache it can't read must not fail the run:\n{out}\n{err}"
+    assert "could not persist sync cursors" in out + err
+    assert memo.read_bytes() == torn
+
+
+def test_full_sync_keeps_other_projects_cursors(source_dest, pypiron_bin, tmp_path):
+    source, dest = source_dest["source"], source_dest["dest"]
+    lists = _seeded(source, tmp_path, "memoe", "memof")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memoe"])
+    assert rc == 0, out + err
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memof"], "--full")
+    assert rc == 0, out + err
+    assert {"memoe", "memof"} <= set(
+        json.loads((dest["data_dir"] / "_sync/cursors.json").read_text())
+    )
+
+
+def test_an_all_304_run_leaves_the_memo_alone(source_dest, pypiron_bin, tmp_path):
+    source, dest = source_dest["source"], source_dest["dest"]
+    lists = _seeded(source, tmp_path, "memog")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memog"])
+    assert rc == 0, out + err
+    memo = dest["data_dir"] / "_sync" / "cursors.json"
+    before = memo.stat().st_mtime_ns
+    time.sleep(0.05)
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memog"])
+    assert rc == 0, out + err
+    assert "upstream unchanged since last sync (304)" in out + err
+    assert memo.stat().st_mtime_ns == before
+
+
 def test_cooldown_quarantines_and_cursor_records_watermark(source_dest, pypiron_bin, tmp_path):
     """A held-back release isn't mirrored, the cursor records when it ages in, and
     an unchanged re-run still 304s (the watermark is below the cutoff)."""

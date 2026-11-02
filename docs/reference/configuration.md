@@ -416,7 +416,7 @@ require pypiron 0.0.23 or newer on both the sync client and destination server.
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `16` | Packages checked in parallel. Each completed package frees a slot for the next, even while another package is stalled. |
 | `--spool-dir PATH` | `PYPIRON_SYNC_SPOOL_DIR` | system temp | Download spool directory. |
 | `--dry-run` | `PYPIRON_SYNC_DRY_RUN` | `false` | Print work, write nothing. |
-| `--full` | `PYPIRON_SYNC_FULL` | `false` | Ignore cursors and reconcile every selected project. |
+| `--full` | `PYPIRON_SYNC_FULL` | `false` | Ignore cursors and reconcile every selected project. After narrowing a filter or version range with `--include-dependencies`, run it once so dependencies only the dropped releases needed stop being followed. |
 | `--no-progress` | `PYPIRON_SYNC_NO_PROGRESS` | `false` | Hide the live progress line (packages, bytes, rate, time left). |
 | `--allow-legacy-versions` | `PYPIRON_ALLOW_LEGACY_VERSIONS` | `false` | Mirror files without an inferable PEP 440 version. Otherwise they are skipped and counted in the run summary. Applies in sync, because the destination accepts mirror uploads. |
 | `--list-legacy-skips` | `PYPIRON_SYNC_LIST_LEGACY_SKIPS` | `false` | Log each file skipped for a non-PEP-440 version, not just the count. |

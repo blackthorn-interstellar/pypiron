@@ -150,3 +150,27 @@ def test_listed_package_keeps_its_own_spec(source, disk_server, pypiron_bin):
     assert mirrored["leaf"] == ["2.0"]
     assert "win-only" not in mirrored
     assert "unrelated" not in mirrored
+
+
+def test_full_resets_dependencies_a_narrowed_selection_dropped(
+    source, disk_server, pypiron_bin, tmp_path
+):
+    """The memo keeps what deselected releases required, so a narrowed selection
+    keeps following their dependencies; `--full` is the documented reset, and
+    its save must not merge the old requirements back."""
+    _sync(pypiron_bin, source, disk_server, "--include-package", "lib")
+    assert _mirrored(disk_server)["leaf"] == ["1.0", "2.0"]
+
+    # lib 1.0 requires nothing, so after the reset nothing leads to leaf.
+    _sync(pypiron_bin, source, disk_server, "--include-package", "lib==1.0", "--full")
+    wheel = make_wheel("leaf", "3.0", tmp_path / "late")
+    upload_legacy(
+        source["legacy"],
+        wheel,
+        username=source["admin_user"],
+        password=source["admin_password"],
+        fields={"mirror": "true"},
+    )
+    wait_for_file_in_index(source["simple"], "leaf", wheel.name)
+    out = _sync(pypiron_bin, source, disk_server, "--include-package", "lib==1.0")
+    assert "3.0" not in _mirrored(disk_server)["leaf"], out

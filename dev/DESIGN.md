@@ -854,6 +854,10 @@ _sync/cursors.json                       # mirror-over-HTTP sync memo: pkg -> la
                                          #   (config-keyed). Pure cache for conditional fetch;
                                          #   never truth, never a view — delete it and the next
                                          #   sync re-fetches. Served by admin GET/PUT /sync/cursors.
+                                         #   Sync merges its refreshed entries into a fresh GET at
+                                         #   run end and never PUTs over a memo it couldn't read;
+                                         #   two saves (or a failover) inside that GET->PUT window
+                                         #   can still drop one run's entries (a re-fetch).
 _advisories/osv-pypi.zip                 # the OSV PyPI advisory export, carried VERBATIM (like
                                          #   .provenance): powers the malware block set + org audit.
                                          #   A leader-authored control SINGLETON: written write-through

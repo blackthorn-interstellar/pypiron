@@ -1870,51 +1870,89 @@ async fn preflight(client: &Client, resolved: &Resolved) -> Result<()> {
 }
 
 /// Load the cursor memo for this run from the destination's `/sync/cursors`.
-/// `--full` (or any read failure) yields an empty map, which forces
-/// unconditional fetches — the memo only ever speeds a run up, never changes
-/// its result.
+/// `--full` (or a read failure) yields an empty map, which forces unconditional
+/// fetches — the memo only ever speeds a run up, never changes its result. An
+/// entry this binary can't parse costs only that project a full fetch.
 async fn load_cursors(client: &Client, resolved: &Resolved) -> Cursors {
     if resolved.full {
         return Cursors::new();
     }
-    let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
-    let req = with_admin_auth(client.get(&url), resolved);
-    match req.send().await {
-        Ok(resp) if resp.status().is_success() => resp.json().await.unwrap_or_default(),
-        _ => Cursors::new(),
+    match fetch_cursors(client, resolved).await {
+        Ok(map) => map
+            .into_iter()
+            .filter_map(|(name, v)| Some((name, serde_json::from_value(v).ok()?)))
+            .collect(),
+        Err(e) => {
+            warn!(error=?e, "could not read the sync cursor memo; every project full-fetches");
+            Cursors::new()
+        }
     }
 }
 
-/// Persist the merged cursor memo to the destination. Best-effort: a failure
-/// just means the next run re-fetches, so it must never fail an otherwise-good
-/// sync.
-async fn save_cursors(client: &Client, resolved: &Resolved, cursors: &Cursors) {
-    if resolved.repair_upload_times {
+/// The stored cursor memo as an untyped object, so entries this binary can't
+/// parse (another sync version's) survive a merge untouched.
+async fn fetch_cursors(
+    client: &Client,
+    resolved: &Resolved,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
+    let resp = with_admin_auth(client.get(&url), resolved).send().await?;
+    if !resp.status().is_success() {
+        bail!("GET /sync/cursors [{}]", resp.status());
+    }
+    let body = resp.bytes().await?;
+    serde_json::from_slice(&body).context("stored sync cursor memo is not a JSON object")
+}
+
+/// This run's cursor changes: `Some` stores a fresh entry, `None` drops a stale
+/// one (`--full` re-synced the project but produced nothing to replay).
+type CursorUpdates = HashMap<String, Option<CursorEntry>>;
+
+/// Apply this run's updates onto the stored memo, leaving every other entry —
+/// other projects, other sync versions' shapes — exactly as stored.
+fn merge_cursors(
+    mut stored: serde_json::Map<String, serde_json::Value>,
+    updates: &CursorUpdates,
+) -> Result<Vec<u8>> {
+    for (name, entry) in updates {
+        match entry {
+            Some(e) => {
+                stored.insert(name.clone(), serde_json::to_value(e)?);
+            }
+            None => {
+                stored.remove(name);
+            }
+        }
+    }
+    Ok(serde_json::to_vec(&stored)?)
+}
+
+/// Merge this run's cursor updates into a fresh read of the stored memo and
+/// write it back. Best-effort: a failure just means the next run re-fetches, so
+/// it never fails an otherwise-good sync. A memo it couldn't read is never
+/// written over — that would wipe every other project's cursor.
+async fn save_cursors(client: &Client, resolved: &Resolved, updates: &CursorUpdates) {
+    if resolved.repair_upload_times || updates.is_empty() {
         return;
     }
     if resolved.dry_run {
         info!("[dry-run] would persist the sync cursor memo to the destination (no write)");
         return;
     }
-    let body = match serde_json::to_vec(cursors) {
-        Ok(b) => b,
-        Err(e) => {
-            warn!(error=?e, "could not encode sync cursors");
-            return;
-        }
-    };
-    let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
-    let req = with_admin_auth(client.put(&url).body(body), resolved);
     let result = async {
-        let resp = req.send().await?;
+        let body = merge_cursors(fetch_cursors(client, resolved).await?, updates)?;
+        let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
+        let resp = with_admin_auth(client.put(&url).body(body), resolved)
+            .send()
+            .await?;
         if !resp.status().is_success() {
-            bail!("saving sync cursors failed [{}]", resp.status());
+            bail!("PUT /sync/cursors [{}]", resp.status());
         }
         Ok::<(), anyhow::Error>(())
     }
     .await;
     if let Err(e) = result {
-        warn!(error=?e, "failed to persist sync cursors (next run re-fetches)");
+        warn!(error=?e, "could not persist sync cursors; left the stored memo unchanged (next run re-fetches)");
     }
 }
 
@@ -2494,7 +2532,7 @@ pub async fn run_sync(
     let progress = Arc::new(Progress::new(0));
     let ticker = (!args.no_progress).then(|| spawn_progress(progress.clone()));
     let mut failures = 0usize;
-    let mut refreshed: Cursors = Cursors::new();
+    let mut refreshed = CursorUpdates::new();
     loop {
         let jobs: Vec<(Job, Want)> = closure(
             &resolved.mirror.include_packages,
@@ -2530,7 +2568,10 @@ pub async fn run_sync(
         let mut packages = stream::iter(&jobs)
             .map(|(job, _)| {
                 // A project this run already synced resumes from that result.
-                let prev = refreshed.get(&job.name).or(cursors.get(&job.name));
+                let prev = match refreshed.get(&job.name) {
+                    Some(updated) => updated.as_ref(),
+                    None => cursors.get(&job.name),
+                };
                 let run = sync_one_package(&client, &resolved, &endpoint, job, prev, &progress);
                 async move { (job, run.await) }
             })
@@ -2548,20 +2589,21 @@ pub async fn run_sync(
         }
         drop(packages);
         for (name, outcome) in finished {
-            if let Some(entry) = outcome.new_cursor {
-                refreshed.insert(name.clone(), entry);
+            // `--full` replaces what it re-synced: no fresh entry means the
+            // stored one (and its dependency memo) goes.
+            if outcome.new_cursor.is_some() || resolved.full {
+                refreshed.insert(name.clone(), outcome.new_cursor);
             }
             requires.insert(name, outcome.requires);
         }
         done.extend(jobs.into_iter().map(|(job, want)| (job.name, want)));
     }
 
-    // Keep cursors for projects this run didn't touch (or 304'd), overwrite the
-    // ones we re-fetched. A failed project advances nothing — it re-fetches next
-    // run. Persisting is best-effort; the memo only ever speeds things up.
-    let mut merged = cursors;
-    merged.extend(refreshed);
-    save_cursors(&client, &resolved, &merged).await;
+    // Merge what this run re-fetched into the stored memo; projects it didn't
+    // touch (or 304'd) keep their cursors. A failed project advances nothing —
+    // it re-fetches next run. Persisting is best-effort; the memo only ever
+    // speeds things up.
+    save_cursors(&client, &resolved, &refreshed).await;
 
     // Stop the ticker, then print the always-on summary on its own line.
     progress.done.notify_one();
@@ -2583,7 +2625,7 @@ pub async fn run_sync(
 struct PackageOutcome {
     /// `Some` only on a successful 200 fetch with an ETag — the entry to store.
     /// `None` means "leave the existing cursor as-is" (a 304 skip, a dry run, or
-    /// a source with no ETag).
+    /// a source with no ETag) — except under `--full`, which drops it.
     new_cursor: Option<CursorEntry>,
     /// With `--include-dependencies`: the `Requires-Dist` entries of every
     /// release read for this project, the next round's leads.
@@ -4170,6 +4212,40 @@ fn normalize_legacy_endpoint(dst_base: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn merge_cursors_touches_only_this_runs_projects() {
+        let stored = serde_json::json!({
+            "kept": {"etag": "a", "config": "c"},
+            "foreign": {"etag": 7},
+            "stale": {"etag": "s", "config": "c"},
+            "updated": {"etag": "old", "config": "c"},
+        });
+        let serde_json::Value::Object(stored) = stored else {
+            unreachable!()
+        };
+        let entry = CursorEntry {
+            etag: "new".into(),
+            config: "c".into(),
+            serial: None,
+            next_eligible_at: None,
+            deps: None,
+        };
+        let updates = CursorUpdates::from([
+            ("updated".to_string(), Some(entry)),
+            ("stale".to_string(), None),
+        ]);
+        let merged: serde_json::Value =
+            serde_json::from_slice(&merge_cursors(stored, &updates).unwrap()).unwrap();
+        assert_eq!(
+            merged,
+            serde_json::json!({
+                "kept": {"etag": "a", "config": "c"},
+                "foreign": {"etag": 7},
+                "updated": {"etag": "new", "config": "c"},
+            })
+        );
+    }
 
     #[test]
     fn pick_vec_refuses_a_provided_but_empty_list() {

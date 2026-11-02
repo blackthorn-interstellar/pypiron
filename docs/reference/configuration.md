@@ -452,6 +452,9 @@ export UV_INDEX_COMPANY_PASSWORD=$(
 Tokens live for 5 minutes and cannot outrank the credential that minted them.
 A server with no write credential stays read-only for every token, including
 ones minted by another server that shares its signing key.
+Keep server clocks in sync (NTP): a server refuses a token issued more than a
+minute in its future, so tokens minted on a server whose clock runs fast fail
+with 401 on the others.
 
 ## Health and maintenance
 

@@ -9,8 +9,14 @@ repo/commit/user.
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import http.client
 import json
 import subprocess
+import time
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -26,6 +32,20 @@ def _auth(user: str, password: str) -> dict:
 
 def _token_header(token: str) -> dict:
     return {"Authorization": _encode_basic_auth("__token__", token)}
+
+
+SIGNING_KEY = b"test-signing-key-0123456789abcdef"  # disk_server_token_auth's key
+
+
+def _b64(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+
+def _sign(role: str, iat: int) -> str:
+    """A token as a peer sharing the signing key would mint it, with its own clock."""
+    payload = _b64(json.dumps({"role": role, "iat": iat, "exp": iat + 300}).encode())
+    mac = _b64(hmac.new(SIGNING_KEY, payload.encode(), hashlib.sha256).digest())
+    return f"pypiron-{payload}.{mac}"
 
 
 def _mint(server, *, role=None, auth=None):
@@ -194,3 +214,40 @@ def test_a_read_only_node_refuses_write_tokens(
         assert code == 403
     finally:
         replica_gen.close()
+
+
+def test_a_token_issued_in_the_future_is_refused(disk_server_token_auth):
+    """A peer whose clock runs fast mints tokens that would otherwise live for the
+    skew plus the TTL; they are refused instead, so the skew gets noticed."""
+    index = f"{disk_server_token_auth['simple']}index.json"
+    now = int(time.time())
+    # The hand-signed format is right: a token issued now reads.
+    assert http_get(index, headers=_token_header(_sign("reader", now)))[0] == 200
+    assert http_get(index, headers=_token_header(_sign("reader", now + 3600)))[0] == 401
+
+
+def test_a_token_that_turns_valid_mid_request_cannot_mint(disk_server_token_auth):
+    """The minting endpoint refuses token-mode callers before reading the body.
+    That refusal must not depend on the token being valid right now: a token
+    issued just past the clock-skew allowance is invalid when the headers land
+    and valid by the time a slow body arrives and the role check runs."""
+    server = disk_server_token_auth
+    token = _sign("uploader", int(time.time()) + 63)
+    body = json.dumps({"role": "uploader"}).encode()
+    url = urlsplit(server["base_url"])
+    conn = http.client.HTTPConnection(url.hostname, url.port, timeout=30)
+    try:
+        conn.putrequest("POST", "/tokens")
+        conn.putheader("Authorization", _token_header(token)["Authorization"])
+        conn.putheader("Content-Type", "application/json")
+        conn.putheader("Content-Length", str(len(body)))
+        conn.endheaders()
+        time.sleep(5)
+        try:
+            conn.send(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass  # refused before the body: the fixed behavior
+        resp = conn.getresponse()
+        assert resp.status == 403, resp.read()
+    finally:
+        conn.close()

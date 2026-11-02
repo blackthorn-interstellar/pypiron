@@ -665,9 +665,12 @@ pub(crate) async fn mint_token(
     // A token cannot mint tokens. Minting requires a base (username/password)
     // credential, so a leaked token can't refresh itself into a fresh full TTL
     // indefinitely — the short expiry stays meaningful, which is the whole basis
-    // for carrying no revocation list (see TOKEN_TTL_SECS). token_role is Some
-    // only when the presented credential is itself a valid __token__ bearer.
-    if state.token_role(&headers).is_some() {
+    // for carrying no revocation list (see TOKEN_TTL_SECS). Refuse on the
+    // `__token__` username alone, not on token validity: validity changes with
+    // time (a future-issued token turns valid later), and the role check below
+    // runs after the body is read, so a validity gate here could be slipped by
+    // a token that is invalid now and valid once a slow body arrives.
+    if crate::auth::basic_credentials(&headers).is_some_and(|(u, _)| token::is_token_username(&u)) {
         return Err((
             StatusCode::FORBIDDEN,
             "a token cannot mint tokens; authenticate with a configured credential".to_string(),

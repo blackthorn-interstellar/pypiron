@@ -706,8 +706,7 @@ impl AppState {
     pub fn token_role(&self, headers: &HeaderMap) -> Option<token::Role> {
         let key = nonempty(self.token_signing_key.as_deref())?;
         let (user, pass) = basic_credentials(headers)?;
-        let base = user.split_once('+').map_or(user.as_str(), |(b, _)| b);
-        if base != token::TOKEN_USERNAME {
+        if !token::is_token_username(&user) {
             return None;
         }
         // The protocol clock, so the simulator can drive a token past its expiry.
@@ -715,9 +714,11 @@ impl AppState {
         token::verify(key, &pass, now).map(|c| c.role)
     }
 
-    /// Does the request authenticate as admin? A token only grants a role this
-    /// node has enabled: a node without an admin credential stays admin-free
-    /// even for a token a peer sharing the signing key minted.
+    /// Does the request authenticate as admin? A token's role is capped by what
+    /// this node can grant: no admin credential, no admin token; no write
+    /// credential, no write token (see `is_uploader`) — even for a token a peer
+    /// sharing the signing key minted. An admin-only node accepts uploader
+    /// tokens: it mints them itself (admin ⊇ uploader).
     pub(crate) fn is_admin(&self, headers: &HeaderMap) -> bool {
         self.admin_credential().is_some_and(|(u, p)| {
             check_basic_auth(headers, u, p).is_ok()

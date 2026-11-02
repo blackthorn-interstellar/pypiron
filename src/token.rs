@@ -27,6 +27,20 @@ pub const TOKEN_USERNAME: &str = "__token__";
 
 const PREFIX: &str = "pypiron-";
 
+/// How far in the verifier's future a token's `iat` may sit before it is
+/// refused. Without it a peer whose clock runs fast mints tokens that live
+/// quietly for the skew plus the TTL; with it they fail with 401 straight away,
+/// so the skew gets noticed. It cannot cap a stolen token's real-time life
+/// (once the verifier's clock catches up the token looks normal) — clock sync
+/// does that. Far above NTP drift, far below the TTL.
+pub const MAX_CLOCK_SKEW_SECS: i64 = 60;
+
+/// Does this Basic-auth username select token mode? `__token__` itself or
+/// `__token__+tag` (the tag is attribution only).
+pub fn is_token_username(user: &str) -> bool {
+    user.split_once('+').map_or(user, |(base, _)| base) == TOKEN_USERNAME
+}
+
 /// Access tier a token grants. Ordering is meaningful: admin ⊇ uploader ⊇
 /// reader, so a token's role can be compared against a required minimum.
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -91,7 +105,8 @@ pub fn mint(signing_key: &str, claims: &Claims) -> anyhow::Result<String> {
 }
 
 /// Verify a token against the signing key and the current time. Returns the
-/// claims only if the prefix, signature, encoding, and expiry all check out;
+/// claims only if the prefix, signature and encoding check out and the token is
+/// neither expired nor issued in the future (beyond [`MAX_CLOCK_SKEW_SECS`]);
 /// any failure is `None` (fail closed — a bad token never authenticates).
 pub fn verify(signing_key: &str, token: &str, now_unix: i64) -> Option<Claims> {
     let body = token.strip_prefix(PREFIX)?;
@@ -102,7 +117,7 @@ pub fn verify(signing_key: &str, token: &str, now_unix: i64) -> Option<Claims> {
         return None;
     }
     let claims: Claims = serde_json::from_slice(&b64url.decode(payload).ok()?).ok()?;
-    if now_unix >= claims.exp {
+    if now_unix >= claims.exp || claims.iat > now_unix.saturating_add(MAX_CLOCK_SKEW_SECS) {
         return None;
     }
     Some(claims)
@@ -169,6 +184,36 @@ mod tests {
         assert!(verify("key", &t, 2000).is_none());
         assert!(verify("key", &t, 2001).is_none());
         assert!(verify("key", &t, 1999).is_some());
+    }
+
+    #[test]
+    fn future_issued_token_is_rejected() {
+        let at = |iat| Claims {
+            iat,
+            exp: iat + 300,
+            ..claims(Role::Reader, 0)
+        };
+        let late = mint("key", &at(1000 + MAX_CLOCK_SKEW_SECS + 1)).unwrap();
+        assert!(verify("key", &late, 1000).is_none());
+        let edge = mint("key", &at(1000 + MAX_CLOCK_SKEW_SECS)).unwrap();
+        assert!(verify("key", &edge, 1000).is_some());
+        // Extreme signed values neither overflow nor slip through.
+        let max = Claims {
+            iat: i64::MAX,
+            exp: i64::MAX,
+            ..claims(Role::Reader, 0)
+        };
+        let max = mint("key", &max).unwrap();
+        assert!(verify("key", &max, 1000).is_none());
+        assert!(verify("key", &max, i64::MAX - 1).is_some());
+    }
+
+    #[test]
+    fn token_username_ignores_the_tag() {
+        assert!(is_token_username("__token__"));
+        assert!(is_token_username("__token__+commit=abc"));
+        assert!(!is_token_username("admin"));
+        assert!(!is_token_username("x__token__"));
     }
 
     #[test]

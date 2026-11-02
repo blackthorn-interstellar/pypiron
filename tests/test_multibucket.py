@@ -3129,6 +3129,73 @@ def test_counter_day_rollups_sum_both_buckets_shares(
     assert _stats()["top"].get("rollupsplit") == 13, _stats()
 
 
+def _segment_count(minio, bucket: str, day: str, shard: str, key: str) -> int:
+    """Sum of `key`'s live download deltas in one bucket's segments for `day`."""
+    prefix = f"_counters/seg/downloads/{day}/{shard}/"
+    total = 0
+    for obj in minio_list_keys_in(minio, bucket):
+        if obj.startswith(prefix):
+            for leaf in json.loads(minio_get_key_in(minio, bucket, obj))["buckets"].values():
+                total += leaf.get(key, 0)
+    return total
+
+
+def test_counter_flush_hung_on_a_dark_bucket_survives_the_switch(
+    s3_server_multi_counters_failover, tmp_path
+):
+    """A counter flush whose PUT hangs on a bucket that went dark is abandoned
+    when the node switches buckets. The downloads it carried must land on the
+    new bucket on a later flush, not vanish with the abandoned attempt."""
+    server = s3_server_multi_counters_failover
+    minio, faults = server["minio"], server["faults"]
+    a, b = minio["buckets"][:2]
+    _eventually(lambda: _selected_bucket(server) == a, timeout=15, what="preferred bucket")
+    _eventually(lambda: _bucket_health(server, b) == 1, timeout=10, what="fallback healthy")
+
+    pkg = "darkflush"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _upload(server, wheel)
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+    # The fallback must hold the artifact, or its flush-time existence check
+    # would refuse the counts after the switch.
+    _eventually(
+        lambda: minio_key_exists_in(minio, b, f"packages/{pkg}/{wheel.name}"),
+        what="artifact replicated to the fallback bucket",
+    )
+    day = datetime.datetime.now(datetime.timezone.utc).date().isoformat()
+    url = f"{server['base_url']}/files/{pkg}/{wheel.name}"
+    counted = f"{pkg}/{wheel.name}"  # a segment's leaf key
+
+    def total() -> int:
+        return sum(_segment_count(minio, bucket, day, "d", counted) for bucket in (a, b))
+
+    # One download flushed normally (and its key verified once, for good).
+    assert http_get(url, timeout=10)[0] == 200
+    _eventually(lambda: total() == 1, timeout=15, what="first download flushed")
+
+    # Three more, whose flush PUT then hangs on the preferred bucket: the worker
+    # is stuck exactly in the flush when the bucket fails and the node switches.
+    seg_puts = lambda: faults.count(bucket=a, method="PUT", needle="_counters/seg/")  # noqa: E731
+    before = seg_puts()
+    faults.hold_puts(a, "_counters/seg/")
+    for _ in range(3):
+        assert http_get(url, timeout=10)[0] == 200
+    try:
+        _eventually(lambda: seg_puts() > before, timeout=15, what="flush PUT hung on a")
+        faults.fail(a)
+        _eventually(lambda: _selected_bucket(server) == b, timeout=30, what="failover")
+        _eventually(
+            lambda: total() == 4,
+            timeout=20,
+            what="the abandoned flush's downloads written to the new bucket",
+        )
+        # The held PUT never reached storage, so nothing was counted twice.
+        time.sleep(2)
+        assert total() == 4
+    finally:
+        faults.recover(a)
+
+
 # ---------------------------------------------------------------------------
 # The single-survivor acceptance test (the totality principle, dev/DESIGN.md).
 

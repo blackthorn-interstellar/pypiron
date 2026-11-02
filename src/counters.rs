@@ -351,6 +351,24 @@ struct Pending {
     n_keys: usize,
 }
 
+/// Deltas a [`Counters::flush`] has taken but not yet written. Dropping it —
+/// on return, or when the flush future is cancelled mid-await — puts every
+/// remaining delta back in the live buffer, so only a landed PUT ever consumes
+/// counts. `rebuffer` takes a std mutex with poison recovery: it cannot panic or
+/// block on async, which is what makes it safe in `Drop`.
+struct Unflushed<'a> {
+    counters: &'a Counters,
+    segs: BTreeMap<(String, String, char), BucketMap>,
+}
+
+impl Drop for Unflushed<'_> {
+    fn drop(&mut self) {
+        for ((metric, day, shard), buckets) in std::mem::take(&mut self.segs) {
+            self.counters.rebuffer(&metric, &day, shard, buckets);
+        }
+    }
+}
+
 /// A set of at most `cap` ids that evicts the oldest insertion when full — the
 /// bound that keeps a verdict cache from becoming the very unbounded growth it
 /// exists to prevent. `Arc<str>` so the set and the eviction queue share one
@@ -550,7 +568,14 @@ impl Counters {
 
     /// Drop anything a [`KeyVerifier`] cannot vouch for, write the surviving
     /// deltas as immutable segments, then clear the buffer. Best-effort: a
-    /// failed segment is re-buffered for the next flush.
+    /// failed **or cancelled** segment is re-buffered for the next flush.
+    ///
+    /// Cancellation is routine, not a crash: the worker races this against a
+    /// bucket switch (the only escape from a PUT hung on a dark bucket) and the
+    /// shutdown budget. So a delta leaves the taken buffer only once its PUT has
+    /// landed, and [`Unflushed`] hands back whatever is left however the future
+    /// ends. A PUT that landed but whose reply was lost is written twice — the
+    /// same at-least-once trade the error path has always made.
     pub async fn flush(&self) {
         let Some(selector) = self.store.as_deref() else {
             return;
@@ -559,15 +584,27 @@ impl Counters {
         let mut taken = {
             let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             self.flush_due.store(false, Ordering::Relaxed);
-            std::mem::take(&mut *guard)
+            Unflushed {
+                counters: self,
+                segs: std::mem::take(&mut *guard).segs,
+            }
         };
         // Nothing forged reaches durable storage: the buffer is filtered before
         // a single segment is written. A no-op without a verifier installed.
+        // It rewrites the map only after its last await, so a cancel mid-check
+        // hands the unfiltered buffer back whole.
         self.drop_unprovable_keys(&mut taken.segs).await;
-        for ((metric, day, shard), buckets) in taken.segs {
+        // One attempt per segment per flush: a failure stays in `taken` and is
+        // re-buffered on return, never retried here (a dark bucket would spin).
+        let ids: Vec<_> = taken.segs.keys().cloned().collect();
+        for id in ids {
+            let Some(buckets) = taken.segs.remove(&id) else {
+                continue;
+            };
             if buckets.is_empty() {
                 continue;
             }
+            let (metric, day, shard) = &id;
             let seq = self.seq.fetch_add(1, Ordering::Relaxed);
             let key = format!(
                 "{SEG_PREFIX}{metric}/{day}/{shard}/{}-{seq}.json",
@@ -578,9 +615,13 @@ impl Counters {
                 buckets,
             };
             let bytes = serde_json::to_vec(&seg).unwrap_or_default();
-            if let Err(e) = store.put(&key, bytes).await {
-                warn!(error=?e, %key, "counter flush failed; re-buffering deltas");
-                self.rebuffer(&metric, &day, shard, seg.buckets);
+            // Still owed until the PUT lands: a cancel during it re-buffers.
+            taken.segs.insert(id.clone(), seg.buckets);
+            match store.put(&key, bytes).await {
+                Ok(()) => {
+                    taken.segs.remove(&id);
+                }
+                Err(e) => warn!(error=?e, %key, "counter flush failed; re-buffering deltas"),
             }
         }
     }
@@ -1484,6 +1525,9 @@ mod tests {
         up: Arc<AtomicBool>,
         /// Reads of a key containing this substring fail transiently.
         fail_get: Arc<Mutex<Option<String>>>,
+        /// PUTs left before every further PUT hangs forever — a bucket gone
+        /// dark mid-flush, the case the worker escapes by cancelling.
+        puts_before_hang: Arc<AtomicUsize>,
     }
     impl Default for MemStore {
         fn default() -> Self {
@@ -1497,7 +1541,11 @@ mod tests {
                 name: bucket_tag(name),
                 up: Arc::new(AtomicBool::new(true)),
                 fail_get: Arc::default(),
+                puts_before_hang: Arc::new(AtomicUsize::new(usize::MAX)),
             }
+        }
+        fn hang_after_puts(&self, n: usize) {
+            self.puts_before_hang.store(n, Ordering::SeqCst);
         }
         fn len(&self) -> usize {
             self.objects.lock().unwrap().len()
@@ -1535,6 +1583,12 @@ mod tests {
         }
         async fn put(&self, key: &str, bytes: Vec<u8>) -> anyhow::Result<()> {
             self.down()?;
+            let left = self.puts_before_hang.load(Ordering::SeqCst);
+            if left == 0 {
+                std::future::pending::<()>().await;
+            }
+            self.puts_before_hang
+                .store(left.saturating_sub(1), Ordering::SeqCst);
             self.objects.lock().unwrap().insert(key.to_string(), bytes);
             Ok(())
         }
@@ -1702,6 +1756,82 @@ mod tests {
         let series = c.query_package("downloads", "requests", today, today).await;
         let day = day_str(today);
         assert_eq!(series[&day]["requests-2.31.0-py3-none-any.whl"], 3);
+    }
+
+    /// Every delta still in the live buffer.
+    fn pending_total(c: &Counters) -> u64 {
+        let guard = c.pending.lock().unwrap();
+        guard
+            .segs
+            .values()
+            .flat_map(|b| b.values())
+            .flat_map(|leaf| leaf.values())
+            .sum()
+    }
+
+    /// Poll a flush exactly once and drop it, the way the worker's `select!`
+    /// drops it when a bucket switch wins. Deterministic: the in-memory store
+    /// never yields except where a test makes it hang.
+    fn cancel_flush(c: &Counters) {
+        use futures::FutureExt;
+        assert!(c.flush().now_or_never().is_none(), "the flush must block");
+    }
+
+    #[tokio::test]
+    async fn cancelled_flush_rebuffers_unwritten_segments() {
+        let store = MemStore::default();
+        let c = engine(store.clone(), Config::default());
+        // Three shards ('a', 'f', 'r') => three segment PUTs, in that order.
+        c.record("downloads", "attrs/attrs-1.0.whl");
+        c.record("downloads", "flask/flask-1.0.whl");
+        c.record("downloads", "flask/flask-1.0.whl");
+        c.record("downloads", "requests/r-1.0.whl");
+        store.hang_after_puts(1);
+        cancel_flush(&c);
+
+        assert_eq!(store.len(), 1, "only the first PUT landed");
+        assert_eq!(
+            pending_total(&c),
+            3,
+            "the in-flight and unattempted segments are back, the landed one is not"
+        );
+
+        // Counts recorded after the cancel merge with the re-buffered ones.
+        c.record("downloads", "flask/flask-1.0.whl");
+        store.hang_after_puts(usize::MAX);
+        c.flush().await;
+        assert_eq!(pending_total(&c), 0);
+
+        let today = OffsetDateTime::now_utc().date();
+        let day = day_str(today);
+        for (pkg, file, want) in [
+            ("attrs", "attrs-1.0.whl", 1),
+            ("flask", "flask-1.0.whl", 3),
+            ("requests", "r-1.0.whl", 1),
+        ] {
+            let series = c.query_package("downloads", pkg, today, today).await;
+            assert_eq!(
+                series[&day][file], want,
+                "{pkg}: exact, never lost or doubled"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn failed_flush_rebuffers_everything_and_retries_next_time() {
+        let store = MemStore::default();
+        let c = engine(store.clone(), Config::default());
+        c.record("downloads", "attrs/attrs-1.0.whl");
+        c.record("downloads", "requests/r-1.0.whl");
+        store.set_up(false);
+        c.flush().await;
+        assert_eq!(store.len(), 0);
+        assert_eq!(pending_total(&c), 2, "a failed PUT keeps its deltas");
+
+        store.set_up(true);
+        c.flush().await;
+        assert_eq!(store.len(), 2);
+        assert_eq!(pending_total(&c), 0);
     }
 
     #[tokio::test]
@@ -2514,6 +2644,28 @@ mod tests {
                 .load(Ordering::SeqCst)
                 .then(|| self.stored.contains(key))
         }
+    }
+
+    /// A verifier whose storage never answers.
+    struct HangingVerifier;
+    #[async_trait]
+    impl KeyVerifier for HangingVerifier {
+        async fn exists(&self, _metric: &str, _key: &str) -> Option<bool> {
+            std::future::pending().await
+        }
+    }
+
+    #[tokio::test]
+    async fn flush_cancelled_during_verification_keeps_buffer() {
+        let store = MemStore::default();
+        let c = Counters::new(Box::new(store.clone()), Config::default())
+            .with_verifier(Box::new(HangingVerifier));
+        c.record("downloads", "requests/r-1.0.whl");
+        c.record("downloads", "requests/r-1.0.whl");
+        c.record("downloads", "flask/flask-1.0.whl");
+        cancel_flush(&c);
+        assert_eq!(store.len(), 0);
+        assert_eq!(pending_total(&c), 3, "nothing verified, nothing lost");
     }
 
     fn gated(store: MemStore, cfg: Config, verifier: FakeVerifier) -> Counters {

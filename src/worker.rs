@@ -825,6 +825,9 @@ pub async fn run_worker_until(
         // Counter flush (EVERY node, not leader-gated): drain the in-memory
         // download buffer to this node's own immutable segment. Best-effort;
         // fires on the interval or early when the buffer hits its high-water mark.
+        // Losing the race to a bucket switch only defers the counts: the
+        // cancelled flush re-buffers them and the next tick writes them to the
+        // newly selected bucket.
         if last_counter_flush.is_none_or(|t| t.elapsed() >= state.counters.flush_interval())
             || state.counters.flush_due()
         {

@@ -927,6 +927,7 @@ class BucketFaults:
     def __init__(self) -> None:
         self._failed: set[str] = set()
         self._blackholed: set[str] = set()
+        self._held_puts: set[tuple[str, str]] = set()
         self._dripped: dict[tuple[str, str], float] = {}
         self._dripped_puts: dict[tuple[str, str], float] = {}
         self._versioning_suspended: set[str] = set()
@@ -945,11 +946,18 @@ class BucketFaults:
         with self._lock:
             self._failed.difference_update(buckets)
             self._blackholed.difference_update(buckets)
+            self._held_puts = {h for h in self._held_puts if h[0] not in buckets}
 
     def blackhole(self, *buckets: str) -> None:
         """Accept requests but withhold a response long enough to test timeouts."""
         with self._lock:
             self._blackholed.update(buckets)
+
+    def hold_puts(self, bucket: str, prefix: str) -> None:
+        """Blackhole only PUTs whose key starts with ``prefix``: one write path
+        hangs while every other call to the bucket still answers."""
+        with self._lock:
+            self._held_puts.add((bucket, prefix))
 
     def drip(self, bucket: str, key: str, *, duration: float = 11.0) -> None:
         """Send one object's GET body steadily over ``duration`` seconds."""
@@ -975,9 +983,12 @@ class BucketFaults:
         with self._lock:
             return bucket in self._failed
 
-    def is_blackholed(self, bucket: str) -> bool:
+    def is_blackholed(self, bucket: str, method: str = "", key: str = "") -> bool:
         with self._lock:
-            return bucket in self._blackholed
+            return bucket in self._blackholed or (
+                method == "PUT"
+                and any(b == bucket and key.startswith(p) for b, p in self._held_puts)
+            )
 
     def drip_duration(self, bucket: str, key: str) -> float | None:
         with self._lock:
@@ -1080,7 +1091,7 @@ class _S3FaultProxyHandler(BaseHTTPRequestHandler):
             self._log(bucket, received, 0, "503-injected-outage")
             self._send_error(503, b"injected bucket outage")
             return
-        if bucket and self.server.faults.is_blackholed(bucket):
+        if bucket and self.server.faults.is_blackholed(bucket, self.command, key):
             # Health-only calls are cancelled by pypiron after one second and
             # startup control calls after five. Keep this connection silent much
             # longer so the test distinguishes those bounds from an immediate

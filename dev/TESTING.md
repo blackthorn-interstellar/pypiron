@@ -195,7 +195,9 @@ all inside the enumerating tier's nominal scope.
   shaped double publishes, mirror-vs-private races, yanks, deletes, demotion
   settles. Checked invariants: buckets converge at merge fixpoint; acknowledged
   bytes are never silently lost (conflict losers land in quarantine, only an
-  authorized delete destroys); deletes settle dead everywhere.
+  authorized delete destroys); deletes settle dead everywhere; and no record is
+  left torn at a fixpoint (`quiescent_records_untorn`: no unsettled freeze,
+  delete or demotion, as `classify_record` reads the cell).
 
 ### What the bounds actually are
 

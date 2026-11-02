@@ -43,7 +43,9 @@ use std::sync::Arc;
 
 use stateright::{Checker, Model, Property};
 
-use pypiron::replicate::{decide, Origin as ROrigin, Record, Side, Verdict};
+use pypiron::replicate::{
+    classify_record, decide, Origin as ROrigin, Record, RecordState, Side, Verdict,
+};
 use pypiron::sidecar::{
     frozen_key, metadata_key, mirror_quarantined_key, provenance_key, sidecar_key, tombstone_key,
     Sidecar, Yanked,
@@ -209,6 +211,11 @@ fn to_sidecar(a: &AbsSidecar) -> Sidecar {
     }
 }
 
+/// What the real classifier says one abstract cell means.
+fn state_of(bucket: &BucketAbs, file: u8) -> RecordState {
+    classify_record(&to_record(bucket, file))
+}
+
 fn to_record(bucket: &BucketAbs, file: u8) -> Record {
     use pypiron::sidecar::{FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX, TOMBSTONE_SUFFIX};
     let rec = &bucket.files[file as usize];
@@ -320,13 +327,15 @@ fn supersede_abs(dst: &mut BucketAbs, file: u8, winner_artifact: u8, winner_side
 /// verdict, because otherwise the leftover key survives every future diff:
 /// `decide` reads both sides as `Live { Private }` and calls them converged.
 fn clear_spent_demotion_fence_abs(bucket: &mut BucketAbs, file: u8) {
+    let spent = matches!(
+        state_of(bucket, file),
+        RecordState::Live {
+            origin: ROrigin::Private,
+            ..
+        }
+    );
     let rec = &mut bucket.files[file as usize];
-    if rec.mirror_q
-        && !rec.tombstoned
-        && !rec.frozen
-        && rec.artifact.is_some()
-        && rec.sidecar.map(|sc| sc.origin) == Some(MOrigin::Private)
-    {
+    if rec.mirror_q && spent {
         rec.mirror_q = false;
     }
 }
@@ -516,8 +525,10 @@ fn backfill_once(w: &World, bucket: u8, file: u8) -> Option<World> {
     // rebuild_package backfills a sidecar for a bare artifact by hashing it;
     // the typed origin comes from the package-level claim, and legacy fields
     // (upload_epoch_ms) stay absent.
+    // Exactly the worker's gate: only a `Bare` body is hashed — never one
+    // under a tombstone, a freeze or a demotion fence.
     let origin = babs.pkg_origin?;
-    if rec.artifact.is_none() || rec.sidecar.is_some() || rec.tombstoned || rec.frozen {
+    if state_of(babs, file) != RecordState::Bare {
         return None;
     }
     let mut next = w.clone();
@@ -535,14 +546,15 @@ fn backfill_once(w: &World, bucket: u8, file: u8) -> Option<World> {
 
 fn late_mirror_quarantine_once(w: &World, bucket: u8, file: u8) -> Option<World> {
     let babs = &w.buckets[bucket as usize];
-    let rec = babs.files[file as usize];
-    if babs.pkg_origin != Some(MOrigin::Private) {
-        return None;
-    }
-    let (Some(_), Some(sc)) = (rec.artifact, rec.sidecar) else {
-        return None;
-    };
-    if sc.origin != MOrigin::Mirror || rec.tombstoned || rec.frozen {
+    // `is_late_mirror`: a live mirror record under a private claim.
+    let late = matches!(
+        state_of(babs, file),
+        RecordState::Live {
+            origin: ROrigin::Mirror,
+            ..
+        }
+    );
+    if babs.pkg_origin != Some(MOrigin::Private) || !late {
         return None;
     }
     // The trigger is per-file (a *live* mirror record under a private claim),
@@ -715,32 +727,35 @@ fn quiescent(w: &World) -> bool {
 /// The truth-projection two quiescent buckets must agree on. Now that a mirror
 /// cache replicates too, the projection includes the live mirror record — the
 /// totality claim covers every replicated state class, not just private.
-type Projection = (
-    bool,
-    bool,
-    Option<(u8, AbsSidecar)>,
-    Option<(u8, AbsSidecar)>,
-);
+type Projection = (bool, bool, Option<(u8, AbsSidecar)>);
 
 fn truth_projection(bucket: &BucketAbs, file: u8) -> Projection {
     let rec = bucket.files[file as usize];
-    // Mirror classify_record's precedence: tombstone/freeze markers suppress
-    // a record even while its canonical body remains occupied (an interrupted
-    // delete leaves exactly that shape). A mirror-quarantine marker suppresses a
-    // mirror body (a demotion loser), and under a *private* sidecar it is stale
-    // and falls through, like the real resolver.
-    let live = |want_private: bool| match (rec.artifact, rec.sidecar) {
-        (Some(byte), Some(sc))
-            if (sc.origin == MOrigin::Private) == want_private
-                && !rec.tombstoned
-                && !rec.frozen
-                && (want_private || !rec.mirror_q) =>
-        {
-            Some((byte, sc))
-        }
+    // The live record is whatever `classify_record` calls live: tombstone and
+    // freeze markers suppress a body that still stands (an interrupted delete
+    // leaves exactly that shape), and a demotion fence suppresses all but a
+    // private sidecar.
+    let live = match state_of(bucket, file) {
+        RecordState::Live { .. } => rec.artifact.zip(rec.sidecar),
         _ => None,
     };
-    (rec.tombstoned, rec.frozen, live(true), live(false))
+    (rec.tombstoned, rec.frozen, live)
+}
+
+/// A torn record the merge must finish before its fixpoint. `Bare` (awaiting a
+/// claim to backfill under) and `Absent { debris }` (a sidecar-first fill that
+/// crashed, which the tier-3 audit drops) are what a fixpoint may leave.
+fn torn(state: &RecordState) -> bool {
+    matches!(
+        state,
+        RecordState::Frozen { settled: false }
+            | RecordState::Tombstoned { settled: false }
+            | RecordState::QuarantinedMirror { settled: false }
+            | RecordState::Live {
+                superseding: true,
+                ..
+            }
+    )
 }
 
 fn converged(w: &World) -> bool {
@@ -834,11 +849,21 @@ impl Model for Fleet {
                         })
                     })
             }),
-            // Non-vacuity guard for the two properties above, which are both
+            // A fixpoint is not a convergence if a bucket still holds a torn
+            // record: a freeze, delete or demotion a crash interrupted and no
+            // pass finished. Read through the real classifier, so a verdict
+            // the executor applies as a no-op over a torn side is caught here.
+            Property::<Self>::always("quiescent_records_untorn", |_, w| {
+                !quiescent(w)
+                    || w.buckets.iter().all(|bucket| {
+                        (0..FILES.len() as u8).all(|file| !torn(&state_of(bucket, file)))
+                    })
+            }),
+            // Non-vacuity guard for the quiescence-gated properties above, all
             // `!quiescent(w) || ...`. If the merge ever stops settling — a
             // decide/execute pair that ping-pongs, or a future repair action
             // added to `merge_fixpoint` that is not quite idempotent — no state
-            // is quiescent, both implications go trivially true, and the
+            // is quiescent, every implication goes trivially true, and the
             // checker reports green on a livelock while still printing an
             // impressive state count. Unconditional on purpose: every fleet
             // here is supposed to drain.

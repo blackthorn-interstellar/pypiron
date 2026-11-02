@@ -245,7 +245,7 @@ backends are supported. With more than one bucket:
 | `--lease-ttl-secs N` | `PYPIRON_LEASE_TTL_SECS` | `30` | Multi-node leader lease TTL. |
 | `--download-stats true\|false` | `PYPIRON_DOWNLOAD_STATS` | `true` | Count package downloads. |
 | `--counters-resolution DUR` | `PYPIRON_COUNTERS_RESOLUTION` | `1d` | Counter bucket width: `1d`, `1h`, `30m`, `2h`, etc. |
-| `--counters-flush-interval-secs N` | `PYPIRON_COUNTERS_FLUSH_INTERVAL_SECS` | `300` | Counter flush cadence. |
+| `--counters-flush-interval-secs N` | `PYPIRON_COUNTERS_FLUSH_INTERVAL_SECS` | `300` | Counter flush cadence. Keep it well under a day: counts written after their day is totalled are discarded. |
 | `--counters-rollup-interval-secs N` | `PYPIRON_COUNTERS_ROLLUP_INTERVAL_SECS` | `3600` | Finished-day compaction cadence. |
 | `--counters-retention-days N` | `PYPIRON_COUNTERS_RETENTION_DAYS` | `90` | Counter retention. |
 | `--index-cache-ttl-secs N` | `PYPIRON_INDEX_CACHE_TTL_SECS` | `1` | Refresh interval for in-memory index/page caches. Local rebuilds clear cached entries. An index read already in progress can restore older results for another TTL, even on a single node; keep this short when new releases must appear promptly. |
@@ -274,6 +274,11 @@ could not read after several tries; each is blocked once OSV updates it or a
 newer daily snapshot includes it. An outage at OSV (timeouts, `5xx`, `429`)
 never counts as a try: the node keeps retrying, and while no advisory reads,
 the probe age keeps rising.
+`pypiron_counter_segments_discarded_total` counts batches of download counts
+that reached storage after their day had already been totalled, so `/stats`
+never includes them. A server that could not write its counts to storage for
+over a day causes this. A one-off rise after a crash during a rollup
+is harmless: those counts were already included.
 
 ### Reserved private names
 

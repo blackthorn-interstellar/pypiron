@@ -369,6 +369,22 @@ impl Drop for Unflushed<'_> {
     }
 }
 
+/// Add `n` to `key` in one buffered leaf, holding the distinct-key cap: a key
+/// already present just grows, a new one past `cap` folds into [`OVERFLOW_KEY`]
+/// (the event still counts; only its name is refused). The one write path for
+/// both `record` and a failed flush's re-buffer, so an outage that keeps
+/// handing deltas back can never grow the buffer past the cap's named keys.
+fn tally(leaf: &mut BTreeMap<String, u64>, n_keys: &mut usize, cap: usize, key: &str, n: u64) {
+    if let Some(c) = leaf.get_mut(key) {
+        *c += n;
+    } else if *n_keys >= cap {
+        *leaf.entry(OVERFLOW_KEY.to_string()).or_insert(0) += n;
+    } else {
+        leaf.insert(key.to_string(), n);
+        *n_keys += 1;
+    }
+}
+
 /// A set of at most `cap` ids that evicts the oldest insertion when full — the
 /// bound that keeps a verdict cache from becoming the very unbounded growth it
 /// exists to prevent. `Arc<str>` so the set and the eviction queue share one
@@ -462,6 +478,10 @@ pub struct Counters {
     pending: Mutex<Pending>,
     flush_wake: tokio::sync::Notify,
     flush_due: AtomicBool,
+    /// The last flush had a segment PUT fail. Holds off the high-water early
+    /// flush until the next interval flush, so a failing bucket is retried once
+    /// per interval rather than once per incoming event.
+    flush_failed: AtomicBool,
 }
 
 impl Counters {
@@ -477,6 +497,7 @@ impl Counters {
             pending: Mutex::new(Pending::default()),
             flush_wake: tokio::sync::Notify::new(),
             flush_due: AtomicBool::new(false),
+            flush_failed: AtomicBool::new(false),
         }
     }
 
@@ -494,6 +515,7 @@ impl Counters {
             pending: Mutex::new(Pending::default()),
             flush_wake: tokio::sync::Notify::new(),
             flush_due: AtomicBool::new(false),
+            flush_failed: AtomicBool::new(false),
         }
     }
 
@@ -517,8 +539,10 @@ impl Counters {
     }
     /// True when a memory high-water mark was crossed since the last flush — the
     /// worker uses it (with [`Counters::flush_signal`]) to flush early under load.
+    /// Never right after a failed flush: the retry waits for the interval (the
+    /// key cap already bounds the buffer, so waiting costs names, not memory).
     pub fn flush_due(&self) -> bool {
-        self.flush_due.load(Ordering::Relaxed)
+        self.flush_due.load(Ordering::Relaxed) && !self.flush_failed.load(Ordering::Relaxed)
     }
     /// Resolves the next time the in-memory buffer crosses its high-water mark.
     pub async fn flush_signal(&self) {
@@ -551,14 +575,7 @@ impl Counters {
                 .or_default()
                 .entry(bucket)
                 .or_default();
-            if let Some(c) = leaf.get_mut(key) {
-                *c += n;
-            } else if *n_keys >= self.cfg.max_keys {
-                *leaf.entry(OVERFLOW_KEY.to_string()).or_insert(0) += n;
-            } else {
-                leaf.insert(key.to_string(), n);
-                *n_keys += 1;
-            }
+            tally(leaf, n_keys, self.cfg.max_keys, key, n);
             *n_keys >= self.cfg.max_keys.saturating_mul(8) / 10
         };
         if over && !self.flush_due.swap(true, Ordering::Relaxed) {
@@ -584,6 +601,7 @@ impl Counters {
         let mut taken = {
             let mut guard = self.pending.lock().unwrap_or_else(|e| e.into_inner());
             self.flush_due.store(false, Ordering::Relaxed);
+            self.flush_failed.store(false, Ordering::Relaxed);
             Unflushed {
                 counters: self,
                 segs: std::mem::take(&mut *guard).segs,
@@ -621,7 +639,10 @@ impl Counters {
                 Ok(()) => {
                     taken.segs.remove(&id);
                 }
-                Err(e) => warn!(error=?e, %key, "counter flush failed; re-buffering deltas"),
+                Err(e) => {
+                    self.flush_failed.store(true, Ordering::Relaxed);
+                    warn!(error=?e, %key, "counter flush failed; re-buffering deltas");
+                }
             }
         }
     }
@@ -780,10 +801,7 @@ impl Counters {
         for (bucket, keys) in buckets {
             let leaf = dest.entry(bucket).or_default();
             for (k, v) in keys {
-                if !leaf.contains_key(&k) {
-                    *n_keys += 1;
-                }
-                *leaf.entry(k).or_insert(0) += v;
+                tally(leaf, n_keys, self.cfg.max_keys, &k, v);
             }
         }
     }
@@ -807,9 +825,12 @@ impl Counters {
     /// Freeze and mirror are one pass on purpose: it costs exactly **one LIST per
     /// bucket** for both, so a bucket that has gone dark stalls the leader's tick
     /// for one hung round trip rather than two.
-    pub async fn compact(&self, peers: &[Box<dyn ObjectStore>]) {
+    ///
+    /// Returns how many segments it deleted unsummed because their day-shard was
+    /// already frozen on that bucket — see `compact_bucket`.
+    pub async fn compact(&self, peers: &[Box<dyn ObjectStore>]) -> u64 {
         let Some(selector) = self.store.as_deref() else {
-            return;
+            return 0;
         };
         let store = selector.pin();
         let today = OffsetDateTime::now_utc().date();
@@ -823,18 +844,20 @@ impl Counters {
         // compacting it twice in one pass would re-list a tree it has swept.
         let mut mesh: Vec<(&dyn ObjectStore, std::collections::HashSet<String>)> = Vec::new();
         let mut done: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut discarded = 0u64;
         for bucket in std::iter::once(store.as_ref()).chain(peers.iter().map(|p| p.as_ref())) {
             if !done.insert(bucket.bucket().to_string()) {
                 continue;
             }
             if let Some(rollups) = self
-                .compact_bucket(bucket, &close_cutoff, &retain_cutoff)
+                .compact_bucket(bucket, &close_cutoff, &retain_cutoff, &mut discarded)
                 .await
             {
                 mesh.push((bucket, rollups));
             }
         }
         reseed_rollups(&mesh, &retain_cutoff).await;
+        discarded
     }
 
     /// One bucket's whole compaction, in isolation: its segments, its rollups,
@@ -846,6 +869,7 @@ impl Counters {
         store: &dyn ObjectStore,
         close_cutoff: &str,
         retain_cutoff: &str,
+        discarded: &mut u64,
     ) -> Option<std::collections::HashSet<String>> {
         let name = store.bucket();
         let keys = match store.list(PREFIX).await {
@@ -881,8 +905,25 @@ impl Counters {
                 .frozen
                 .contains(&(metric.clone(), day.clone(), *shard))
             {
-                // Already frozen here: a crash left stragglers — sweep, never recompute.
-                let _ = store.delete(seg_keys).await;
+                // Already frozen here, and a frozen rollup is immutable (peers
+                // copy it if absent), so these are swept, never summed. Either a
+                // crash between the freeze and its sweep left them (already
+                // counted), or a node flushed them after the day froze — a flush
+                // over a day late — and their counts are lost. Counted only once
+                // the delete lands, so a failed one retried next pass is not
+                // counted twice.
+                match store.delete(seg_keys).await {
+                    Ok(()) => {
+                        *discarded += seg_keys.len() as u64;
+                        warn!(
+                            bucket=%name, %metric, %day, %shard, segments=seg_keys.len(),
+                            "counter segments found for a day already rolled up were discarded unsummed: a node flushed over a day late (or a rollup was interrupted before its sweep, and they were already counted)"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(error=?e, bucket=%name, %metric, %day, %shard, "counter compaction: sweeping segments of an already rolled-up day failed; a later pass retries")
+                    }
+                }
                 continue;
             }
             match sum_segments(store, seg_keys).await {
@@ -1528,6 +1569,8 @@ mod tests {
         /// PUTs left before every further PUT hangs forever — a bucket gone
         /// dark mid-flush, the case the worker escapes by cancelling.
         puts_before_hang: Arc<AtomicUsize>,
+        /// Deletes fail transiently while everything else works.
+        fail_delete: Arc<AtomicBool>,
     }
     impl Default for MemStore {
         fn default() -> Self {
@@ -1542,6 +1585,7 @@ mod tests {
                 up: Arc::new(AtomicBool::new(true)),
                 fail_get: Arc::default(),
                 puts_before_hang: Arc::new(AtomicUsize::new(usize::MAX)),
+                fail_delete: Arc::default(),
             }
         }
         fn hang_after_puts(&self, n: usize) {
@@ -1605,6 +1649,10 @@ mod tests {
         }
         async fn delete(&self, keys: &[String]) -> anyhow::Result<()> {
             self.down()?;
+            anyhow::ensure!(
+                !self.fail_delete.load(Ordering::SeqCst),
+                "injected delete failure"
+            );
             let mut o = self.objects.lock().unwrap();
             for k in keys {
                 o.remove(k);
@@ -1832,6 +1880,129 @@ mod tests {
         c.flush().await;
         assert_eq!(store.len(), 2);
         assert_eq!(pending_total(&c), 0);
+    }
+
+    #[tokio::test]
+    async fn rebuffer_never_exceeds_the_key_cap() {
+        // A flush takes the whole buffer, so while its PUTs hang the live buffer
+        // refills to the cap; handing the taken keys back must fold the excess
+        // into the overflow aggregate, not grow the map past the cap.
+        let store = MemStore::default();
+        let c = engine(
+            store.clone(),
+            Config {
+                max_keys: 4,
+                ..Config::default()
+            },
+        );
+        for i in 0..4 {
+            c.record("downloads", &format!("old/old-{i}.whl"));
+        }
+        store.hang_after_puts(0);
+        {
+            use futures::FutureExt;
+            let mut f = Box::pin(c.flush());
+            assert!((&mut f).now_or_never().is_none(), "the flush must block");
+            for i in 0..4 {
+                c.record("downloads", &format!("new/new-{i}.whl"));
+            }
+        } // the hung flush is dropped here and re-buffers what it took
+
+        let guard = c.pending.lock().unwrap();
+        assert_eq!(guard.n_keys, 4, "the cap holds through a re-buffer");
+        let leaves: BTreeMap<String, u64> = guard
+            .segs
+            .values()
+            .flat_map(|b| b.values())
+            .flat_map(|leaf| leaf.iter().map(|(k, v)| (k.clone(), *v)))
+            .fold(BTreeMap::new(), |mut m, (k, v)| {
+                *m.entry(k).or_insert(0) += v;
+                m
+            });
+        drop(guard);
+        for i in 0..4 {
+            assert_eq!(
+                leaves[&format!("new/new-{i}.whl")],
+                1,
+                "live keys keep their names"
+            );
+            assert!(!leaves.contains_key(&format!("old/old-{i}.whl")));
+        }
+        assert_eq!(
+            leaves[OVERFLOW_KEY], 4,
+            "re-buffered keys past the cap fold"
+        );
+        assert_eq!(pending_total(&c), 8, "no event is lost");
+    }
+
+    #[tokio::test]
+    async fn a_failed_flush_does_not_pull_the_next_one_early() {
+        // Past the high-water mark every record would otherwise re-arm an early
+        // flush against the failing bucket; it waits for the interval instead.
+        let store = MemStore::default();
+        let c = engine(
+            store.clone(),
+            Config {
+                max_keys: 5, // high-water mark: 4 keys
+                ..Config::default()
+            },
+        );
+        for i in 0..4 {
+            c.record("downloads", &format!("a/a-{i}.whl"));
+        }
+        assert!(c.flush_due());
+        store.set_up(false);
+        c.flush().await;
+        c.record("downloads", "a/a-0.whl");
+        assert!(!c.flush_due(), "a failed flush holds off the early trigger");
+
+        store.set_up(true);
+        c.flush().await; // the interval flush
+        assert_eq!(pending_total(&c), 0);
+        for i in 0..4 {
+            c.record("downloads", &format!("b/b-{i}.whl"));
+        }
+        assert!(c.flush_due(), "a successful flush re-enables it");
+    }
+
+    #[tokio::test]
+    async fn a_segment_landing_after_its_day_froze_is_counted_as_discarded() {
+        let store = MemStore::named("s3://a");
+        let past = day_str(
+            OffsetDateTime::now_utc()
+                .date()
+                .saturating_sub(time::Duration::days(3)),
+        );
+        let seg = |n: u32| format!("{SEG_PREFIX}downloads/{past}/r/inc-{n}.json");
+        store
+            .put(&seg(0), seg_bytes("requests/r-1.0.whl", 5))
+            .await
+            .unwrap();
+        let c = engine(store.clone(), Config::default());
+        assert_eq!(c.compact(&[]).await, 0, "a first freeze discards nothing");
+
+        // A node that could not flush for days lands its segment now.
+        store
+            .put(&seg(1), seg_bytes("requests/r-1.0.whl", 2))
+            .await
+            .unwrap();
+        store.fail_delete.store(true, Ordering::SeqCst);
+        assert_eq!(c.compact(&[]).await, 0, "a failed sweep counts nothing");
+        store.fail_delete.store(false, Ordering::SeqCst);
+        assert_eq!(c.compact(&[]).await, 1);
+        assert!(store.get(&seg(1)).await.unwrap().is_none(), "swept");
+        assert_eq!(c.compact(&[]).await, 0, "never counted twice");
+
+        let day = time::Date::parse(
+            &past,
+            time::macros::format_description!("[year]-[month]-[day]"),
+        )
+        .unwrap();
+        let series = c.query_package("downloads", "requests", day, day).await;
+        assert_eq!(
+            series[&past]["r-1.0.whl"], 5,
+            "the frozen total is unchanged"
+        );
     }
 
     #[tokio::test]

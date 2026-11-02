@@ -7,8 +7,10 @@ the real binary: upload -> download -> flush -> query."""
 
 from __future__ import annotations
 
+import json
 import re
 import time
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
@@ -357,3 +359,45 @@ def test_redirected_download_of_a_missing_file_counts_nothing(
     time.sleep(2.5)
     stats = _stats(base, pkg)
     assert stats["total"] == 1, f"a re-minted fake stays out of the store: {stats}"
+
+
+def _segment(key: str, count: int) -> str:
+    return json.dumps({"resolution_secs": 86400, "buckets": {"00:00": {key: count}}})
+
+
+def _discarded(base_url: str) -> int:
+    code, body, _ = http_get(f"{base_url}/metrics")
+    assert code == 200
+    m = re.search(r"^pypiron_counter_segments_discarded_total (\d+)$", body.decode(), re.MULTILINE)
+    assert m, body.decode()
+    return int(m.group(1))
+
+
+def test_counts_landing_after_their_day_is_totalled_show_on_metrics(
+    disk_server_fast_rollup,
+):
+    """A node that could not write its counts for over a day lands them after
+    the day was rolled up: they are discarded, never silently."""
+    server = disk_server_fast_rollup
+    base = server["base_url"]
+    day = (datetime.now(timezone.utc).date() - timedelta(days=3)).isoformat()
+    seg_dir = server["data_dir"] / "_counters" / "seg" / "downloads" / day / "l"
+    seg_dir.mkdir(parents=True)
+    key = "latecount/latecount-1.0-py3-none-any.whl"
+
+    (seg_dir / "injected-0.json").write_text(_segment(key, 5))
+    rollup_dir = server["data_dir"] / "_counters" / "day" / "downloads" / day
+    deadline = time.monotonic() + 15
+    while not list(rollup_dir.glob("l@*.json")) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert list(rollup_dir.glob("l@*.json")), "the past day was rolled up"
+    assert _discarded(base) == 0
+
+    late = seg_dir / "injected-1.json"
+    late.write_text(_segment(key, 2))
+    deadline = time.monotonic() + 15
+    while late.exists() and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert not late.exists(), "the late batch was swept"
+    assert _discarded(base) == 1
+    assert _stats(base, "latecount")["total"] == 5

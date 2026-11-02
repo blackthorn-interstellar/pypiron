@@ -152,6 +152,10 @@ pub struct Metrics {
     /// the download. The request log shows these as 200s (the status went out
     /// before the body ran), so this counter is the only place they surface.
     pub proxy_stream_aborts: AtomicU64,
+    /// Download-count segments the rollup deleted unsummed because their day
+    /// was already totalled: a node flushed over a day late (lost counts), or a
+    /// rollup crashed before its sweep (already counted).
+    pub counter_segments_discarded: AtomicU64,
     /// requests by project attribution tag and route group. A mutex, not
     /// atomics: only requests that carry credentials touch it, and the
     /// critical section is one map bump.
@@ -537,6 +541,11 @@ impl Metrics {
                 "pypiron_proxy_stream_aborts_total",
                 "Streamed cold-miss downloads cut off mid-body after the 200.",
                 &self.proxy_stream_aborts,
+            ),
+            (
+                "pypiron_counter_segments_discarded_total",
+                "Download-count batches discarded because their day was already rolled up (a node flushed over a day late, or an interrupted rollup left them).",
+                &self.counter_segments_discarded,
             ),
         ] {
             emit_counter(&mut out, name, help, value.load(Ordering::Relaxed));
@@ -971,6 +980,7 @@ mod tests {
         assert!(text.contains("pypiron_audit_packages_skipped_total 0"));
         assert!(text.contains("pypiron_global_cas_conflicts_total 0"));
         assert!(text.contains("pypiron_stale_intents_healed_total 0"));
+        assert!(text.contains("pypiron_counter_segments_discarded_total 0"));
         assert!(text.contains("# TYPE pypiron_audit_last_duration_seconds gauge"));
         assert!(text.contains("pypiron_audit_last_duration_seconds 0"));
         // No project traffic recorded: the family is omitted entirely.

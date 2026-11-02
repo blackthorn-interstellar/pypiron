@@ -830,15 +830,17 @@ pub async fn run_worker_until(
         // fires on the interval or early when the buffer hits its high-water mark.
         // Losing the race to a bucket switch only defers the counts: the
         // cancelled flush re-buffers them and the next tick writes them to the
-        // newly selected bucket.
+        // newly selected bucket. The interval runs from when a flush ENDS, so
+        // a PUT that hangs past the interval before failing is not retried at
+        // once (a failed flush also stops the high-water trigger until then).
         if last_counter_flush.is_none_or(|t| t.elapsed() >= state.counters.flush_interval())
             || state.counters.flush_due()
         {
-            last_counter_flush = Some(Instant::now());
             tokio::select! {
                 _ = state.counters.flush() => {}
                 _ = wait_until_generation_changes(&state, selected.generation) => {}
             }
+            last_counter_flush = Some(Instant::now());
             // Drop the per-package /stats cache now that this node's own writes are
             // in the store, so a same-node poll reads its own just-flushed counts
             // (the TTL bounds other nodes). Off the hot path, once per flush.
@@ -1158,7 +1160,11 @@ pub async fn run_worker_until(
                 tokio::spawn(async move {
                     let _guard = guard;
                     let peers = job_state.counter_rollup_peers(primary_index);
-                    job_state.counters.compact(&peers).await;
+                    let discarded = job_state.counters.compact(&peers).await;
+                    job_state
+                        .metrics
+                        .counter_segments_discarded
+                        .fetch_add(discarded, Ordering::Relaxed);
                 });
             }
             // The tick can run many seconds on S3 with a backlog. Race it against

@@ -615,9 +615,16 @@ artifact gets a real sidecar from `worker::backfill_sidecar`, while a bare
 sidecar has no repairer and simply waits for the next writer to take the still-
 free immutable key with different bytes. So every writer that owns the artifact
 key's conditional create lands the bytes first: both upload origins and the
-streaming replication copy. The server-side copy transport is the one exemption
+streaming replication copy. The server-side copy transport is one exemption
 and stays sidecar-first, because its copy verb has no create-if-absent and a
-pre-check is the only gate it can have; `supersede_record`, which replaces rather
+pre-check is the only gate it can have. The proxy cache fill is the other: it
+types the record before its bytes, because an untyped orphan body could later be
+backfilled as private truth, and it publishes the body only after its sidecar
+stands. A sidecar already standing there (a crashed, cancelled or refused fill,
+a peer's copy whose body never landed) is adopted only when it names the same
+mirror sha256 and size, merged by the same-sha rule (`sidecar_merge`) under a
+conditional write; anything else refuses the fill and is left for the audit's
+orphan sweep. `supersede_record`, which replaces rather
 than creates, brackets its body-then-sidecar pair in a `.superseding` intent
 marker so a crash between the two is a recognizable torn record the next rebuild
 finishes. Pinned as a property of the write *sequence* in

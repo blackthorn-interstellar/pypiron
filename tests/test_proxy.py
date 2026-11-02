@@ -545,6 +545,82 @@ def test_deleted_mirror_file_reheals_within_presence_ttl(proxy_pair, tmp_path):
     assert cached.exists(), "the re-request must re-cache the artifact from upstream"
 
 
+def _interrupted_fill(proxy, pkg, wheel):
+    """Fill `wheel` through the proxy once, then delete the body and its PEP 658
+    companion, leaving only the sidecar: what a crashed, cancelled or refused
+    fill leaves behind. One GET only, so the warm-hit presence cache stays cold.
+    Returns (url, body path, sidecar path, sidecar bytes as the fill wrote them)."""
+    url = f"{proxy['base_url']}/files/{pkg}/{wheel.name}"
+    code, _, _ = http_get(url)
+    assert code == 200
+    body = proxy["data_dir"] / "packages" / pkg / wheel.name
+    sidecar = body.with_name(wheel.name + ".meta.json")
+    original = sidecar.read_bytes()
+    body.unlink()
+    with contextlib.suppress(FileNotFoundError):
+        body.with_name(wheel.name + ".metadata").unlink()
+    return url, body, sidecar, original
+
+
+def _drift(original: bytes, ours_should_win: bool) -> bytes:
+    """`original` with only its upload-time changed, picked so the same-sha merge's
+    digest tie-break goes the requested way (the smaller sha256 wins)."""
+    doc = json.loads(original)
+    for day in range(1, 29):
+        when = f"2020-02-{day:02d}T00:00:00Z"
+        drifted = original.replace(doc["upload-time"].encode(), when.encode())
+        assert drifted != original
+        ours_wins = hashlib.sha256(original).digest() <= hashlib.sha256(drifted).digest()
+        if ours_wins == ours_should_win:
+            return drifted
+    raise AssertionError("no upload-time gave the wanted tie-break")
+
+
+def test_leftover_sidecar_with_drifted_metadata_does_not_block_a_fill(proxy_pair, tmp_path):
+    """A leftover sidecar naming the same mirror bytes as a new fill, but with
+    different metadata, used to make every later fill of that file download it,
+    refuse, and 404 until the daily audit swept the orphan. It is now merged by
+    the same-sha rule replication uses, and the fill goes on. A leftover naming
+    different bytes is still refused and left untouched."""
+    upstream, proxy = proxy_pair["upstream"], proxy_pair["proxy"]
+    pkg = "leftover"
+    wheels = [make_wheel(pkg, v, tmp_path) for v in ("1.0", "2.0", "3.0")]
+    for wheel in wheels:
+        _upload(upstream, wheel, pkg)
+
+    # Our sidecar wins the tie-break: the leftover is replaced with ours.
+    url, body, sidecar, original = _interrupted_fill(proxy, pkg, wheels[0])
+    sidecar.write_bytes(_drift(original, ours_should_win=True))
+    code, got, _ = http_get(url)
+    assert code == 200, "a same-bytes leftover sidecar must not block the fill"
+    assert hashlib.sha256(got).hexdigest() == sha256_file(wheels[0])
+    assert body.exists()
+    assert sidecar.read_bytes() == original
+
+    # The leftover ranks higher (a local yank epoch): it stays, the fill goes on.
+    url, body, sidecar, original = _interrupted_fill(proxy, pkg, wheels[1])
+    standing = json.loads(original)
+    standing["yank-epoch"] = 1
+    standing_bytes = json.dumps(standing, separators=(",", ":")).encode()
+    sidecar.write_bytes(standing_bytes)
+    code, got, _ = http_get(url)
+    assert code == 200
+    assert hashlib.sha256(got).hexdigest() == sha256_file(wheels[1])
+    assert body.exists()
+    assert sidecar.read_bytes() == standing_bytes, "the higher-ranked leftover must stay"
+
+    # Different bytes: not ours to replace. Refused, and nothing is written.
+    url, body, sidecar, original = _interrupted_fill(proxy, pkg, wheels[2])
+    other = json.loads(original)
+    other["sha256"] = "0" * 64
+    other_bytes = json.dumps(other, separators=(",", ":")).encode()
+    sidecar.write_bytes(other_bytes)
+    code, _, _ = http_get(url)
+    assert code == 404
+    assert not body.exists()
+    assert sidecar.read_bytes() == other_bytes
+
+
 def test_proxy_persists_upstream_quarantine_status(proxy_pair, tmp_path):
     """The proxy relayed upstream PEP 792 status only into its in-memory listing,
     so a lockfile-pinned `/files/` URL served cached bytes of an upstream-

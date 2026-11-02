@@ -1310,7 +1310,9 @@ impl Proxy {
         };
         // Type the record before its artifact can exist. An orphan sidecar is
         // inert; an orphan artifact would be backfilled from a later private
-        // package claim and launder public bytes into private truth.
+        // package claim and launder public bytes into private truth. A sidecar
+        // already standing (a crashed or refused earlier fill, a peer's copy) is
+        // adopted only when it names these exact mirror bytes.
         let sidecar_key = sidecar_key(key);
         let sidecar_bytes = serde_json::to_vec(&sidecar)?;
         if !storage
@@ -1320,12 +1322,10 @@ impl Proxy {
                 Some("application/json"),
             )
             .await?
+            && !adopt_standing_sidecar(storage, &sidecar_key, &sidecar, &sidecar_bytes).await?
         {
-            let existing = storage.get_bytes(&sidecar_key).await?;
-            if existing != sidecar_bytes {
-                intent.commit().await?;
-                return Ok(false);
-            }
+            intent.commit().await?;
+            return Ok(false);
         }
 
         // Pre-commit re-check: a slow download can
@@ -2013,6 +2013,46 @@ fn download_grace() -> Duration {
         .ok()
         .and_then(|v| v.parse::<u64>().ok())
         .map_or(DOWNLOAD_GRACE, Duration::from_secs)
+}
+
+/// May a fill proceed over a sidecar that already stands at `key`? A standing
+/// sidecar naming the same mirror bytes (sha256 and size) is the same record
+/// seen at another time — a leftover from a crashed, cancelled or refused fill,
+/// or a peer's copy whose body never landed — so it merges by the same-sha rule
+/// replication uses (DESIGN §6.5), under a conditional write, and the fill goes
+/// on. Anything else (different bytes, private or untyped, unparseable) is a
+/// conflict this fill does not own: refuse, and leave it untouched.
+async fn adopt_standing_sidecar(
+    storage: &dyn Storage,
+    key: &str,
+    ours: &Sidecar,
+    ours_bytes: &[u8],
+) -> Result<bool> {
+    let Some((bytes, etag)) = storage.get_with_etag(key).await? else {
+        return Ok(false); // swept meanwhile; the next request refills
+    };
+    if bytes == ours_bytes {
+        return Ok(true);
+    }
+    let Ok(current) = serde_json::from_slice::<Sidecar>(&bytes) else {
+        return Ok(false);
+    };
+    if current.origin.as_deref() != Some(origin::MIRROR)
+        || current.sha256 != ours.sha256
+        || current.size != ours.size
+    {
+        return Ok(false);
+    }
+    let mirror = Some(crate::replicate::Origin::Mirror);
+    if crate::replicate::sidecar_merge(ours, mirror, &current, mirror)
+        != crate::replicate::MergeChoice::A
+    {
+        return Ok(true); // the standing sidecar ranks at least as high
+    }
+    Ok(storage
+        .put_if_match(key, &etag, ours_bytes.to_vec())
+        .await?
+        .is_some())
 }
 
 /// Keep the listings cache bounded: first drop everything expired (those

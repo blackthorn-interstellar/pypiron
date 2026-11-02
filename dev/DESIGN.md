@@ -508,8 +508,9 @@ An ordered list of two or more bucket URIs — any mix of S3, GCS, and Azure —
 turns every non-selected bucket into a warm writable copy. Each node
 independently selects the first bucket its health view calls healthy. A request
 pins one immutable `(storage, generation)` at entry; a selection change affects
-only new work. Leases carry that generation, and audit checks it before every
-write batch, so authority never crosses a bucket switch.
+only new work. A selection switch drops every lease manager and starts fresh
+ones, and audit re-checks the pinned generation before every write batch, so
+authority never crosses a bucket switch.
 
 **An upload is durable on every reachable bucket before it is acknowledged.**
 The node's selected bucket is the serialization point — duplicate-filename 409s,
@@ -903,7 +904,9 @@ _advisories/report.json                  # the org audit: hosted (name, version)
                                          #   affects, joined with 30-day counters, ranked by installs.
                                          #   Served admin-gated at /audit + /audit.json. Both this and
                                          #   quarantined.json are DERIVED from the zip + corpus.
-_leader/lease.json                       # multi-node lease (holder, term, expires-at)
+_leader/lease.json                       # multi-node lease (holder, term, expires-at); an empty
+                                         #   holder = released at shutdown (a CAS over the holder's
+                                         #   own ETag, never a delete, so it cannot clobber a successor)
 _topology/stamp.json                     # multi-bucket only: fail-closed config check — a hash of the
                                          #   ordered bucket identities + operator topology generation,
                                          #   CAS-written/verified on every reachable bucket at startup.

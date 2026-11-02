@@ -265,6 +265,11 @@ async fn run_bucket_health_until(
 /// never saw false-failovers a live selected bucket whenever an audit or peer
 /// drain saturates the store for one second. Availability is the dedicated
 /// health loop's job (`probe_buckets`).
+///
+/// Cancelling the check does not cancel a PUT that already reached the store:
+/// a timed-out check may still have won or renewed the lease. The next
+/// completed check claims it. A node whose every check outlasts the deadline
+/// keeps renewing a lease it never acts on (private/ROADMAP.md).
 async fn bounded_lease_check(state: &AppState, bucket: usize, lease: &LeaseManager) -> bool {
     match timeout(BUCKET_HEALTH_IO_TIMEOUT, lease.is_leader()).await {
         Ok(is_leader) => is_leader,
@@ -790,19 +795,12 @@ pub async fn run_worker_until(
             }
             authority_generation = Some(selected.generation);
             if selected.storage.supports_leases() {
-                lease = Some(LeaseManager::new(
-                    selected.storage.clone(),
-                    state.lease_ttl,
-                    selected.generation,
-                ));
+                lease = Some(LeaseManager::new(selected.storage.clone(), state.lease_ttl));
             }
             for (index, handle) in state.buckets.handles().iter().enumerate() {
                 if index != selected.index && handle.storage.supports_leases() {
-                    warm_leases[index] = Some(LeaseManager::new(
-                        handle.storage.clone(),
-                        state.lease_ttl,
-                        selected.generation,
-                    ));
+                    warm_leases[index] =
+                        Some(LeaseManager::new(handle.storage.clone(), state.lease_ttl));
                 }
             }
         }

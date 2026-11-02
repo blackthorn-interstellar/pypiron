@@ -41,10 +41,6 @@ pub(crate) const LEASE_KEY: &str = "_leader/lease.json";
 struct Lease {
     holder: String,
     term: u64,
-    /// Bucket selection generation under which this authority was acquired.
-    /// Legacy leases deserialize as generation zero.
-    #[serde(default)]
-    generation: u64,
     #[serde(rename = "expires-at")]
     expires_at: i64,
 }
@@ -54,11 +50,10 @@ pub struct LeaseManager {
     storage: Arc<dyn Storage>,
     holder: String,
     ttl_secs: i64,
-    generation: u64,
 }
 
 impl LeaseManager {
-    pub fn new(storage: Arc<dyn Storage>, ttl: Duration, generation: u64) -> Self {
+    pub fn new(storage: Arc<dyn Storage>, ttl: Duration) -> Self {
         let holder = format!(
             "{}-{}",
             std::process::id(),
@@ -68,7 +63,6 @@ impl LeaseManager {
             storage,
             holder,
             ttl_secs: ttl.as_secs().max(1) as i64,
-            generation,
         }
     }
 
@@ -106,7 +100,6 @@ impl LeaseManager {
                 // Corrupt lease: treat as expired and steal over its ETag.
                 holder: String::new(),
                 term: 0,
-                generation: 0,
                 expires_at: 0,
             },
         };
@@ -131,7 +124,10 @@ impl LeaseManager {
                 .put_if_match(LEASE_KEY, &etag, self.lease_json(current.term + 1, now))
                 .await?
                 .is_some();
-            if stolen {
+            if stolen && current.holder.is_empty() {
+                // Released at shutdown (or corrupt): a handover, not a theft.
+                info!(holder=%self.holder, term = current.term + 1, "lease acquired");
+            } else if stolen {
                 info!(holder=%self.holder, previous=%current.holder, term = current.term + 1, "lease stolen (expired or bogus expiry)");
             }
             return Ok(stolen);
@@ -140,24 +136,31 @@ impl LeaseManager {
         Ok(false)
     }
 
-    /// Best-effort release on graceful shutdown: delete the lease if we still
+    /// Best-effort release on graceful shutdown: expire the lease if we still
     /// hold it, so a restarted (or replacement) node becomes leader on its
     /// next tick instead of waiting out the TTL — without this, every restart
-    /// was a TTL-long window where uploads went unprocessed. The read-then-
-    /// delete race (a peer steals between the two) merely deletes the peer's
-    /// fresh lease; it re-creates it next tick. Sloppy by design.
+    /// was a TTL-long window where uploads went unprocessed. The release is a
+    /// conditional overwrite (empty holder, expired) against the ETag we read,
+    /// never a delete: the store has no conditional delete, and a peer that
+    /// took the lease in between must keep it.
     pub async fn release(&self) {
-        let held = match self.storage.get_with_etag(LEASE_KEY).await {
-            Ok(Some((bytes, _))) => serde_json::from_slice::<Lease>(&bytes)
-                .map(|l| l.holder == self.holder)
-                .unwrap_or(false),
-            _ => false,
+        let (term, etag) = match self.storage.get_with_etag(LEASE_KEY).await {
+            Ok(Some((bytes, etag))) => match serde_json::from_slice::<Lease>(&bytes) {
+                Ok(lease) if lease.holder == self.holder => (lease.term, etag),
+                _ => return,
+            },
+            _ => return,
         };
-        if held {
-            match self.storage.delete_keys(&[LEASE_KEY.to_string()]).await {
-                Ok(()) => info!(holder=%self.holder, "lease released on shutdown"),
-                Err(e) => warn!(error=?e, "failed to release lease on shutdown"),
-            }
+        let released = serde_json::to_vec(&Lease {
+            holder: String::new(),
+            term,
+            expires_at: 0,
+        })
+        .unwrap_or_default();
+        match self.storage.put_if_match(LEASE_KEY, &etag, released).await {
+            Ok(Some(_)) => info!(holder=%self.holder, "lease released on shutdown"),
+            Ok(None) => debug!("lease changed hands before release; left alone"),
+            Err(e) => warn!(error=?e, "failed to release lease on shutdown"),
         }
     }
 
@@ -165,7 +168,6 @@ impl LeaseManager {
         serde_json::to_vec(&Lease {
             holder: self.holder.clone(),
             term,
-            generation: self.generation,
             expires_at: now + self.ttl_secs,
         })
         .unwrap_or_default()
@@ -178,50 +180,63 @@ mod tests {
     use crate::storage::test_support::InMemStorage;
     use std::time::Duration;
 
+    async fn stored(storage: &InMemStorage) -> Lease {
+        serde_json::from_slice(&storage.get_bytes(LEASE_KEY).await.unwrap()).unwrap()
+    }
+
     #[tokio::test]
-    async fn release_deletes_own_lease_only() {
+    async fn release_expires_own_lease_only() {
         let storage = Arc::new(InMemStorage::default());
-        let lm = LeaseManager::new(storage.clone(), Duration::from_secs(30), 0);
+        let lm = LeaseManager::new(storage.clone(), Duration::from_secs(30));
         assert!(lm.is_leader().await, "first node acquires the lease");
         lm.release().await;
-        assert!(
-            storage.get_bytes(LEASE_KEY).await.is_err(),
-            "own lease must be deleted on release"
-        );
+        let released = stored(&storage).await;
+        assert_eq!((released.holder.as_str(), released.expires_at), ("", 0));
 
         // A foreign lease survives someone else's release.
-        let other = LeaseManager::new(storage.clone(), Duration::from_secs(30), 0);
+        let other = LeaseManager::new(storage.clone(), Duration::from_secs(30));
         assert!(other.is_leader().await);
-        let late = LeaseManager::new(storage.clone(), Duration::from_secs(30), 0);
+        let late = LeaseManager::new(storage.clone(), Duration::from_secs(30));
         assert!(!late.is_leader().await, "lease is held by `other`");
         late.release().await;
-        assert!(
-            storage.get_bytes(LEASE_KEY).await.is_ok(),
-            "a non-holder's release must not delete the lease"
+        assert_eq!(stored(&storage).await.holder, other.holder);
+    }
+
+    /// A peer that takes the lease between release's read and its write keeps
+    /// it. An unconditional delete here removed the peer's fresh lease, and the
+    /// leaderless gap that followed let any node start a second leadership.
+    #[tokio::test]
+    async fn release_never_clobbers_a_peers_fresh_lease() {
+        let storage = Arc::new(InMemStorage::default());
+        let a = LeaseManager::new(storage.clone(), Duration::from_secs(30));
+        assert!(a.is_leader().await);
+        let now = crate::clock::now_utc().unix_timestamp();
+        storage.write_after_read(
+            LEASE_KEY,
+            serde_json::to_vec(&Lease {
+                holder: "peer".into(),
+                term: 2,
+                expires_at: now + 30,
+            })
+            .unwrap(),
         );
+        a.release().await;
+        assert_eq!(stored(&storage).await.holder, "peer");
     }
 
     #[tokio::test]
     async fn released_lease_is_acquired_immediately_not_after_ttl() {
         let storage = Arc::new(InMemStorage::default());
-        let a = LeaseManager::new(storage.clone(), Duration::from_secs(3600), 0);
+        let a = LeaseManager::new(storage.clone(), Duration::from_secs(3600));
         assert!(a.is_leader().await);
+        let term = stored(&storage).await.term;
         a.release().await;
         // TTL is an hour; without release the successor would wait it out.
-        let b = LeaseManager::new(storage.clone(), Duration::from_secs(3600), 0);
+        let b = LeaseManager::new(storage.clone(), Duration::from_secs(3600));
         assert!(
             b.is_leader().await,
             "successor must acquire instantly after a graceful release"
         );
-    }
-
-    #[tokio::test]
-    async fn lease_records_the_selection_generation() {
-        let storage = Arc::new(InMemStorage::default());
-        let manager = LeaseManager::new(storage.clone(), Duration::from_secs(30), 7);
-        assert!(manager.is_leader().await);
-        let bytes = storage.get_bytes(LEASE_KEY).await.unwrap();
-        let lease: Lease = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(lease.generation, 7);
+        assert_eq!(stored(&storage).await.term, term + 1, "terms keep rising");
     }
 }

@@ -6,11 +6,13 @@ hands the lease to the survivor within the TTL and uploads keep flowing.
 
 from __future__ import annotations
 
+import json
+import time
 from contextlib import ExitStack, contextmanager
 
 import pytest
 
-from .conftest import _start_s3_server
+from .conftest import _start_s3_server, minio_get_key
 from .helpers import (
     download_pypi_wheel,
     get_index_json,
@@ -65,6 +67,33 @@ def test_leader_failover(minio, pypiron_bin, tmp_path_factory, tmp_path):
         )
         wait_for_file_in_index(server_b["simple"], PACKAGE, new_wheel.name, timeout=30.0)
         assert "lease stolen" in server_b["log_path"].read_text()
+
+
+def test_graceful_shutdown_hands_the_lease_over_at_once(minio, pypiron_bin, tmp_path_factory):
+    """A leader stopped gracefully hands its lease over: the survivor leads on
+    its next tick, not after the TTL, and the lease keeps counting up its term
+    rather than starting over."""
+    start = contextmanager(_start_s3_server)
+    env = {"PYPIRON_LEASE_TTL_SECS": "300", "PYPIRON_AUDIT_ON_BOOT": "false"}
+    with ExitStack() as stack:
+        server_a = stack.enter_context(start(tmp_path_factory, pypiron_bin, minio, extra_env=env))
+        server_b = stack.enter_context(start(tmp_path_factory, pypiron_bin, minio, extra_env=env))
+        deadline = time.monotonic() + 15.0
+        while "lease acquired" not in server_a["log_path"].read_text():
+            assert time.monotonic() < deadline, "first node never took the lease"
+            time.sleep(0.2)
+        assert "lease acquired" not in server_b["log_path"].read_text()
+
+        server_a["proc"].terminate()
+        server_a["proc"].wait(timeout=15.0)
+        assert "lease released on shutdown" in server_a["log_path"].read_text()
+
+        deadline = time.monotonic() + 15.0
+        while "lease acquired" not in server_b["log_path"].read_text():
+            assert time.monotonic() < deadline, "survivor waited out the TTL instead"
+            time.sleep(0.2)
+        lease = json.loads(minio_get_key(minio, "_leader/lease.json"))
+        assert lease["holder"] and lease["term"] == 2, lease
 
 
 def test_wait_on_upload_is_visible_on_a_warm_follower(

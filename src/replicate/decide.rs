@@ -249,6 +249,28 @@ pub fn classify_record(r: &Record) -> RecordState {
     }
 }
 
+/// Whether a filename's `.tombstone` and `.frozen` markers alone settle it as
+/// deleted, whatever else stands beside them. The upload fence and the
+/// single-bucket file route HEAD just those two markers and ask this; the
+/// index renderer asks it to skip a sidecar read no answer could depend on.
+pub fn fenced_by_markers(tombstoned: bool, frozen: bool) -> bool {
+    let markers = Record {
+        sidecar: None,
+        has_artifact: false,
+        has_metadata: false,
+        has_provenance: false,
+        tombstoned,
+        frozen,
+        mirror_quarantined: false,
+        superseding: false,
+        pkg_origin: None,
+    };
+    matches!(
+        classify_record(&markers),
+        RecordState::Frozen { .. } | RecordState::Tombstoned { .. }
+    )
+}
+
 /// Whether an index lists this record: live and not a late mirror. The one
 /// rule the renderer and the sidecar edits share, so an edit is never acked
 /// for a file no index shows. `claim` is the package's origin claim.
@@ -1624,11 +1646,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// The consumers of a record — the index renderer ([`listed`]), the
-    /// upload fence and the single-bucket file route (a `.tombstone` or
-    /// `.frozen` HEAD), the yank and timestamp repair
-    /// ([`crate::publish::edit_refusal`]) and the merge ([`decide`]) — agree
-    /// on every combination of facts.
+    /// The consumers of a record — the index renderer ([`listed`], and its
+    /// sidecar-skip shortcut), the upload fence and the single-bucket file
+    /// route (all three via [`fenced_by_markers`]), the yank and timestamp
+    /// repair ([`crate::publish::edit_refusal`]) and the merge ([`decide`]) —
+    /// agree on every combination of facts. Each is called, not restated: the
+    /// I/O around them (which markers get HEADed) is the blackbox suite's.
     #[test]
     fn every_consumer_agrees_on_every_record() {
         use crate::publish::{edit_refusal, SidecarEdit};
@@ -1659,9 +1682,10 @@ pub(crate) mod tests {
             let shown = listed(&r, claim);
             let deleted = matches!(state, Frozen { .. } | Tombstoned { .. });
 
-            // The upload fence and the single-bucket file route HEAD exactly
-            // `.tombstone` and `.frozen`: they bar what the merge calls deleted.
-            assert_eq!(r.tombstoned || r.frozen, deleted, "{r:?}");
+            // The upload fence and the single-bucket file route, over the two
+            // markers they HEAD, bar exactly what the merge calls deleted.
+            let fenced = fenced_by_markers(r.tombstoned, r.frozen);
+            assert_eq!(fenced, deleted, "{r:?}");
             // A fence is never invisible. Freeze and tombstone dominate every
             // sidecar; a demotion fence yields only to a sidecar that itself
             // says private — never to the claim's fallback.
@@ -1680,15 +1704,13 @@ pub(crate) mod tests {
             }
             // The renderer skips the sidecar read when the markers alone say
             // deleted; that is only sound if no sidecar could change the answer.
-            let markers_only = Record {
-                sidecar: None,
-                ..r.clone()
-            };
-            if matches!(
-                classify_record(&markers_only),
-                Frozen { .. } | Tombstoned { .. }
-            ) {
+            if fenced {
                 assert!(deleted && !shown, "{r:?}");
+                let unread = Record {
+                    sidecar: None,
+                    ..r.clone()
+                };
+                assert!(!listed(&unread, claim), "{r:?}");
             }
             // The rebuild backfills only a `Bare` body: never under any fence.
             if state == Bare {

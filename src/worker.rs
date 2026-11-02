@@ -4235,12 +4235,7 @@ async fn load_file_metadata(
     // A delete or freeze hides the file whatever its sidecar says (a law the
     // classifier's tests pin), so a fenced body is never read for nothing.
     let mut rec = record(None);
-    if has(SIDECAR_SUFFIX)
-        && !matches!(
-            classify_record(&rec),
-            RecordState::Tombstoned { .. } | RecordState::Frozen { .. }
-        )
-    {
+    if has(SIDECAR_SUFFIX) && !crate::replicate::fenced_by_markers(rec.tombstoned, rec.frozen) {
         let sc = match memo.known {
             Some(sc) => sc.clone(),
             None => match read_listed_sidecar(storage, &entry.key).await? {

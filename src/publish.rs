@@ -1023,7 +1023,7 @@ pub async fn publish_record(
         storage.head_exists(&frozen_key(&key)),
     )
     .await
-    .map(|(tombstoned, frozen)| tombstoned || frozen);
+    .map(|(tombstoned, frozen)| replicate::fenced_by_markers(tombstoned, frozen));
     match filename_fenced {
         Ok(false) => {}
         Ok(true) => {
@@ -1811,11 +1811,12 @@ async fn edit_sidecar(
                 }
             };
             if !changed {
-                if matches!(edit, SidecarEdit::Yank(_)) {
+                if matches!(edit, SidecarEdit::Yank(_)) && !state.buckets.is_multi() {
                     return Ok(false);
                 }
-                // Retrying an acknowledged local edit must still heal replication
-                // if its previous fan-out failed, without consuming another epoch.
+                // Retrying an edit that already landed here must still heal
+                // replication if its previous fan-out never ran or failed,
+                // without consuming another epoch.
                 record_origin = sc.origin.clone();
                 wrote = true;
                 break;
@@ -1840,8 +1841,16 @@ async fn edit_sidecar(
                     wrote = true;
                     // The fences are separate objects no sidecar CAS covers: a
                     // delete or freeze that landed since the check above must
-                    // not be acked — or fanned out — as a successful edit.
-                    check_editable(storage, pkg, &key, &sc, &edit).await?;
+                    // not be acked — or fanned out — as a successful edit. An
+                    // unreadable fence is no such refusal: the check before the
+                    // write passed, and aborting now would leave the edit landed
+                    // here with no fan-out to carry it to the peers.
+                    match check_editable(storage, pkg, &key, &sc, &edit).await {
+                        Err((StatusCode::SERVICE_UNAVAILABLE, e)) => {
+                            warn!(error = %e, "metadata update: post-write fence check unreadable; fanning out");
+                        }
+                        refused => refused?,
+                    }
                     break;
                 }
                 Ok(None) => continue,

@@ -311,8 +311,9 @@ ENDPOINTS: list = [
         mutates=True,
         target="probe",
         # +1 read: the rebuild hashes the new wheel's `.metadata` for the index.
-        cold_ops={"read": 12, "write": 11, "list": 2, "delete": 1},
-        warm_ops={"read": 12, "write": 11, "list": 2, "delete": 1},
+        # +1 read: the post-create `.frozen` HEAD beside the tombstone's.
+        cold_ops={"read": 13, "write": 11, "list": 2, "delete": 1},
+        warm_ops={"read": 13, "write": 11, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -338,8 +339,10 @@ ENDPOINTS: list = [
         expect=(200, 201, 204),
         mutates=True,
         target="probe",
-        cold_ops={"read": 6, "write": 5, "list": 2, "delete": 1},
-        warm_ops={"read": 6, "write": 5, "list": 2, "delete": 1},
+        # +12 reads: the record (five fence/body HEADs and the claim) is
+        # checked before the sidecar CAS and again after it.
+        cold_ops={"read": 18, "write": 5, "list": 2, "delete": 1},
+        warm_ops={"read": 18, "write": 5, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -351,8 +354,10 @@ ENDPOINTS: list = [
         expect=(200, 204),
         mutates=True,
         target="probe",
-        cold_ops={"read": 6, "write": 5, "list": 2, "delete": 1},
-        warm_ops={"read": 6, "write": 5, "list": 2, "delete": 1},
+        # +12 reads: the record (five fence/body HEADs and the claim) is
+        # checked before the sidecar CAS and again after it.
+        cold_ops={"read": 18, "write": 5, "list": 2, "delete": 1},
+        warm_ops={"read": 18, "write": 5, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -364,11 +369,10 @@ ENDPOINTS: list = [
         body="upload_time",
         mutates=True,
         target="probe",
-        # Sidecar CAS/indexing like yank, plus the private origin, three
-        # suppression fences, and artifact-presence checks. The HTML Simple
-        # index contains no dates, so only the JSON index is rewritten.
-        cold_ops={"read": 11, "write": 4, "list": 2, "delete": 1},
-        warm_ops={"read": 11, "write": 4, "list": 2, "delete": 1},
+        # Sidecar CAS/indexing like yank, record checks included. The HTML
+        # Simple index contains no dates, so only the JSON index is rewritten.
+        cold_ops={"read": 18, "write": 4, "list": 2, "delete": 1},
+        warm_ops={"read": 18, "write": 4, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(

@@ -3670,3 +3670,55 @@ def test_refused_yank_does_not_stall_the_next_index_change(
         _eventually(yanked, timeout=15, what="yank visible in the index")
     finally:
         server_gen.close()
+
+
+@pytest.fixture()
+def s3_server_multi_no_backstop(tmp_path_factory, pypiron_bin, minio_two):
+    """Two buckets with the full-diff backstop a day away, so only the write
+    path's own fan-out can carry an edit to the peer within a test."""
+    yield from _start_s3_server(
+        tmp_path_factory,
+        pypiron_bin,
+        minio_two,
+        extra_env={"PYPIRON_RECONCILE_INTERVAL_SECS": "86400"},
+    )
+
+
+def test_retried_yank_reaches_the_peer_its_first_attempt_missed(
+    s3_server_multi_no_backstop, tmp_path
+):
+    """A yank can land on the selected bucket and fail before its fan-out (a
+    storage error in the fence check after the write). The client's retry finds
+    the sidecar already yanked, and used to answer 200 without fanning out, so
+    the peer served the file un-yanked until the daily full diff."""
+    server = s3_server_multi_no_backstop
+    minio = server["minio"]
+    pkg = "yankretry"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    _upload(server, wheel)
+    key = f"packages/{pkg}/{wheel.name}.meta.json"
+    selected = _selected_bucket(server)
+    (peer,) = [bucket for bucket in minio["buckets"] if bucket != selected]
+    _eventually(lambda: minio_key_exists_in(minio, peer, key), what="baseline copy")
+
+    # The first attempt's write, with nothing carrying it any further.
+    landed = {
+        **json.loads(minio_get_key_in(minio, selected, key)),
+        "yanked": "withdrawn",
+        "yank-epoch": 1,
+    }
+    minio_put_key_in(minio, selected, key, json.dumps(landed))
+
+    code, body, _ = http_request_auth(
+        "POST",
+        f"{server['base_url']}/files/{pkg}/{wheel.name}/yank",
+        username=server["user"],
+        password=server["password"],
+        data=b"withdrawn",
+    )
+    assert code == 200, body
+    _eventually(
+        lambda: json.loads(minio_get_key_in(minio, peer, key)).get("yanked") == "withdrawn",
+        timeout=15,
+        what="the retry carries the yank to the peer",
+    )

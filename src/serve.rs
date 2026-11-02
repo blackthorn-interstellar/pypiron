@@ -185,7 +185,7 @@ async fn single_bucket_file_visible(
         storage.head_exists(&frozen_key(artifact_key)),
     )
     .await?;
-    let visible = !tombstoned && !frozen;
+    let visible = !crate::replicate::fenced_by_markers(tombstoned, frozen);
     state
         .presign_cache
         .record_fence_verdict(artifact_key, visible, pinned.generation);

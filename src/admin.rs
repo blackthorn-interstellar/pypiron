@@ -711,7 +711,8 @@ pub(crate) async fn mint_token(
         ));
     }
 
-    let now = OffsetDateTime::now_utc().unix_timestamp();
+    // The clock `AppState::token_role` verifies against, so mint and expiry agree.
+    let now = crate::clock::now_utc().unix_timestamp();
     let claims = token::Claims {
         role,
         repo: clip_meta(req.repo),

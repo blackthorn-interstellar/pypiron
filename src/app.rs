@@ -696,14 +696,15 @@ impl AppState {
     /// None otherwise (no key, not a token request, bad/expired token) — fail
     /// closed. The `+tag` overlay is ignored here (`__token__+commit=…` still
     /// resolves to token mode); the token itself carries its attribution.
-    pub(crate) fn token_role(&self, headers: &HeaderMap) -> Option<token::Role> {
+    pub fn token_role(&self, headers: &HeaderMap) -> Option<token::Role> {
         let key = nonempty(self.token_signing_key.as_deref())?;
         let (user, pass) = basic_credentials(headers)?;
         let base = user.split_once('+').map_or(user.as_str(), |(b, _)| b);
         if base != token::TOKEN_USERNAME {
             return None;
         }
-        let now = OffsetDateTime::now_utc().unix_timestamp();
+        // The protocol clock, so the simulator can drive a token past its expiry.
+        let now = crate::clock::now_utc().unix_timestamp();
         token::verify(key, &pass, now).map(|c| c.role)
     }
 

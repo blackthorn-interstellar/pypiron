@@ -178,9 +178,12 @@ credentials cross an untrusted network.
   Wrong passwords sent at the same time share those five tries: once five are
   in flight, further logins from that address get `429` until one finishes.
   Repeating the same credential across parallel requests counts as one try.
-- If tens of thousands of addresses are locked out or mid-login at once, logins
-  from further addresses get `429` until that clears. Existing lockouts are
-  never forgotten.
+- Under a flood of failed logins from many addresses, new addresses are
+  grouped by network (IPv4 `/24`, then `/16`; IPv6 `/48`, then `/32`), so one
+  network's addresses share a single lockout and can't crowd out everyone
+  else. Only a flood from thousands of separate networks makes logins from
+  further networks get `429` until it subsides. Existing lockouts are never
+  forgotten.
 - Cross-site state-changing requests are rejected, and every response includes
   `X-Content-Type-Options: nosniff`.
 - Client-supplied forwarding headers are ignored unless `--trusted-proxy` is

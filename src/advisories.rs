@@ -729,8 +729,12 @@ pub struct RefreshCtx<'a> {
 /// state, so a failover starts a fresh conditional cycle harmlessly).
 #[derive(Default)]
 pub struct RefreshMemo {
-    /// The URL feed's last-seen ETag, for the next `If-None-Match`.
-    http_etag: Option<String>,
+    /// The URL feed's last-seen ETag and the sha256 of the bytes it named. Sent as
+    /// `If-None-Match` only while that sha is still the loaded snapshot's: a 304
+    /// means "you already have these bytes", which stops being true the moment a
+    /// failover or a failed reload leaves a different snapshot loaded — and then
+    /// the 304 would keep the newer bytes from ever being persisted again.
+    http_etag: Option<(String, String)>,
     /// Whether the source was failing on the previous tick (warn on transition).
     source_failing: bool,
     /// Whether we have already warned that blocking is armed but unfed, so the
@@ -904,17 +908,22 @@ async fn poll_and_persist(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut RefreshMe
     // FeedSource is cheap for a path; for a URL it rebuilds the client each tick,
     // which is negligible at the reconcile cadence.
     let source = FeedSource::new(feed)?;
-    let fetched = source.poll(memo.http_etag.as_deref()).await?;
+    let loaded_sha = AdvisoryState::read(ctx.slot).zip_sha256.clone();
+    let if_none_match = memo
+        .http_etag
+        .as_ref()
+        .filter(|(_, sha)| Some(sha) == loaded_sha.as_ref())
+        .map(|(etag, _)| etag.as_str());
+    let fetched = source.poll(if_none_match).await?;
     let (bytes, http_etag) = match fetched {
         RawFetch::NotModified => return Ok(()),
         RawFetch::Bytes { bytes, http_etag } => (bytes, http_etag),
     };
     // Remember the source's ETag only once these bytes are persisted (or already
     // loaded): a write that fails must be retried, not turned into a 304 forever.
-    let loaded_sha = AdvisoryState::read(ctx.slot).zip_sha256.clone();
     let sha = sha256_hex(&bytes);
     if Some(&sha) == loaded_sha.as_ref() {
-        memo.http_etag = http_etag;
+        memo.http_etag = http_etag.map(|etag| (etag, sha));
         return Ok(());
     }
     // Validate before persisting — the storage copy is what every node loads. The
@@ -933,7 +942,7 @@ async fn poll_and_persist(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut RefreshMe
     )
     .await
     .context("persisting advisory snapshot")?;
-    memo.http_etag = http_etag;
+    memo.http_etag = http_etag.map(|etag| (etag, sha));
     Ok(())
 }
 
@@ -1061,7 +1070,11 @@ async fn reseed_key_if_absent(
 }
 
 /// Every-node half: reload the in-memory snapshot when `FEED_KEY`'s storage etag
-/// has moved. Returns whether a new snapshot was swapped in.
+/// has moved. Returns whether a new snapshot was swapped in. The same bytes under
+/// a new etag — a leader re-seeding a failed-over bucket, a rewrite — adopt the
+/// etag and nothing else: clearing the probe overlay for them would drop every
+/// malware rule the probe applied ahead of this baseline, and the probe only
+/// re-backfills when the baseline's sha actually changes.
 async fn reload(ctx: &RefreshCtx<'_>) -> Result<bool> {
     let Some(etag) = feed_storage_etag(ctx.storage).await? else {
         return Ok(false);
@@ -1077,6 +1090,13 @@ async fn reload(ctx: &RefreshCtx<'_>) -> Result<bool> {
     // is carried forward instead of clobbered — the two swaps each preserve the
     // other's field.
     let mut guard = ctx.slot.write().unwrap_or_else(|p| p.into_inner());
+    if guard.zip_sha256.as_ref() == Some(&sha) {
+        *guard = Arc::new(AdvisoryState {
+            storage_etag: Some(etag),
+            ..(**guard).clone()
+        });
+        return Ok(false);
+    }
     *guard = Arc::new(AdvisoryState {
         db: Some(db),
         zip_sha256: Some(sha),

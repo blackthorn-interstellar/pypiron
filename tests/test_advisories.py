@@ -1766,6 +1766,10 @@ class _FeedControl:
         with self._st.lock:
             self._st.broken.pop(adv_id, None)
 
+    def zip_bytes(self) -> bytes:
+        with self._st.lock:
+            return self._st.zip_bytes
+
     def count(self, method: str, needle: str) -> int:
         with self._st.lock:
             return sum(1 for (m, p) in self._st.log if m == method and needle in p)
@@ -1882,6 +1886,86 @@ def test_probe_blocks_new_mal_ahead_of_daily_feed(tmp_path_factory, pypiron_bin,
             assert _poll_http_status(file_url, {200, 302}, timeout=30), (
                 "withdrawal never un-blocked the file"
             )
+
+
+def _replace_atomically(path: Path, data: bytes) -> None:
+    """Swap `path`'s bytes the way a storage write lands: tmp then rename."""
+    tmp = path.with_suffix(".swap")
+    tmp.write_bytes(data)
+    os.replace(tmp, path)
+
+
+def test_a_failover_onto_an_older_snapshot_is_repaired_from_the_source(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """A leader whose stored snapshot is swapped for an older copy under it — a
+    failover onto a bucket whose write-through failed, stood in for by replacing
+    the stored zip — fetches the source again and puts the newer bytes back. It
+    used to send its remembered ETag, take the 304 as "already have it", and serve
+    the older snapshot until the source itself changed."""
+    pkg, ver = "failovermal", "1.0.0"
+    mal_id = "MAL-2024-93001"
+    newer = {**_baseline_records(), mal_id: _mal_record(mal_id, pkg, ver, "2024-06-01T00:00:00Z")}
+    older = make_osv_zip(tmp_path / "older.zip", _baseline_records()).read_bytes()
+    with _probe_feed_server(newer, tmp_path) as (feed_url, feed):
+        with advisory_server(
+            tmp_path_factory,
+            pypiron_bin,
+            feed_url,
+            # A fast leader poll, and no probe: it would re-apply the MAL from the
+            # per-advisory feed and hide whether the snapshot itself came back.
+            extra_args=["--reconcile-interval-secs", "1", "--malware-probe-secs", "0"],
+            extra_env=_DIRECT_EGRESS,
+        ) as server:
+            base = server["base_url"]
+            stored = _stored_feed_path(server)
+            served = feed.zip_bytes()
+            _wait_file_bytes(stored, served, timeout=20)
+            wheel = make_wheel(pkg, ver, tmp_path)
+            # Not awaited in the index: the loaded snapshot scrubs it from there.
+            _mirror_upload(server, wheel)
+            file_url = f"{base}/files/{pkg}/{wheel.name}"
+            assert _poll_http_status(file_url, {403}), "the newer snapshot never blocked"
+
+            _replace_atomically(stored, older)
+            _wait_file_bytes(stored, served, timeout=20)
+            assert _poll_http_status(file_url, {403}), "the block did not come back"
+            time.sleep(3)
+            assert stored.read_bytes() == served, "the older snapshot came back"
+
+
+def test_rewriting_the_same_snapshot_keeps_probe_blocks(tmp_path_factory, pypiron_bin, tmp_path):
+    """The same snapshot bytes landing again under a new storage version (a
+    leader re-seeding a bucket after a failover) is not a new baseline: a malware
+    advisory the probe applied ahead of it keeps blocking. Reloading used to clear
+    those blocks, and the probe — whose baseline had not changed — never put them
+    back until the advisory feed itself moved."""
+    pkg, ver = "reseedmal", "1.0.0"
+    mal_id = "MAL-2025-73001"
+    with _probe_feed_server(_baseline_records(), tmp_path) as (feed_url, feed):
+        with advisory_server(
+            tmp_path_factory,
+            pypiron_bin,
+            feed_url,
+            extra_args=["--reconcile-interval-secs", "1", "--malware-probe-secs", "1"],
+            extra_env=_DIRECT_EGRESS,
+        ) as server:
+            base = server["base_url"]
+            assert _poll_metric(base, "pypiron_malware_probe_age_seconds") is not None
+            wheel = make_wheel(pkg, ver, tmp_path)
+            _mirror_upload(server, wheel)
+            wait_for_file_in_index(server["simple"], pkg, wheel.name)
+            file_url = f"{base}/files/{pkg}/{wheel.name}"
+            feed.publish(_mal_record(mal_id, pkg, ver, "2025-01-01T00:00:00Z"))
+            assert _poll_http_status(file_url, {403}), "the probe never blocked the MAL"
+
+            stored = _stored_feed_path(server)
+            _replace_atomically(stored, stored.read_bytes())
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                code, _, _ = http_get(file_url)
+                assert code == 403, f"rewriting the same snapshot dropped the block ({code})"
+                time.sleep(0.2)
 
 
 def test_probe_skips_unreadable_mal_and_blocks_newer(tmp_path_factory, pypiron_bin, tmp_path):

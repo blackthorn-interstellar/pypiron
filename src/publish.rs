@@ -1610,7 +1610,7 @@ pub(crate) async fn upload_time_set(
     .await
 }
 
-enum SidecarEdit {
+pub(crate) enum SidecarEdit {
     Yank(Yanked),
     UploadTime { sha256: String, upload_time: String },
 }
@@ -1649,7 +1649,7 @@ async fn check_editable(
     sc: &Sidecar,
     edit: &SidecarEdit,
 ) -> Result<(), (StatusCode, String)> {
-    use replicate::{Origin, RecordState};
+    use replicate::Origin;
     use sidecar::{FROZEN_SUFFIX, MIRROR_QUARANTINED_SUFFIX, SUPERSEDING_SUFFIX, TOMBSTONE_SUFFIX};
     const PROBED: [&str; 5] = [
         "",
@@ -1681,9 +1681,20 @@ async fn check_editable(
         Some(sc.clone()),
         claim,
     );
-    let state = replicate::classify_record(&record);
-    if !replicate::listed(&record, claim) {
-        return Err(match state {
+    edit_refusal(&record, claim, edit).map_or(Ok(()), Err)
+}
+
+/// The decision half of [`check_editable`], over the record it read: why this
+/// edit is refused, or `None` when it may proceed.
+pub(crate) fn edit_refusal(
+    record: &replicate::Record,
+    claim: Option<replicate::Origin>,
+    edit: &SidecarEdit,
+) -> Option<(StatusCode, String)> {
+    use replicate::{Origin, RecordState};
+    let state = replicate::classify_record(record);
+    if !replicate::listed(record, claim) {
+        return Some(match state {
             RecordState::Absent { .. } | RecordState::Bare => {
                 (StatusCode::NOT_FOUND, "No such file".into())
             }
@@ -1697,7 +1708,7 @@ async fn check_editable(
         superseding: true, ..
     } = state
     {
-        return Err((
+        return Some((
             StatusCode::CONFLICT,
             "a replication repair is rewriting this file's metadata; retry".into(),
         ));
@@ -1712,12 +1723,12 @@ async fn check_editable(
                 }
             ))
     {
-        return Err((
+        return Some((
             StatusCode::CONFLICT,
             "timestamp repair requires a private artifact".into(),
         ));
     }
-    Ok(())
+    None
 }
 
 /// Both edits consume the observed sidecar with CAS and bump its existing

@@ -1316,8 +1316,10 @@ pub(crate) mod tests {
         }
     }
 
-    /// Every combination of objects × sidecar kind × claim, as records.
-    fn every_record() -> Vec<Record> {
+    /// Every combination of objects × sidecar kind × claim: the record, and
+    /// the claim its package holds (which `from_listing` keeps only as a
+    /// fallback origin, so a consumer that takes the claim needs it too).
+    fn every_record_with_claim() -> Vec<(Record, Option<Origin>)> {
         let sidecars = [
             None,
             Some(sc("x", PRIVATE, Yanked::Flag(false), 0)),
@@ -1335,11 +1337,18 @@ pub(crate) mod tests {
                 .collect();
             for sidecar in &sidecars {
                 for claim in [None, Some(Origin::Private), Some(Origin::Mirror)] {
-                    out.push(with(&present, sidecar.clone(), claim));
+                    out.push((with(&present, sidecar.clone(), claim), claim));
                 }
             }
         }
         out
+    }
+
+    fn every_record() -> Vec<Record> {
+        every_record_with_claim()
+            .into_iter()
+            .map(|(r, _)| r)
+            .collect()
     }
 
     #[test]
@@ -1566,5 +1575,199 @@ pub(crate) mod tests {
             &fenced(Some(sc("x", PRIVATE, Yanked::Flag(false), 0))),
             Some(Origin::Private)
         ));
+    }
+
+    /// dev/DESIGN.md's per-file record-state table, restated over raw facts.
+    /// Its rows must partition the fact space — exactly one row matches every
+    /// combination — and the matching row must be the classifier's answer.
+    #[test]
+    fn every_record_matches_exactly_one_design_row() {
+        use RecordState::*;
+        for (r, claim) in every_record_with_claim() {
+            let leftovers =
+                r.has_artifact || r.sidecar.is_some() || r.has_metadata || r.has_provenance;
+            let written = r.sidecar.as_ref().and_then(|s| s.origin.as_deref());
+            // A sidecar's own origin; the claim stands in only when it names none.
+            let origin = match written {
+                Some(name) => Origin::parse(name),
+                None if r.has_artifact => claim,
+                None => None,
+            };
+            let fenced = r.frozen || r.tombstoned;
+            let demoted = r.mirror_quarantined && written != Some(PRIVATE);
+            let body = r.has_artifact && !fenced && !demoted;
+            let rows = [
+                r.frozen.then_some(Frozen {
+                    settled: r.tombstoned && !leftovers && !r.mirror_quarantined,
+                }),
+                (r.tombstoned && !r.frozen).then_some(Tombstoned {
+                    settled: !leftovers && !r.mirror_quarantined,
+                }),
+                (demoted && !fenced).then_some(QuarantinedMirror {
+                    settled: !leftovers,
+                }),
+                (body && r.sidecar.is_some())
+                    .then_some(origin)
+                    .flatten()
+                    .map(|origin| Live {
+                        sha: "x".into(),
+                        origin,
+                        superseding: r.superseding,
+                    }),
+                (body && r.sidecar.is_none()).then_some(Bare),
+                (body && r.sidecar.is_some() && origin.is_none()).then_some(Untyped),
+                (!r.has_artifact && !fenced && !demoted).then_some(Absent { debris: leftovers }),
+            ];
+            let matched: Vec<RecordState> = rows.into_iter().flatten().collect();
+            assert_eq!(matched.len(), 1, "{r:?} matches {matched:?}");
+            assert_eq!(classify_record(&r), matched[0], "{r:?}");
+        }
+    }
+
+    /// The consumers of a record — the index renderer ([`listed`]), the
+    /// upload fence and the single-bucket file route (a `.tombstone` or
+    /// `.frozen` HEAD), the yank and timestamp repair
+    /// ([`crate::publish::edit_refusal`]) and the merge ([`decide`]) — agree
+    /// on every combination of facts.
+    #[test]
+    fn every_consumer_agrees_on_every_record() {
+        use crate::publish::{edit_refusal, SidecarEdit};
+        use axum::http::StatusCode;
+        use RecordState::*;
+
+        let edits = [
+            SidecarEdit::Yank(Yanked::Flag(true)),
+            SidecarEdit::UploadTime {
+                sha256: "x".into(),
+                upload_time: "t".into(),
+            },
+        ];
+        let empty = with(&[], None, None);
+        let peers = [
+            empty.clone(),
+            with(&[""], Some(sc("x", PRIVATE, Yanked::Flag(false), 0)), None),
+            with(&[""], Some(sc("y", PRIVATE, Yanked::Flag(false), 0)), None),
+            with(&[""], Some(sc("x", MIRROR, Yanked::Flag(false), 0)), None),
+            with(&[""], Some(sc("y", MIRROR, Yanked::Flag(false), 0)), None),
+            with(&[TOMBSTONE_SUFFIX], None, None),
+            with(&[FROZEN_SUFFIX, TOMBSTONE_SUFFIX], None, None),
+            with(&[MIRROR_QUARANTINED_SUFFIX], None, None),
+        ];
+
+        for (r, claim) in every_record_with_claim() {
+            let state = classify_record(&r);
+            let shown = listed(&r, claim);
+            let deleted = matches!(state, Frozen { .. } | Tombstoned { .. });
+
+            // The upload fence and the single-bucket file route HEAD exactly
+            // `.tombstone` and `.frozen`: they bar what the merge calls deleted.
+            assert_eq!(r.tombstoned || r.frozen, deleted, "{r:?}");
+            // A fence is never invisible. Freeze and tombstone dominate every
+            // sidecar; a demotion fence yields only to a sidecar that itself
+            // says private — never to the claim's fallback.
+            if r.frozen {
+                assert!(matches!(state, Frozen { .. }), "{r:?}");
+            } else if r.tombstoned {
+                assert!(matches!(state, Tombstoned { .. }), "{r:?}");
+            } else if r.mirror_quarantined && !matches!(state, QuarantinedMirror { .. }) {
+                let written = r.sidecar.as_ref().and_then(|s| s.origin.as_deref());
+                assert_eq!(written, Some(PRIVATE), "{r:?}");
+            }
+            // Nothing deleted, fenced or bodiless is ever listed.
+            if shown {
+                assert!(r.has_artifact && !deleted, "{r:?}");
+                assert!(matches!(state, Live { .. } | Untyped), "{r:?}");
+            }
+            // The renderer skips the sidecar read when the markers alone say
+            // deleted; that is only sound if no sidecar could change the answer.
+            let markers_only = Record {
+                sidecar: None,
+                ..r.clone()
+            };
+            if matches!(
+                classify_record(&markers_only),
+                Frozen { .. } | Tombstoned { .. }
+            ) {
+                assert!(deleted && !shown, "{r:?}");
+            }
+            // The rebuild backfills only a `Bare` body: never under any fence.
+            if state == Bare {
+                assert!(!r.tombstoned && !r.frozen && !r.mirror_quarantined, "{r:?}");
+            }
+            // A torn supersede is never plain `Live`: its sha may be stale.
+            if let Live { superseding, .. } = state {
+                assert_eq!(superseding, r.superseding, "{r:?}");
+            }
+
+            // The yank and the timestamp repair refuse whatever no index shows.
+            for edit in &edits {
+                let refusal = edit_refusal(&r, claim, edit).map(|(status, _)| status);
+                if !shown {
+                    let want = if matches!(state, Absent { .. } | Bare) {
+                        StatusCode::NOT_FOUND
+                    } else {
+                        StatusCode::CONFLICT
+                    };
+                    assert_eq!(refusal, Some(want), "{r:?}");
+                }
+                if deleted
+                    || matches!(
+                        state,
+                        Live {
+                            superseding: true,
+                            ..
+                        }
+                    )
+                {
+                    assert_eq!(refusal, Some(StatusCode::CONFLICT), "{r:?}");
+                }
+                if !r.has_artifact {
+                    assert!(refusal.is_some(), "sidecar without a body: {r:?}");
+                }
+                if shown && !r.superseding && matches!(edit, SidecarEdit::Yank(_)) {
+                    assert_eq!(refusal, None, "a listed file must be yankable: {r:?}");
+                }
+            }
+
+            // The merge.
+            for peer in &peers {
+                let verdict = decide(&r, peer);
+                match verdict {
+                    // Only a live record is copied out, and only into nothing.
+                    Verdict::Copy(Side::A) => {
+                        assert!(matches!(state, Live { .. }), "{r:?}");
+                    }
+                    Verdict::Copy(Side::B) => {
+                        assert!(matches!(state, Absent { .. }), "{r:?}");
+                    }
+                    Verdict::Defer => {
+                        let peer_state = classify_record(peer);
+                        assert!(
+                            matches!(state, Bare | Untyped) || matches!(peer_state, Bare | Untyped),
+                            "{r:?}"
+                        );
+                    }
+                    _ => {}
+                }
+                // A deleted record never takes a peer's body back.
+                if deleted {
+                    assert!(
+                        matches!(
+                            verdict,
+                            Verdict::Noop
+                                | Verdict::Tombstone
+                                | Verdict::FinishFreeze
+                                | Verdict::PropagateFreeze(_)
+                        ),
+                        "{r:?} vs {peer:?}: {verdict:?}"
+                    );
+                }
+            }
+            // `Noop` is a durability claim: a listed record is never
+            // "converged" with a peer that holds nothing.
+            if shown {
+                assert_ne!(decide(&r, &empty), Verdict::Noop, "{r:?}");
+            }
+        }
     }
 }

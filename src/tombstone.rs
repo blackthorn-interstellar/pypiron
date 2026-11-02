@@ -22,7 +22,7 @@ use crate::storage::Storage;
 /// Floor for [`drop_orphan_companions`]' age gate, independent of
 /// `--intent-grace-secs`: long enough that no sidecar-first writer can still be
 /// mid-flight, short enough that real debris is swept the same day.
-const AGE_FLOOR: time::Duration = time::Duration::seconds(300);
+pub(crate) const AGE_FLOOR: time::Duration = time::Duration::seconds(300);
 
 /// Minimal tombstone body. The filename is informational — the key already
 /// carries it — and there is deliberately no wall clock: a tombstone's meaning

@@ -1544,7 +1544,7 @@ pub fn copy_pair_eligible(
 const ARTIFACT_WRITE_TIMEOUT_BASE: std::time::Duration = std::time::Duration::from_secs(60);
 const ARTIFACT_WRITE_TIMEOUT_PER_MIB: std::time::Duration = std::time::Duration::from_secs(1);
 
-fn artifact_write_timeout(payload_size: u64) -> std::time::Duration {
+pub(crate) fn artifact_write_timeout(payload_size: u64) -> std::time::Duration {
     let mib = (payload_size / (1024 * 1024)).min(u32::MAX as u64) as u32;
     ARTIFACT_WRITE_TIMEOUT_BASE + ARTIFACT_WRITE_TIMEOUT_PER_MIB * mib
 }
@@ -1559,9 +1559,14 @@ pub async fn bounded_artifact_write<T>(
     let budget = artifact_write_timeout(payload_size);
     match tokio::time::timeout(budget, op).await {
         Ok(result) => result,
-        Err(_elapsed) => Err(anyhow!(
-            "artifact write to {key} exceeded {budget:?}; treating the connection as wedged"
-        )),
+        // Typed as a timeout, which is what it is: callers that ask whether a
+        // failure heals by itself (a retained replication note) must say yes.
+        Err(_elapsed) => Err(anyhow::Error::new(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "artifact write to {key} exceeded {budget:?}; treating the connection as wedged"
+            ),
+        ))),
     }
 }
 

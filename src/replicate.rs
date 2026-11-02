@@ -1042,8 +1042,18 @@ async fn install_or_verify_sidecar(
             return Ok(true);
         }
     }
-    bail!("conditional sidecar replacement retries exhausted for {key}")
+    Err(Contended(format!(
+        "conditional sidecar replacement retries exhausted for {key}"
+    ))
+    .into())
 }
+
+/// A write that lost a race with another writer of the same record: the next
+/// attempt reads the new state and goes again, so a note that fails this way
+/// waits rather than pages.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+struct Contended(String);
 
 /// Copy a live private record into `dst`:
 /// origin claim first, then sidecar, companions, and the artifact **last** —
@@ -1599,7 +1609,10 @@ async fn supersede_record(
                 .await?
                 .is_none()
             {
-                bail!("destination artifact changed during supersede for {akey}");
+                return Err(Contended(format!(
+                    "destination artifact changed during supersede for {akey}"
+                ))
+                .into());
             }
             verify_stored_size(dst, &akey, len).await?;
             state.metrics.record_replicated(len);
@@ -2376,14 +2389,27 @@ pub(crate) fn classify_marked_record(
     body_sha: Option<&str>,
     intended_sha: &str,
     marker_age: Option<time::Duration>,
-    intent_grace: time::Duration,
+    retire_after: time::Duration,
 ) -> MarkedRecord {
     let install = body_sha == Some(intended_sha);
-    let settled = marker_age.is_some_and(|age| age >= intent_grace);
+    let settled = marker_age.is_some_and(|age| age >= retire_after);
     MarkedRecord {
         install,
         retire: install || settled,
     }
+}
+
+/// How old a marker over a body that does not match yet must be before its
+/// supersede is presumed dead. Not the bare intent grace: between writing the
+/// marker and the body, a supersede quarantines the losing body and writes
+/// the new one — two artifact writes of about the intended size, each allowed
+/// its full write budget — and `--intent-grace-secs` goes as low as 3s. So
+/// the gate never drops below [`tombstone::AGE_FLOOR`] (the same floor the
+/// orphan sweep keeps for a copy in flight) nor below those two budgets.
+pub(crate) fn marker_retire_gate(intent_grace: time::Duration, size: u64) -> time::Duration {
+    let writes = 2 * crate::storage::artifact_write_timeout(size);
+    let writes = time::Duration::try_from(writes).unwrap_or(time::Duration::MAX);
+    intent_grace.max(tombstone::AGE_FLOOR).max(writes)
 }
 
 /// Finish a [`supersede_record`] that left a body ahead of the sidecar naming
@@ -2407,8 +2433,12 @@ pub(crate) fn classify_marked_record(
 /// writer's own `_dirty/` intent guarantees the rebuild that sees its outcome.
 ///
 /// Retiring is a re-listing then a delete, and only a marker whose listed
-/// version did not change since the caller's listing goes: another supersede of
-/// the same file that rewrote the marker meanwhile owns it now. Storage has no
+/// version and timestamp did not change since the caller's listing goes:
+/// another supersede of the same file that rewrote the marker meanwhile owns
+/// it now. The timestamp is what catches a retry of the same supersede, which
+/// rewrites byte-identical JSON — on unversioned S3 the etag is the content
+/// MD5 and does not move, while the marker being retired is already past its
+/// gate, so a rewrite always lands a later timestamp. Storage has no
 /// conditional delete, so a rewrite landing between that re-listing and the
 /// delete still loses its marker — a window of one round trip.
 ///
@@ -2422,7 +2452,7 @@ pub async fn finish_interrupted_supersedes(
 ) -> Result<usize> {
     let now = crate::clock::now_utc();
     let mut finished = 0;
-    let mut answered: Vec<(&str, &str)> = Vec::new();
+    let mut answered: Vec<(&str, (&str, Option<&str>))> = Vec::new();
     for entry in markers {
         let marker = entry.key.as_str();
         let Some(akey) = marker.strip_suffix(SUPERSEDING_SUFFIX) else {
@@ -2448,8 +2478,10 @@ pub async fn finish_interrupted_supersedes(
         let body_sha = if tombstoned || frozen {
             None
         } else {
-            match storage.get_bytes(akey).await {
-                Ok(body) => Some(sha256_hex(&body)),
+            // Streamed: the body can be a multi-GiB wheel, and a kept marker
+            // has it re-hashed on every rebuild.
+            match crate::storage::stream_sha256(storage, akey).await {
+                Ok((sha, _)) => Some(sha),
                 Err(e) if is_not_found(&e) => None,
                 Err(e) => return Err(e),
             }
@@ -2462,8 +2494,12 @@ pub async fn finish_interrupted_supersedes(
         // A body still holding the *old* bytes, or bytes this intent knows
         // nothing about, is left exactly as found: this finishes a torn write,
         // it never adjudicates one.
-        let verdict =
-            classify_marked_record(body_sha.as_deref(), &intended.sha256, age, intent_grace);
+        let verdict = classify_marked_record(
+            body_sha.as_deref(),
+            &intended.sha256,
+            age,
+            marker_retire_gate(intent_grace, intended.size),
+        );
         if verdict.install
             && install_or_verify_sidecar(storage, &sidecar_key(akey), &intended).await?
         {
@@ -2472,7 +2508,7 @@ pub async fn finish_interrupted_supersedes(
         // A backend that lists no version can never prove the marker unchanged,
         // so its marker stays: a re-hash on each rebuild, never a lost fence.
         if let (true, Some(etag)) = (verdict.retire, entry.etag.as_deref()) {
-            answered.push((marker, etag));
+            answered.push((marker, (etag, entry.last_modified.as_deref())));
         }
     }
     if answered.is_empty() {
@@ -2481,13 +2517,16 @@ pub async fn finish_interrupted_supersedes(
     let relisted = storage
         .list_dir_entries(&format!("{PACKAGES_PREFIX}{pkg}/"))
         .await?;
-    let current: HashMap<&str, &str> = relisted
+    let current: HashMap<&str, (&str, Option<&str>)> = relisted
         .iter()
-        .filter_map(|entry| Some((entry.key.as_str(), entry.etag.as_deref()?)))
+        .filter_map(|entry| {
+            let version = (entry.etag.as_deref()?, entry.last_modified.as_deref());
+            Some((entry.key.as_str(), version))
+        })
         .collect();
     let unchanged: Vec<String> = answered
         .into_iter()
-        .filter(|(marker, etag)| current.get(marker) == Some(etag))
+        .filter(|(marker, version)| current.get(marker) == Some(version))
         .map(|(marker, _)| marker.to_string())
         .collect();
     if !unchanged.is_empty() {
@@ -3328,16 +3367,22 @@ struct Backlog {
 }
 
 /// Classify why a note stays. Pure, so the split between "waits" and "needs a
-/// human" is pinned by a table test. An availability failure (timeout,
-/// connection, 5xx) clears when the bucket returns, by the same rule bucket
-/// health uses to fail over; nothing else does.
+/// human" is pinned by a table test. Not bucket health's question — whether
+/// another bucket is safer — but whether the next sweep can succeed unaided:
+/// an outage (timeout, connection, 408, 5xx), a throttle (429, SlowDown,
+/// quota), a write that lost a race, or a record that vanished mid-read all
+/// clear on their own. Anything else fails the same way every sweep.
 fn classify_note_failure(error: &anyhow::Error) -> NoteOutcome {
-    if crate::bucket_health::classify(crate::observed_storage::signal_for_error(error))
-        == crate::bucket_health::SignalClass::AvailabilityFailure
-    {
-        NoteOutcome::Pending
-    } else {
-        NoteOutcome::Failing
+    use crate::bucket_health::BucketSignal::*;
+    if error.chain().any(|cause| cause.is::<Contended>()) {
+        return NoteOutcome::Pending;
+    }
+    match crate::observed_storage::signal_for_error(error) {
+        Timeout | ConnectionFailure | QuotaError | Success => NoteOutcome::Pending,
+        HttpStatus(status) if status == 408 || status == 429 || status >= 500 => {
+            NoteOutcome::Pending
+        }
+        _ => NoteOutcome::Failing,
     }
 }
 
@@ -3955,7 +4000,16 @@ mod tests {
         }
 
         async fn list_dir_entries(&self, prefix: &str) -> Result<Vec<FileEntry>> {
-            self.inner.list_dir_entries(prefix).await
+            let mut entries = self.inner.list_dir_entries(prefix).await?;
+            // The racing write landed after everything seeded before it, and
+            // a real store stamps it so — even when it rewrites the same bytes
+            // under the same content etag.
+            if self.raced.load(Ordering::SeqCst) {
+                for entry in entries.iter_mut().filter(|entry| entry.key == self.key) {
+                    entry.last_modified = Some("2026-01-01T00:00:01Z".to_string());
+                }
+            }
+            Ok(entries)
         }
 
         async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
@@ -5537,6 +5591,18 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_marker_outlives_its_own_supersedes_writes() {
+        let s = time::Duration::seconds;
+        // The operator's grace can't drop it below the floor...
+        assert_eq!(marker_retire_gate(s(3), 0), tombstone::AGE_FLOOR);
+        // ...a longer grace stands...
+        assert_eq!(marker_retire_gate(s(900), 0), s(900));
+        // ...and a big wheel gets both of its write budgets: the quarantined
+        // loser and the new body, 60s + 1s/MiB each.
+        assert_eq!(marker_retire_gate(s(900), 1 << 30), s(2 * (60 + 1024)));
+    }
+
     /// The marker exists for exactly the window a live supersede is in: body
     /// replaced, sidecar not yet published. A rebuild that lands *before* the
     /// body write (the audit's and replicator's rebuilds do not wait out live
@@ -5633,6 +5699,39 @@ mod tests {
             storage.get_bytes(&superseding_key(&key)).await.unwrap(),
             fresh,
             "the rebuild deleted a fence a newer supersede wrote after it looked"
+        );
+    }
+
+    /// The same ABA, by the likeliest next writer of the marker: a retry of
+    /// the very supersede that abandoned it, rewriting byte-identical JSON. On
+    /// unversioned S3 (and this store) the listed etag is the content hash and
+    /// does not move; only the timestamp says the marker was rewritten.
+    #[tokio::test]
+    async fn a_rebuild_keeps_a_fence_a_retried_supersede_rewrote_with_the_same_bytes() {
+        let filename = "pkg-1.whl";
+        let key = artifact_key("pkg", filename);
+        let marker = serde_json::to_vec(&sc(
+            &sha256_hex(b"the bytes the supersede is about to write"),
+            PRIVATE,
+            Yanked::Flag(false),
+            0,
+        ))
+        .unwrap();
+        let storage = Arc::new(
+            RacingWriterStorage::new(superseding_key(&key), marker.clone()).racing_a_read(),
+        );
+        seed_live(&storage.inner, "pkg", filename, b"the old bytes", PRIVATE);
+        storage.inner.insert(&superseding_key(&key), marker.clone());
+        let state = test_state(storage.clone());
+
+        worker::rebuild_package(&state, storage.as_ref(), "pkg")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            storage.get_bytes(&superseding_key(&key)).await.unwrap(),
+            marker,
+            "the rebuild deleted the fence of the retry that rewrote it"
         );
     }
 
@@ -6267,13 +6366,31 @@ mod tests {
             .is_empty());
     }
 
-    #[test]
-    fn only_an_outage_makes_a_retained_note_wait_quietly() {
+    #[tokio::test(start_paused = true)]
+    async fn only_a_failure_that_heals_itself_makes_a_note_wait_quietly() {
         use std::io::{Error as IoError, ErrorKind};
+        let wedged = crate::storage::bounded_artifact_write(
+            "packages/pkg/pkg-1.whl",
+            1 << 30,
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
         let waits = [
             anyhow::Error::new(IoError::from(ErrorKind::TimedOut)),
             anyhow::Error::new(IoError::from(ErrorKind::ConnectionRefused))
                 .context("copy pkg/pkg-1.whl"),
+            // S3 throttling: alarm-worthy for bucket health, but it lifts.
+            anyhow!("Server returned non-2xx status code: 503 Service Unavailable: <Code>SlowDown</Code>")
+                .context("put packages/pkg/pkg-1.whl"),
+            anyhow!("Server returned non-2xx status code: 429 Too Many Requests"),
+            // A big wheel over a slow link outran its write budget.
+            wedged,
+            // Lost a race to another writer of the record.
+            anyhow::Error::from(Contended("destination artifact changed during supersede".into()))
+                .context("supersede pkg/pkg-1.whl"),
+            // The record went away mid-read.
+            anyhow::Error::new(IoError::from(ErrorKind::NotFound)),
         ];
         for error in waits {
             assert_eq!(

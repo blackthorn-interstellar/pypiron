@@ -23,7 +23,7 @@ use std::{
     collections::{BTreeSet, HashMap, HashSet},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc, Mutex, OnceLock,
+        Arc, Mutex,
     },
     time::Instant,
 };
@@ -1325,6 +1325,9 @@ pub async fn audit(
     // we could not read.
     let quarantine_base = crate::advisories::stored_quarantined(storage).await;
     let mut deltas: Vec<(String, FileShas)> = Vec::new();
+    // Fingerprints of the packages in `deltas`, withheld from the shard write
+    // until the checkpoint committing them has landed (see `audit_shard`).
+    let mut pending_fps: Vec<(String, String)> = Vec::new();
     // Advisory-report inventory: `(package, filenames)` for advisory-matched names,
     // accumulated across shards and joined against the audit index in the tail.
     let mut inventory: Vec<(String, Vec<String>)> = Vec::new();
@@ -1339,16 +1342,24 @@ pub async fn audit(
     // once; steady state commits only churn. Deciding this up front tells the
     // shard pass whether to read unchanged packages' sidecars.
     //
-    // `None` = the chain head could not be read this pass. We then skip the
-    // checkpoint write entirely, rather than risk a *partial* genesis: treating
-    // the error as "not genesis" while a later succeeding read inside
-    // `write_chain_link` sees the empty chain would write seq 0 committing only
-    // the churned packages, permanently omitting never-churned artifacts with no
-    // re-genesis path. Skipping leaves the empty chain intact so the next pass
-    // (whose read succeeds) performs a true whole-corpus genesis.
-    let genesis_state: Option<bool> = if state.transparency {
+    // The head read here is also the checkpoint's fence: this pass may append
+    // only directly onto it (`append_chain_link`). A link that lands while the
+    // walk runs was written by an audit whose observations may be newer than
+    // ours, and chaining after it would commit our older view over its newer
+    // one. Such a pass appends nothing and leaves its churned fingerprints
+    // unadvanced, so the next audit re-derives them from storage.
+    //
+    // `None` = the chain head could not be read this pass (or transparency is
+    // off). We then skip the checkpoint write entirely, rather than risk a
+    // *partial* genesis: treating the error as "not genesis" while a later
+    // succeeding read inside `write_chain_link` sees the empty chain would write
+    // seq 0 committing only the churned packages, permanently omitting
+    // never-churned artifacts with no re-genesis path. Skipping leaves the empty
+    // chain intact so the next pass (whose read succeeds) performs a true
+    // whole-corpus genesis.
+    let walk_head: Option<Option<(u64, String)>> = if state.transparency {
         match crate::transparency::read_head(storage).await {
-            Ok(head) => Some(head.is_none()),
+            Ok(head) => Some(head.map(|(seq, bytes)| (seq, sha256_hex(&bytes)))),
             Err(e) => {
                 warn!(error=?e, "transparency: chain head unreadable; checkpoint deferred this pass");
                 None
@@ -1357,7 +1368,7 @@ pub async fn audit(
     } else {
         None
     };
-    let genesis = genesis_state == Some(true);
+    let genesis = matches!(walk_head, Some(None));
 
     // Shards enumerate in parallel — that is what the sharding is for. The
     // bound keeps peak memory at a few shards' worth of listings (a shard is
@@ -1387,6 +1398,7 @@ pub async fn audit(
                     pkg_stats.extend(result.pkg_stats);
                     quarantined_names.extend(result.quarantined);
                     deltas.extend(result.deltas);
+                    pending_fps.extend(result.pending_fps);
                     inventory.extend(result.inventory);
                 }
                 Err(e) => {
@@ -1511,29 +1523,45 @@ pub async fn audit(
     publish_inventory(state, storage, totals).await;
     // Append the tamper-evident checkpoint last, once views and inventory are
     // settled. Never fails the audit itself: a checkpoint that cannot be landed
-    // warns, counts `pypiron_chain_checkpoint_deferrals_total`, and rides to the
-    // next pass.
-    // Only write when we could determine genesis-vs-incremental this pass; a
-    // `None` (unreadable head) is deferred above to avoid a partial genesis.
-    if let Some(is_genesis) = genesis_state {
-        let mut delta: crate::transparency::Delta = deltas.into_iter().collect();
-        if is_genesis {
-            // Genesis has no prior state to remove from, so an empty map is pure
-            // noise; keep only packages that actually hold committable files.
-            delta.retain(|_, files| !files.is_empty());
+    // warns, counts `pypiron_chain_checkpoint_deferrals_total`, and leaves its
+    // packages' fingerprints where they were, so whichever node audits next
+    // rebuilds them and commits the delta again. Only a landed checkpoint
+    // advances them.
+    let delta: crate::transparency::Delta = deltas.into_iter().collect();
+    let landed = match walk_head {
+        Some(head) => {
+            let mut delta = delta;
+            if head.is_none() {
+                // Genesis has no prior state to remove from, so an empty map is
+                // pure noise; keep only packages that actually hold committable
+                // files.
+                delta.retain(|_, files| !files.is_empty());
+            }
+            write_chain_link(state, pinned, generation, head, delta).await
         }
-        write_chain_link(state, pinned, generation, delta).await;
-    } else {
-        // The chain head was unreadable this pass, so the checkpoint is deferred
-        // above — but the per-package fingerprint shards were already written
-        // unconditionally, so a dropped delta is never re-derived: the chain would
-        // keep committing the old sha over bytes storage has already replaced.
-        // Carry it against this bucket so the next pass (whose head read succeeds)
-        // merges it, exactly as the CAS-loss path does. A false `genesis_state`
-        // (transparency off) collects no deltas, so this no-ops.
-        let delta: crate::transparency::Delta = deltas.into_iter().collect();
-        if !delta.is_empty() {
-            carry_unlanded(&pinned.storage, delta);
+        // The chain head was unreadable when the walk began, so there is no head
+        // this pass may append onto (see `walk_head`). Transparency off collects
+        // no deltas and lands here as a no-op.
+        None => {
+            if !delta.is_empty() {
+                defer_checkpoint(state);
+            }
+            false
+        }
+    };
+    if landed && !pending_fps.is_empty() {
+        let edits: Vec<(&str, Option<&str>)> = pending_fps
+            .iter()
+            .map(|(pkg, fp)| (pkg.as_str(), Some(fp.as_str())))
+            .collect();
+        let committed = match require_generation(state, generation) {
+            Ok(()) => edit_fingerprints(storage, &edits).await,
+            Err(e) => Err(e),
+        };
+        if let Err(e) = committed {
+            // Harmless: the next audit rebuilds these packages and commits the
+            // same maps again, which replays identically.
+            warn!(error=?e, "transparency: checkpoint landed but its fingerprints were not recorded; the next audit re-commits them");
         }
     }
     // Publish completion metrics only after the sweep's last storage write:
@@ -1575,72 +1603,16 @@ async fn current_package_shas(
     Ok(files.into_iter().map(|f| (f.filename, f.sha256)).collect())
 }
 
-/// Deltas an append could not land, held against the bucket handle they were
-/// observed on and merged into that bucket's next checkpoint.
-///
-/// Leader memory on purpose. A package's audit fingerprint is written with its
-/// shard, long before the checkpoint is appended, so a delta dropped here is never
-/// re-derived: the chain would go on committing the old sha while storage holds
-/// the new bytes, and `verify-chain` would report a tamper that clears only if
-/// that package happens to churn again. Holding it costs a few keys and makes the
-/// next pass whole. A crash loses it — the accepted residual (see
-/// `crate::transparency`).
-///
-/// Keyed by the handle itself, as a `Weak`: a carried delta rejoins the chain it
-/// was observed against (surviving a pin switch away and back), a dropped bucket
-/// takes its carry with it, and nothing is handed to whatever later allocation
-/// reuses the address — the deterministic simulator runs many fleets, under the
-/// same bucket names, in one process.
-type Unlanded = Vec<(std::sync::Weak<dyn Storage>, crate::transparency::Delta)>;
-static UNLANDED_DELTAS: OnceLock<Mutex<Unlanded>> = OnceLock::new();
-
-fn unlanded_deltas() -> &'static Mutex<Unlanded> {
-    UNLANDED_DELTAS.get_or_init(Mutex::default)
-}
-
-/// Is `held` the very handle `pin` points at? Address only: the vtable half of a
-/// trait-object pointer is not reliably unique.
-fn same_handle(held: &std::sync::Weak<dyn Storage>, pin: &Arc<dyn Storage>) -> bool {
-    held.upgrade()
-        .is_some_and(|storage| std::ptr::addr_eq(Arc::as_ptr(&storage), Arc::as_ptr(pin)))
-}
-
-/// Take back whatever this bucket could not land last pass, under `delta`; this
-/// pass's observation of a package is the fresher one and wins. Carries whose
-/// bucket is gone are dropped in the same sweep.
-fn merge_unlanded(pin: &Arc<dyn Storage>, delta: &mut crate::transparency::Delta) {
-    let mut carried = unlanded_deltas()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    carried.retain(|(held, _)| held.strong_count() > 0);
-    if let Some(position) = carried.iter().position(|(held, _)| same_handle(held, pin)) {
-        let (_, previous) = carried.swap_remove(position);
-        for (pkg, files) in previous {
-            delta.entry(pkg).or_insert(files);
-        }
-    }
-}
-
-/// Hold a delta no bucket accepted, for this bucket's next pass.
-fn carry_unlanded(pin: &Arc<dyn Storage>, delta: crate::transparency::Delta) {
-    let mut carried = unlanded_deltas()
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    match carried.iter_mut().find(|(held, _)| same_handle(held, pin)) {
-        Some((_, kept)) => kept.extend(delta),
-        None => carried.push((Arc::downgrade(pin), delta)),
-    }
-}
-
 /// Append a hash-chained transparency checkpoint committing this pass's changed
-/// packages. Never fails the audit: anything that stops the append warns, counts
-/// a `chain_checkpoint_deferrals`, and carries the delta to the next audit, which
-/// re-attempts. Deferral is the *designed* outcome whenever the fleet's head
-/// cannot be vouched for, so that counter — not the absence of one — is what an
-/// operator watches; a value climbing every audit means the chain has stopped
-/// advancing. Leader-gated by construction — called only from
-/// `audit`, after the fingerprint and global-index writes, on the same pin and
-/// generation.
+/// packages, and say whether it landed. Never fails the audit: anything that
+/// stops the append warns and counts a `chain_checkpoint_deferrals`, and the
+/// caller then leaves those packages' fingerprints unadvanced so the next audit
+/// — on this node or any other — re-derives the delta from storage. Deferral is
+/// the *designed* outcome whenever the fleet's head cannot be vouched for, so
+/// that counter — not the absence of one — is what an operator watches; a value
+/// climbing every audit means the chain has stopped advancing. Leader-gated by
+/// construction — called only from `audit`, after the global-index writes, on
+/// the same pin and generation.
 ///
 /// Reconcile first, append second. Catching the fleet up before writing is what
 /// keeps a failover leader from spending a seq a peer already used under different
@@ -1652,15 +1624,16 @@ async fn write_chain_link(
     state: &AppState,
     pinned: &crate::buckets::Pinned,
     generation: u64,
-    mut delta: crate::transparency::Delta,
-) {
+    walk_head: Option<(u64, String)>,
+    delta: crate::transparency::Delta,
+) -> bool {
     let handles = state.buckets.handles();
     if handles.get(pinned.index).is_none() {
         error!(
             bucket = pinned.index,
             "transparency: pinned bucket has no handle; checkpoint skipped"
         );
-        return;
+        return false;
     }
     // The chain fleet in config order: the write pin plus every eligible peer.
     // Config order is what makes the append arbiter below the same bucket on every
@@ -1683,46 +1656,47 @@ async fn write_chain_link(
         }
     }
     let synced = crate::transparency::catch_up_fleet(&fleet, primary).await;
-    // Append only on churn — but a delta a previous pass could not land is churn
-    // that has not been committed yet, so it rides along on the next pass even if
-    // this one is idle.
-    merge_unlanded(&pinned.storage, &mut delta);
+    // Append only on churn.
     if delta.is_empty() {
-        return;
+        return true;
     }
     if synced.in_sync.is_empty() {
-        warn!(
-            "transparency: no bucket could arbitrate the checkpoint; carrying it to the next audit"
-        );
-        defer_checkpoint(state, pinned, delta);
-        return;
+        warn!("transparency: no bucket could arbitrate the checkpoint; deferred to the next audit");
+        defer_checkpoint(state);
+        return false;
     }
-    if let Some(unlanded) =
-        append_chain_link(state, &fleet, primary, synced, generation, delta).await
-    {
-        defer_checkpoint(state, pinned, unlanded);
+    let landed =
+        append_chain_link(state, &fleet, primary, synced, generation, walk_head, delta).await;
+    if !landed {
+        defer_checkpoint(state);
     }
+    landed
 }
 
-/// Hold a checkpoint this pass could not land, and say so on the one surface an
-/// operator can watch. Every fail-closed exit in the chain path lands here, so
-/// the counter is the alarm for "the chain has stopped advancing" — the warns
-/// name which bucket, the counter says it kept happening.
-fn defer_checkpoint(
-    state: &AppState,
-    pinned: &crate::buckets::Pinned,
-    delta: crate::transparency::Delta,
-) {
+/// Count a checkpoint this pass could not land, on the one surface an operator
+/// can watch. Every fail-closed exit in the chain path lands here, so the
+/// counter is the alarm for "the chain has stopped advancing" — the warns name
+/// which bucket, the counter says it kept happening.
+fn defer_checkpoint(state: &AppState) {
     state
         .metrics
         .chain_checkpoint_deferrals
         .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    carry_unlanded(&pinned.storage, delta);
 }
 
 /// Append one hash-chained link committing `delta` and mirror it across the
-/// fleet. Returns the delta when it landed nowhere, so the caller can carry it
-/// into the next pass.
+/// fleet. Returns whether it landed; a `false` leaves the caller's fingerprints
+/// unadvanced, so the next audit re-derives the same churn from storage.
+///
+/// The link may only chain directly onto `walk_head`, the pin's head when this
+/// audit's walk began. A link that landed since was written by an audit whose
+/// observations may postdate ours: chaining after it would commit our older
+/// file→sha map over its newer one, and once that audit records its
+/// fingerprints nothing would re-derive the package — `verify-chain` would
+/// report a tamper that clears only when the package next churns. So a moved
+/// head defers, exactly as a lost CAS does. Links therefore land in the order
+/// their walks observed storage, and the last commitment for a package is
+/// always its freshest.
 ///
 /// The seq is decided by one create-if-absent CAS on the **arbiter**: the first
 /// bucket, in config order, whose chain this pass read cleanly (`synced`). Every
@@ -1731,160 +1705,151 @@ fn defer_checkpoint(
 /// bucket's head, which the catch-up just made the fleet head. One head read
 /// confirms that immediately before the CAS, and it is the arbiter's *own* head
 /// that decides: at or past this seq, or holding other bytes at seq-1, means the
-/// bucket moved since the catch-up and this pass carries its delta instead of
-/// racing it. Only *behind* is allowed through — a peer left short by a failed
-/// copy stays an arbiter candidate on purpose (one transient write error must not
-/// move the arbiter), and it can take this link and be backfilled under it. That
-/// is a real cost, not a free pass: until the next catch-up fills the gap, that
+/// bucket moved since the catch-up and this pass defers instead of racing it.
+/// Only *behind* is allowed through — a peer left short by a failed copy stays
+/// an arbiter candidate on purpose (one transient write error must not move the
+/// arbiter), and it can take this link and be backfilled under it. That is a
+/// real cost, not a free pass: until the next catch-up fills the gap, that
 /// bucket's chain has a hole, and `verify-chain` faults it (`gap`, and
 /// `broken-link` at the hole's upper edge) with exit 1 the whole time. A
 /// checkpoint that waits is the cheaper failure, which is why every other
 /// mismatch defers.
-///
-/// With the pre-check in place, losing the CAS means a leader wrote the arbiter
-/// in the window between that head read and this write — narrow, and no longer
-/// the ordinary way two leaders meet. It still must not abandon the link: the
-/// loser adopts the winner (pulling it onto this bucket) and appends at the next
-/// seq in the same pass, because dropping the delta would leave the chain
-/// committing an old sha over bytes storage has already replaced, which
-/// `verify-chain` reports as a tamper that never clears. Two attempts, then
-/// carry: a racing leader can only take the seq we just read, so a second loss
-/// means to stop spinning, not to give up.
 async fn append_chain_link(
     state: &AppState,
     fleet: &[crate::layout::ReplicaTarget<'_>],
     primary: usize,
     synced: crate::transparency::FleetChain,
     generation: u64,
+    walk_head: Option<(u64, String)>,
     delta: crate::transparency::Delta,
-) -> Option<crate::transparency::Delta> {
-    let mut synced = synced;
-    let Some(pin) = fleet.get(primary) else {
-        return Some(delta);
+) -> bool {
+    let (Some(pin), Some(&decider)) = (fleet.get(primary), synced.in_sync.first()) else {
+        return false;
     };
-    for attempt in 0..2 {
-        let Some(&decider) = synced.in_sync.first() else {
-            break;
-        };
-        let Some(arbiter) = fleet.get(decider) else {
-            break;
-        };
-        if let Err(e) = require_generation(state, generation) {
-            warn!(error=?e, "transparency: generation changed; checkpoint carried to the next audit");
-            return Some(delta);
+    let Some(arbiter) = fleet.get(decider) else {
+        return false;
+    };
+    if let Err(e) = require_generation(state, generation) {
+        warn!(error=?e, "transparency: generation changed; checkpoint deferred to the next audit");
+        return false;
+    }
+    let head = match crate::transparency::read_head(pin.storage).await {
+        Ok(head) => head.map(|(head_seq, bytes)| (head_seq, sha256_hex(&bytes))),
+        Err(e) => {
+            error!(error=?e, "transparency: could not read chain head; checkpoint deferred");
+            return false;
         }
-        let (seq, prev_sha256) = match crate::transparency::read_head(pin.storage).await {
-            Ok(Some((head_seq, bytes))) => (head_seq + 1, sha256_hex(&bytes)),
-            Ok(None) => (0, String::new()),
-            Err(e) => {
-                error!(error=?e, "transparency: could not read chain head; checkpoint carried");
-                return Some(delta);
-            }
-        };
-        // The seq and `prev-sha256` come from the pin, but the CAS lands on the
-        // arbiter, so the arbiter must not already be past the seq we are about
-        // to spend, and where it stands at seq-1 it must hold the very bytes we
-        // are chaining onto. The catch-up just made both true; one read confirms
-        // it rather than trusting a peer that may have moved since. Behind is
-        // allowed and deliberately not "corrected" by deriving the seq from the
-        // arbiter instead: a peer left behind by a failed copy stays an arbiter
-        // candidate on purpose, and numbering off its short chain would re-issue
-        // a seq the pin already holds — forking the other way.
-        if decider != primary {
-            match crate::transparency::read_head(arbiter.storage).await {
-                Ok(head) => {
-                    let chains_on = match &head {
-                        Some((head_seq, head_bytes)) => {
-                            *head_seq < seq
-                                && (*head_seq + 1 != seq || sha256_hex(head_bytes) == prev_sha256)
-                        }
-                        None => true,
-                    };
-                    if !chains_on {
-                        warn!(
-                            seq,
-                            bucket = %arbiter.name,
-                            arbiter_head = ?head.as_ref().map(|(s, _)| *s),
-                            "transparency: the arbiter's chain moved out from under this pass; checkpoint carried to the next audit"
-                        );
-                        return Some(delta);
+    };
+    if head != walk_head {
+        warn!(
+            walk_head = ?walk_head.as_ref().map(|(s, _)| *s),
+            head = ?head.as_ref().map(|(s, _)| *s),
+            "transparency: the chain advanced while this audit walked; its churn is re-derived by the next audit"
+        );
+        return false;
+    }
+    let (seq, prev_sha256) = match head {
+        Some((head_seq, sha)) => (head_seq + 1, sha),
+        None => (0, String::new()),
+    };
+    // The seq and `prev-sha256` come from the pin, but the CAS lands on the
+    // arbiter, so the arbiter must not already be past the seq we are about to
+    // spend, and where it stands at seq-1 it must hold the very bytes we are
+    // chaining onto. The catch-up just made both true; one read confirms it
+    // rather than trusting a peer that may have moved since. Behind is allowed
+    // and deliberately not "corrected" by deriving the seq from the arbiter
+    // instead: a peer left behind by a failed copy stays an arbiter candidate on
+    // purpose, and numbering off its short chain would re-issue a seq the pin
+    // already holds — forking the other way.
+    if decider != primary {
+        match crate::transparency::read_head(arbiter.storage).await {
+            Ok(head) => {
+                let chains_on = match &head {
+                    Some((head_seq, head_bytes)) => {
+                        *head_seq < seq
+                            && (*head_seq + 1 != seq || sha256_hex(head_bytes) == prev_sha256)
                     }
-                }
-                Err(e) => {
-                    error!(error=?e, bucket = %arbiter.name, "transparency: could not read the arbiter's chain head; checkpoint carried");
-                    return Some(delta);
-                }
-            }
-        }
-        let created =
-            match crate::clock::now_utc().format(&time::format_description::well_known::Rfc3339) {
-                Ok(created) => created,
-                Err(e) => {
-                    error!(error=?e, "transparency: timestamp format failed; checkpoint carried");
-                    return Some(delta);
-                }
-            };
-        let link = crate::transparency::ChainLink {
-            seq,
-            prev_sha256,
-            created,
-            packages: delta.clone(),
-        };
-        let bytes = match crate::transparency::link_bytes(&link) {
-            Ok(bytes) => bytes,
-            Err(e) => {
-                error!(error=?e, "transparency: serialize failed; checkpoint carried");
-                return Some(delta);
-            }
-        };
-        match arbiter
-            .storage
-            .put_if_none_match(&crate::transparency::chain_key(seq), bytes.clone())
-            .await
-        {
-            Ok(Some(_)) => {
-                info!(
-                    seq,
-                    packages = link.packages.len(),
-                    bucket = %arbiter.name,
-                    "transparency: checkpoint written"
-                );
-                // Mirror the immutable link to every bucket the catch-up found
-                // consistent with this chain. A forked or unreadable bucket is not
-                // in that set and is deliberately left untouched.
-                for position in &synced.in_sync {
-                    if *position == decider {
-                        continue;
-                    }
-                    let Some(bucket) = fleet.get(*position) else {
-                        continue;
-                    };
-                    if let Err(e) = crate::transparency::copy_link(bucket, seq, &bytes).await {
-                        warn!(bucket = %bucket.name, seq, error = ?e, "transparency: mirroring the checkpoint to a peer failed; retries next audit");
-                    }
-                }
-                return None;
-            }
-            Ok(None) => {
-                if attempt == 1 {
+                    None => true,
+                };
+                if !chains_on {
                     warn!(
                         seq,
-                        "transparency: lost the checkpoint CAS twice; carrying it to the next audit"
+                        bucket = %arbiter.name,
+                        arbiter_head = ?head.as_ref().map(|(s, _)| *s),
+                        "transparency: the arbiter's chain moved out from under this pass; checkpoint deferred to the next audit"
                     );
-                    break;
+                    return false;
                 }
-                // Adopt the winner instead of dropping our delta: the catch-up
-                // pulls its link onto this bucket, and the next attempt chains
-                // onto it at the following seq.
-                synced = crate::transparency::catch_up_fleet(fleet, primary).await;
             }
             Err(e) => {
-                error!(error=?e, seq, bucket = %arbiter.name, "transparency: checkpoint write failed; carried to the next audit");
-                return Some(delta);
+                error!(error=?e, bucket = %arbiter.name, "transparency: could not read the arbiter's chain head; checkpoint deferred");
+                return false;
             }
         }
     }
-    Some(delta)
+    let created =
+        match crate::clock::now_utc().format(&time::format_description::well_known::Rfc3339) {
+            Ok(created) => created,
+            Err(e) => {
+                error!(error=?e, "transparency: timestamp format failed; checkpoint deferred");
+                return false;
+            }
+        };
+    let link = crate::transparency::ChainLink {
+        seq,
+        prev_sha256,
+        created,
+        packages: delta,
+    };
+    let bytes = match crate::transparency::link_bytes(&link) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            error!(error=?e, "transparency: serialize failed; checkpoint deferred");
+            return false;
+        }
+    };
+    match arbiter
+        .storage
+        .put_if_none_match(&crate::transparency::chain_key(seq), bytes.clone())
+        .await
+    {
+        Ok(Some(_)) => {
+            info!(
+                seq,
+                packages = link.packages.len(),
+                bucket = %arbiter.name,
+                "transparency: checkpoint written"
+            );
+            // Mirror the immutable link to every bucket the catch-up found
+            // consistent with this chain. A forked or unreadable bucket is not
+            // in that set and is deliberately left untouched.
+            for position in &synced.in_sync {
+                if *position == decider {
+                    continue;
+                }
+                let Some(bucket) = fleet.get(*position) else {
+                    continue;
+                };
+                if let Err(e) = crate::transparency::copy_link(bucket, seq, &bytes).await {
+                    warn!(bucket = %bucket.name, seq, error = ?e, "transparency: mirroring the checkpoint to a peer failed; retries next audit");
+                }
+            }
+            true
+        }
+        // Another leader took this seq between the head read and the write. Its
+        // link stands; the next audit's catch-up adopts it and re-derives ours.
+        Ok(None) => {
+            warn!(
+                seq,
+                "transparency: lost the checkpoint CAS; deferred to the next audit"
+            );
+            false
+        }
+        Err(e) => {
+            error!(error=?e, seq, bucket = %arbiter.name, "transparency: checkpoint write failed; deferred to the next audit");
+            false
+        }
+    }
 }
 
 struct ShardAudit {
@@ -1912,6 +1877,13 @@ struct ShardAudit {
     /// when `--transparency` is off. An empty inner map means the package went
     /// away (a removal on chain replay).
     deltas: Vec<(String, FileShas)>,
+    /// `(package, new fingerprint)` for each rebuilt package in `deltas`. The
+    /// shard write keeps such a package's *previous* fingerprint; the new one is
+    /// recorded only after the checkpoint committing its delta lands. A stored
+    /// fingerprint therefore always names a state the chain has committed, which
+    /// is what lets a pass that cannot land its checkpoint — on any node, for any
+    /// reason — leave the next audit to rebuild the package and commit it again.
+    pending_fps: Vec<(String, String)>,
     /// Advisory-report inventory: `(package, artifact filenames)` for every
     /// package this shard holds whose name is in the audit index. Collected from
     /// the listing already in hand (no extra reads), and only for advisory-matched
@@ -1983,6 +1955,7 @@ async fn audit_shard(
         pkg_stats: Vec::new(),
         quarantined: Vec::new(),
         deltas: Vec::new(),
+        pending_fps: Vec::new(),
         inventory: Vec::new(),
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
@@ -2238,8 +2211,17 @@ async fn audit_shard(
                     // evidence deliberately stays in `packages/` while dead.
                     // Only the genesis pass needs this package's shas (its
                     // rebuild didn't run); steady state contributes no delta.
+                    // A genesis read that fails yields no delta, and the
+                    // collector then drops this package's fingerprint so the
+                    // next audit rebuilds it and commits it as churn.
                     let delta = if collect_deltas && need_full_shas && !maintenance_failed {
-                        current_package_shas(storage, &state.sidecar_cache, &pkg).await.ok()
+                        match current_package_shas(storage, &state.sidecar_cache, &pkg).await {
+                            Ok(shas) => Some(shas),
+                            Err(e) => {
+                                warn!(package=%pkg, error=?e, "audit: genesis sha read failed; the package is committed by a later audit");
+                                None
+                            }
+                        }
                     } else {
                         None
                     };
@@ -2287,8 +2269,26 @@ async fn audit_shard(
         });
         for (pkg, fp, live_now, was_rebuilt, failed, delta) in futures::future::join_all(jobs).await
         {
-            if let Some(fp) = &fp {
-                fresh.insert(pkg.clone(), fp.clone());
+            // A stored fingerprint vouches that the chain has committed the
+            // state it names. A rebuilt package's delta is not committed yet, so
+            // the shard keeps its previous fingerprint (the next audit rebuilds
+            // it again unless the checkpoint lands and `audit` records the new
+            // one). A genesis package whose shas could not be read is left out
+            // of the shard altogether, for the same reason.
+            let genesis_unread =
+                collect_deltas && need_full_shas && !was_rebuilt && !failed && delta.is_none();
+            match &fp {
+                Some(fp) if was_rebuilt && delta.is_some() => {
+                    if let Some(previous) = stored.get(&pkg) {
+                        fresh.insert(pkg.clone(), previous.clone());
+                    }
+                    out.pending_fps.push((pkg.clone(), fp.clone()));
+                }
+                Some(_) if genesis_unread => {}
+                Some(fp) => {
+                    fresh.insert(pkg.clone(), fp.clone());
+                }
+                None => {}
             }
             if let Some(shas) = delta {
                 out.deltas.push((pkg.clone(), shas));
@@ -2967,7 +2967,7 @@ fn enforced_excludes_key() -> String {
 /// no stamp exists yet (first run). A *not-found* is the ordinary first-run case;
 /// any other read error propagates rather than masquerading as "nothing enforced"
 /// — collapsing a transient (or persistent) read fault to empty would spin a full
-/// re-delist every pass instead of surfacing, the way [`invalidate_fingerprints`]
+/// re-delist every pass instead of surfacing, the way [`edit_fingerprints`]
 /// already distinguishes the two. A present-but-unparsable body reads as empty (a
 /// harmless full re-delist), only truly missing bytes are `None`.
 pub(crate) async fn read_enforced_excludes(
@@ -2996,29 +2996,34 @@ pub(crate) async fn enforced_denylist(
     }
 }
 
-/// Drop the given packages from their audit fingerprint shards so the next audit
-/// rebuilds them instead of skipping on a fingerprint that a denylist change left
-/// stale. Grouped by shard (a normalized name's first character) so each shard
-/// file is rewritten at most once. An absent shard file needs no work.
-async fn invalidate_fingerprints(storage: &dyn Storage, packages: &[&str]) -> Result<()> {
-    let mut by_shard: std::collections::BTreeMap<char, Vec<&str>> =
+/// Set (`Some`) or drop (`None`) packages' audit fingerprints. Grouped by shard
+/// (a normalized name's first character) so each shard file is rewritten at most
+/// once, and only when an edit changes it. Dropping one makes the next audit
+/// rebuild that package instead of skipping it; the denylist reconcile uses that
+/// when a config change left a fingerprint stale. Setting one is how `audit`
+/// records a package's fingerprint once the checkpoint committing it has landed.
+async fn edit_fingerprints(storage: &dyn Storage, edits: &[(&str, Option<&str>)]) -> Result<()> {
+    let mut by_shard: std::collections::BTreeMap<char, Vec<(&str, Option<&str>)>> =
         std::collections::BTreeMap::new();
-    for pkg in packages {
+    for (pkg, fp) in edits {
         if let Some(c) = pkg.chars().next() {
-            by_shard.entry(c).or_default().push(pkg);
+            by_shard.entry(c).or_default().push((pkg, *fp));
         }
     }
-    for (shard, names) in by_shard {
+    for (shard, edits) in by_shard {
         let key = format!("{STATE_PREFIX}fp-{shard}.json");
         let mut stored: std::collections::BTreeMap<String, String> =
             match storage.get_bytes(&key).await {
                 Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-                Err(e) if is_not_found(&e) => continue,
+                Err(e) if is_not_found(&e) => Default::default(),
                 Err(e) => return Err(e),
             };
         let mut changed = false;
-        for name in names {
-            changed |= stored.remove(name).is_some();
+        for (name, fp) in edits {
+            changed |= match fp {
+                Some(fp) => stored.insert(name.to_string(), fp.to_string()).as_deref() != Some(fp),
+                None => stored.remove(name).is_some(),
+            };
         }
         if changed {
             let bytes = serde_json::to_vec(&stored)?;
@@ -3102,7 +3107,8 @@ pub async fn reconcile_excludes(
     // Dropping the fingerprint forces the audit to rebuild these names too, so it
     // agrees with the tick (both apply the live denylist). This runs before the
     // audit is spawned (the leader loop awaits the reconcile), so it is race-free.
-    invalidate_fingerprints(storage, &names).await?;
+    let drops: Vec<(&str, Option<&str>)> = names.iter().map(|name| (*name, None)).collect();
+    edit_fingerprints(storage, &drops).await?;
     for name in &names {
         mark_dirty(storage, name).await?;
     }
@@ -5988,14 +5994,15 @@ mod tests {
     /// The arbiter, not the pin, is what the CAS lands against — and it can move
     /// between the catch-up that vouched for it and the write. An arbiter that
     /// has reached the seq this pass computed off the pin has been written by
-    /// somebody else since: carry, and let the next audit reconcile onto its
-    /// link. (Racing it is not catastrophic here — the CAS would lose and adopt
+    /// somebody else since: defer, and let the next audit reconcile onto its
+    /// link. (Racing it is not catastrophic here — the CAS would lose and defer
     /// — but the same read is what catches the case below, which is.)
     #[tokio::test]
-    async fn an_arbiter_already_at_our_seq_carries_the_checkpoint() {
+    async fn an_arbiter_already_at_our_seq_defers_the_checkpoint() {
         let arbiter = Arc::new(InMemStorage::default());
         let pin = Arc::new(InMemStorage::default());
         let genesis = chain_link_bytes(0, "", "shared");
+        let walk_head = Some((0, sha256_hex(&genesis)));
         let second = chain_link_bytes(1, &sha256_hex(&genesis), "shared");
         // The pin is at head 0, so this pass computes seq 1 — which the arbiter
         // already holds.
@@ -6014,7 +6021,7 @@ mod tests {
             },
         ];
 
-        let carried = append_chain_link(
+        let landed = append_chain_link(
             &state,
             &fleet,
             1,
@@ -6022,14 +6029,14 @@ mod tests {
                 in_sync: vec![0, 1],
             },
             pinned.generation,
+            walk_head,
             one_package_delta(),
         )
         .await;
 
-        assert_eq!(
-            carried,
-            Some(one_package_delta()),
-            "an arbiter that already spent our seq must send the delta to the next audit"
+        assert!(
+            !landed,
+            "an arbiter that already spent our seq must leave the delta to the next audit"
         );
         assert_eq!(
             arbiter
@@ -6047,13 +6054,12 @@ mod tests {
     /// prefix that bucket does not have, which is a fork written by the append
     /// itself. Only comparing what the arbiter's head actually is sees it.
     #[tokio::test]
-    async fn an_arbiter_holding_other_bytes_at_the_previous_seq_carries_the_checkpoint() {
+    async fn an_arbiter_holding_other_bytes_at_the_previous_seq_defers_the_checkpoint() {
         let arbiter = Arc::new(InMemStorage::default());
         let pin = Arc::new(InMemStorage::default());
-        pin.insert(
-            &crate::transparency::chain_key(0),
-            chain_link_bytes(0, "", "left"),
-        );
+        let left = chain_link_bytes(0, "", "left");
+        let walk_head = Some((0, sha256_hex(&left)));
+        pin.insert(&crate::transparency::chain_key(0), left);
         let rival = chain_link_bytes(0, "", "right");
         arbiter.insert(&crate::transparency::chain_key(0), rival.clone());
         let (state, pinned) = fleet_pinned_second(arbiter.clone(), pin.clone());
@@ -6068,7 +6074,7 @@ mod tests {
             },
         ];
 
-        let carried = append_chain_link(
+        let landed = append_chain_link(
             &state,
             &fleet,
             1,
@@ -6076,13 +6082,13 @@ mod tests {
                 in_sync: vec![0, 1],
             },
             pinned.generation,
+            walk_head,
             one_package_delta(),
         )
         .await;
 
-        assert_eq!(
-            carried,
-            Some(one_package_delta()),
+        assert!(
+            !landed,
             "a link must never be written onto a head it does not chain onto"
         );
         assert!(
@@ -6102,58 +6108,241 @@ mod tests {
         );
     }
 
-    /// Guards the carry mechanism itself — the pre-existing fail-closed exit
-    /// (the pin's own chain listing failing) that every new defer arm reuses, so
-    /// this kills none of those arms directly. What it does pin is what they all
-    /// depend on: a pass that appends nothing must not lose the delta it was
-    /// holding. Dropping it leaves the chain committing an old sha over bytes
-    /// storage has already replaced, which `verify-chain` then reports as a
-    /// tamper that clears only if that package happens to churn again.
+    const CHAIN_FILE: &str = "a-1.0-py3-none-any.whl";
+
+    /// Replay the pin's whole chain: what it currently commits per package.
+    async fn chain_state(storage: &dyn Storage) -> crate::transparency::Delta {
+        let mut links = Vec::new();
+        for seq in 0.. {
+            match storage
+                .get_bytes(&crate::transparency::chain_key(seq))
+                .await
+            {
+                Ok(bytes) => links.push(
+                    serde_json::from_slice::<crate::transparency::ChainLink>(&bytes).unwrap(),
+                ),
+                Err(e) if is_not_found(&e) => break,
+                Err(e) => panic!("chain read: {e:?}"),
+            }
+        }
+        crate::transparency::replay(&links)
+    }
+
+    async fn chain_len(storage: &dyn Storage) -> usize {
+        storage
+            .list_all(crate::transparency::CHAIN_PREFIX)
+            .await
+            .unwrap()
+            .len()
+    }
+
+    /// The sha `a`'s chain replay commits for its one file.
+    async fn committed_sha(storage: &dyn Storage) -> Option<String> {
+        chain_state(storage)
+            .await
+            .get("a")
+            .and_then(|files| files.get(CHAIN_FILE))
+            .cloned()
+    }
+
+    /// Replace `a`'s one file consistently — new bytes and a sidecar naming
+    /// their sha — the way a legitimate supersede (or the attacker the chain
+    /// exists to catch) leaves storage. The listing fingerprint moves with it.
+    fn rewrite_chain_file(storage: &InMemStorage, bytes: &[u8], sha: &str) {
+        let key = format!("{PACKAGES_PREFIX}a/{CHAIN_FILE}");
+        let mut sidecar = test_sidecar(bytes.len() as u64, Some(crate::origin::PRIVATE));
+        sidecar.sha256 = sha.to_string();
+        storage.insert(&key, bytes.to_vec());
+        storage.insert(&sidecar_key(&key), serde_json::to_vec(&sidecar).unwrap());
+    }
+
+    /// A pass that rebuilt a churned package but ended without a checkpoint —
+    /// here one other package's status read failed, so the audit returned before
+    /// the append — must leave that churn for the next pass to commit. It used
+    /// to have recorded the package's new fingerprint already, so the next pass
+    /// skipped it as unchanged and the chain went on committing the old sha:
+    /// a `hash-changed` from `verify-chain` until the package next churned.
     #[tokio::test]
-    async fn a_deferred_checkpoint_carries_its_delta_into_the_next_pass() {
+    async fn a_failed_audit_pass_still_checkpoints_its_churn_on_the_next_pass() {
         let storage = Arc::new(InMemStorage::default());
-        let state = AppState::headless(storage.clone());
+        let state = test_app_state(storage.clone(), Duration::from_secs(3600));
         let pinned = state.pin();
-        let mut delta = crate::transparency::Delta::new();
-        delta.insert(
-            "six".to_string(),
-            [("six-1.0-py3-none-any.whl".to_string(), "aa".to_string())]
+        seed_private_artifact(&storage, "a", CHAIN_FILE);
+        audit(&state, &pinned, false).await.unwrap();
+        assert_eq!(committed_sha(storage.as_ref()).await, Some("ab".repeat(32)));
+
+        rewrite_chain_file(&storage, b"artifact-2", &"cd".repeat(32));
+        seed_private_artifact(&storage, "q", "q-1.0-py3-none-any.whl");
+        let status = crate::status::status_key("q");
+        storage.insert(&status, br#"{"status":"archived"}"#.to_vec());
+        storage.fail_reads_of(&status);
+        audit(&state, &pinned, false).await.unwrap_err();
+        assert_eq!(
+            chain_len(storage.as_ref()).await,
+            1,
+            "a failed pass appends nothing"
+        );
+
+        storage.heal_reads();
+        audit(&state, &pinned, false).await.unwrap();
+        assert_eq!(
+            committed_sha(storage.as_ref()).await,
+            Some("cd".repeat(32)),
+            "the next pass must commit the churn the failed pass rebuilt"
+        );
+
+        // Control: the landed checkpoint recorded the fingerprint, so an idle
+        // pass skips the package and appends nothing — nothing loops.
+        let links = chain_len(storage.as_ref()).await;
+        let skipped = state.metrics.audit_packages_skipped.load(Ordering::Relaxed);
+        audit(&state, &pinned, false).await.unwrap();
+        assert_eq!(chain_len(storage.as_ref()).await, links);
+        assert_eq!(
+            state.metrics.audit_packages_skipped.load(Ordering::Relaxed) - skipped,
+            2,
+            "both packages are provably unchanged once their checkpoint landed"
+        );
+    }
+
+    /// The handoff case. One leader rebuilds the churn but cannot read the
+    /// chain, so it defers; a different process then leads. Nothing of the
+    /// first leader's memory reaches it — only storage does — and it must still
+    /// commit the churn.
+    #[tokio::test]
+    async fn a_new_leader_commits_a_delta_the_old_leader_could_not_land() {
+        let storage = Arc::new(InMemStorage::default());
+        let old_leader = test_app_state(storage.clone(), Duration::from_secs(3600));
+        let pinned = old_leader.pin();
+        seed_private_artifact(&storage, "a", CHAIN_FILE);
+        audit(&old_leader, &pinned, false).await.unwrap();
+
+        rewrite_chain_file(&storage, b"artifact-2", &"cd".repeat(32));
+        storage.fail_lists_of(crate::transparency::CHAIN_PREFIX);
+        audit(&old_leader, &pinned, false).await.unwrap();
+        storage.heal_lists();
+        assert_eq!(chain_len(storage.as_ref()).await, 1);
+        assert_eq!(
+            old_leader
+                .metrics
+                .chain_checkpoint_deferrals
+                .load(Ordering::Relaxed),
+            1,
+            "a pass whose chain head was unreadable defers its churn, and says so"
+        );
+
+        // Another process: its own handle onto the same objects.
+        let handle: Arc<dyn Storage> = Arc::new(crate::counted_storage::CountedStorage::new(
+            storage.clone(),
+            Arc::new(crate::metrics::Metrics::default()),
+        ));
+        let new_leader = test_app_state(handle, Duration::from_secs(3600));
+        let pinned = new_leader.pin();
+        audit(&new_leader, &pinned, false).await.unwrap();
+        assert_eq!(
+            committed_sha(storage.as_ref()).await,
+            Some("cd".repeat(32)),
+            "the new leader must re-derive the churn from storage"
+        );
+    }
+
+    /// Genesis reads an unchanged package's shas straight from its sidecars. A
+    /// read that fails there must not leave the package's fingerprint standing:
+    /// the next pass would skip it as unchanged, and a package that never
+    /// churns would stay out of the chain — no tamper coverage — for good.
+    #[tokio::test]
+    async fn a_package_genesis_could_not_read_is_committed_by_the_next_pass() {
+        let storage = Arc::new(InMemStorage::default());
+        seed_private_artifact(&storage, "a", CHAIN_FILE);
+        seed_private_artifact(&storage, "b", "b-1.0-py3-none-any.whl");
+        // Fingerprints recorded while transparency was off: both packages are
+        // unchanged when it is turned on, so genesis reads their sidecars.
+        let mut untracked = AppState::headless(storage.clone());
+        untracked.transparency = false;
+        let untracked = Arc::new(untracked);
+        audit(&untracked, &untracked.pin(), false).await.unwrap();
+        assert_eq!(chain_len(storage.as_ref()).await, 0);
+
+        let state = test_app_state(storage.clone(), Duration::from_secs(3600));
+        let pinned = state.pin();
+        storage.fail_reads_of(&sidecar_key(&format!("{PACKAGES_PREFIX}a/{CHAIN_FILE}")));
+        audit(&state, &pinned, false).await.unwrap();
+        storage.heal_reads();
+        assert_eq!(
+            chain_len(storage.as_ref()).await,
+            1,
+            "genesis lands without `a`"
+        );
+        assert_eq!(committed_sha(storage.as_ref()).await, None);
+
+        audit(&state, &pinned, false).await.unwrap();
+        assert_eq!(
+            committed_sha(storage.as_ref()).await,
+            Some("ab".repeat(32)),
+            "the package genesis missed must be committed by the next pass"
+        );
+    }
+
+    /// Two audits overlap: this one observes `cd`, and while it walks another
+    /// leader's audit observes the newer `ef` and lands it. Chaining this pass's
+    /// older view after that link would make the chain commit `cd` over `ef`,
+    /// and once the other audit records `ef`'s fingerprint nothing re-derives
+    /// the package — a `hash-changed` that never clears. The pass must append
+    /// only onto the head its walk began from.
+    #[tokio::test]
+    async fn an_audit_never_chains_its_older_view_after_a_newer_checkpoint() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = test_app_state(storage.clone(), Duration::from_secs(3600));
+        let pinned = state.pin();
+        seed_private_artifact(&storage, "a", CHAIN_FILE);
+        audit(&state, &pinned, false).await.unwrap();
+        let genesis = storage
+            .get_bytes(&crate::transparency::chain_key(0))
+            .await
+            .unwrap();
+
+        rewrite_chain_file(&storage, b"artifact-2", &"cd".repeat(32));
+        // The rival audit, landing after this pass read `cd`: truth moves to
+        // `ef` and its checkpoint commits it at seq 1.
+        let key = format!("{PACKAGES_PREFIX}a/{CHAIN_FILE}");
+        let mut sidecar = test_sidecar(10, Some(crate::origin::PRIVATE));
+        sidecar.sha256 = "ef".repeat(32);
+        let sidecar = serde_json::to_vec(&sidecar).unwrap();
+        let mut packages = crate::transparency::Delta::new();
+        packages.insert(
+            "a".to_string(),
+            [(CHAIN_FILE.to_string(), "ef".repeat(32))]
                 .into_iter()
                 .collect(),
         );
-
-        // Pass one: the chain cannot be listed, so no head can be vouched for.
-        storage.fail_lists_of(crate::transparency::CHAIN_PREFIX);
-        write_chain_link(&state, &pinned, pinned.generation, delta.clone()).await;
-        storage.heal_lists();
-        assert!(
-            storage
-                .list_all(crate::transparency::CHAIN_PREFIX)
-                .await
-                .unwrap()
-                .is_empty(),
-            "a pass that could not read the chain must not have written to it"
+        let rival = crate::transparency::link_bytes(&crate::transparency::ChainLink {
+            seq: 1,
+            prev_sha256: sha256_hex(&genesis),
+            created: "2026-01-01T00:00:00Z".to_string(),
+            packages,
+        })
+        .unwrap();
+        storage.before_write_of(&format!("{SIMPLE_PREFIX}a/index.json"), move |objects| {
+            objects.insert(sidecar_key(&key), sidecar);
+            objects.insert(key, b"artifact-3".to_vec());
+            objects.insert(crate::transparency::chain_key(1), rival);
+        });
+        audit(&state, &pinned, false).await.unwrap();
+        assert_eq!(
+            chain_len(storage.as_ref()).await,
+            2,
+            "nothing chained after the rival"
         );
 
-        // Pass two has nothing of its own to commit: the carried delta is the
-        // churn, and riding along is the whole point of holding it.
-        write_chain_link(
-            &state,
-            &pinned,
-            pinned.generation,
-            crate::transparency::Delta::new(),
-        )
-        .await;
-
-        let bytes = storage
-            .get_bytes(&crate::transparency::chain_key(0))
+        // The rival records its fingerprint last.
+        let fp = package_fingerprint(storage.as_ref(), "a").await.unwrap();
+        edit_fingerprints(storage.as_ref(), &[("a", Some(fp.as_str()))])
             .await
-            .expect("the next pass must land the checkpoint it carried");
-        let link: crate::transparency::ChainLink =
-            serde_json::from_slice(&bytes).expect("a chain link this process just wrote");
+            .unwrap();
+        audit(&state, &pinned, false).await.unwrap();
         assert_eq!(
-            link.packages, delta,
-            "the carried delta must be exactly what the next pass committed"
+            committed_sha(storage.as_ref()).await,
+            Some("ef".repeat(32)),
+            "the chain's last word on the package must be the newest observation"
         );
     }
 

@@ -16,14 +16,17 @@ from __future__ import annotations
 import contextlib
 import json
 import os
+import re
 import shutil
 import subprocess
+import time
 from pathlib import Path
 
 import pytest
 
 from .helpers import (
     find_free_port,
+    http_get,
     http_request_auth,
     kill_process_tree,
     make_wheel,
@@ -340,6 +343,63 @@ def test_chain_appends_on_churn(disk_server_fast_reconcile, pypiron_bin, tmp_pat
     assert _verify_chain(pypiron_bin, server["data_dir"]).returncode == 0
 
 
+def _wait_deferrals(base_url: str, at_least: int, timeout: float = 20.0) -> None:
+    name = "pypiron_chain_checkpoint_deferrals_total"
+    deadline = time.time() + timeout
+    value = None
+    while time.time() < deadline:
+        code, body, _ = http_get(f"{base_url}/metrics")
+        m = re.search(rf"^{name} (\d+)$", body.decode(), re.MULTILINE) if code == 200 else None
+        value = int(m.group(1)) if m else None
+        if value is not None and value >= at_least:
+            return
+        time.sleep(0.2)
+    raise AssertionError(f"{name} never reached {at_least}; last {value}")
+
+
+def test_a_restarted_server_commits_a_checkpoint_its_predecessor_deferred(pypiron_bin, tmp_path):
+    """A leader that rebuilds a churned package but cannot land the checkpoint
+    (here its chain cannot be listed) and then goes away must not take that
+    churn with it. The next leader — a fresh process, sharing nothing but
+    storage — commits it. It used to be lost: the old leader had already
+    recorded the package as audited, so the new one skipped it, and verify-chain
+    reported the legitimate rewrite as `hash-changed` until the package next
+    changed."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    flags = ["--reconcile-interval-secs", "2"]
+    chain_dir = data_dir / "_transparency" / "chain"
+    parked = data_dir / "_transparency" / "chain-parked"
+    with _serve(pypiron_bin, data_dir, extra_args=flags) as server:
+        wheel = make_wheel("transhandoffa", "1.0.0", tmp_path)
+        _upload(server, wheel)
+        _wait_links(data_dir, at_least=1)
+
+        # Make the chain unlistable: a plain file where its directory was.
+        chain_dir.rename(parked)
+        chain_dir.write_text("")
+        artifact, sidecar = _artifact_and_sidecar(data_dir, _pkg_from_wheel(wheel))
+        rewritten = artifact.read_bytes() + b"superseded"
+        artifact.write_bytes(rewritten)
+        meta = json.loads(sidecar.read_text())
+        meta["sha256"] = sha256_file(artifact)
+        meta["size"] = len(rewritten)
+        sidecar.write_text(json.dumps(meta))
+        _wait_deferrals(server["base_url"], at_least=1)
+
+    chain_dir.unlink()
+    parked.rename(chain_dir)
+    with _serve(pypiron_bin, data_dir, extra_args=flags):
+        _wait_links(data_dir, at_least=2)
+
+    cp = _verify_chain(pypiron_bin, data_dir)
+    assert cp.returncode == 0, (
+        f"the rewrite must be committed, not a tamper:\n{cp.stdout}{cp.stderr}"
+    )
+    assert "fingerprint-changed" in cp.stdout, cp.stdout
+    assert artifact.name in cp.stdout, cp.stdout
+
+
 def test_transparency_false_writes_no_links(pypiron_bin, tmp_path):
     """`--transparency false` stops the audit writing links; the namespace stays
     empty even after churn and repeated sweeps."""
@@ -352,8 +412,6 @@ def test_transparency_false_writes_no_links(pypiron_bin, tmp_path):
     ) as server:
         _upload(server, make_wheel("transoffa", "1.0.0", tmp_path))
         # Give the sweep several intervals to (not) write anything.
-        import time
-
         time.sleep(6)
         assert _chain_links(data_dir) == [], "no links must be written with transparency off"
 
@@ -364,8 +422,6 @@ def test_transparency_false_writes_no_links(pypiron_bin, tmp_path):
 
 
 def _wait_links(data_dir: Path, at_least: int, timeout: float = 15.0) -> None:
-    import time
-
     deadline = time.time() + timeout
     while time.time() < deadline:
         if len(_chain_links(data_dir)) >= at_least:

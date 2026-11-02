@@ -306,7 +306,11 @@ The VOPR does not touch either — `examples/vopr.rs` contains no reference to
 `src/counters.rs` or `src/transparency.rs` — so their only coverage is
 hand-written: the unit tests in each module, plus `tests/test_counters.py`,
 `tests/test_transparency.py`, and the counter and chain cases in
-`tests/test_multibucket.py`. This paragraph previously said these were "covered
+`tests/test_multibucket.py`. The chain's recovery invariant (a fingerprint
+advances only after its checkpoint lands) is pinned by audit-level tests in
+`src/worker.rs`: a failed pass, a leader handoff, an overlapping audit, and a
+genesis read that failed each still end with the chain committing what storage
+holds. This paragraph previously said these were "covered
 by sampling instead." That was false, and it is how two production bugs reached
 a shipped feature and were found by audit rather than by a gate: a day-rollup
 key carrying no bucket identity, and a chain fork that could never heal. Until a

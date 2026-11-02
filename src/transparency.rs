@@ -26,17 +26,19 @@
 //! the time a link is written and a leader that just failed over cannot re-use a
 //! seq a peer already spent. When a pass cannot establish that — a chain it could
 //! not list, or a copy onto the pin that did not finish — it appends nothing and
-//! carries the delta to the next audit: a checkpoint that waits is repairable, and
-//! a fork written on a head nobody could vouch for is not.
+//! defers: a checkpoint that waits is repairable, and a fork written on a head
+//! nobody could vouch for is not.
 //!
-//! The append itself is a create-if-absent CAS on a
-//! deterministic arbiter (the first reachable bucket in config order), and a
-//! leader that loses that CAS adopts the winner and appends again at the next seq
-//! rather than dropping its delta — a dropped delta leaves the chain committing an
-//! old sha over new bytes, which `verify-chain` then reports as a tamper that
-//! never clears. A delta that no bucket would accept is held in the leader's
-//! memory and merged into the next pass; a crash there loses it, and that is the
-//! accepted residual (the next audit that sees the package change re-commits it).
+//! The append itself is a create-if-absent CAS on a deterministic arbiter (the
+//! first reachable bucket in config order), and it may only chain onto the head
+//! the audit's walk began from: a link that landed meanwhile came from an audit
+//! whose observations may be newer, and committing ours after it would put an old
+//! sha over new bytes. Deferring is safe because nothing is held in memory: a
+//! package's audit fingerprint advances only after the checkpoint committing it
+//! lands, so whichever node audits next — after a deferral, a failed pass, a
+//! crash, or a lease handoff — sees the package as changed, rebuilds it, and
+//! commits its delta from storage. A crash between the append and the fingerprint
+//! write costs a duplicate commitment of identical maps, which replays the same.
 //!
 //! Exit codes mirror `verify-index`: **0** chain valid and storage matches,
 //! **1** a violation (rows on stdout, an expected scriptable outcome), **2** the

@@ -146,7 +146,7 @@ links could not be copied onto the write pin, means this node cannot say its own
 head is the fleet head — and appending on a head nobody vouched for is how the
 same seq gets spent twice under different bytes, which is permanent (`verify-chain`
 reports `chain-diverged`, and no later pass merges the branches). So the pass
-appends nothing, holds its delta for the next audit, and counts
+appends nothing, leaves its delta for the next audit, and counts
 `pypiron_chain_checkpoint_deferrals_total`. **Deferral is the normal failure
 mode of this path**; a count that climbs every audit means the chain has stopped
 advancing and some bucket needs attention. Eligibility is the bound: buckets the
@@ -156,14 +156,24 @@ can still be written (see `private/ROADMAP.md`).
 
 Immediately before the CAS the leader re-reads the arbiter's own head: at or past
 the seq it was about to write, or holding different bytes at seq-1, means that
-bucket moved since the reconcile, and the pass carries rather than races. Losing
-the CAS is therefore the uncommon path now, not the ordinary way two leaders
-meet — but the loser still adopts the winner's link and appends at the following
-seq *in the same pass*, because dropping its delta would leave the chain
-committing an old sha over bytes storage has already replaced, a false
-`hash-changed` that clears only when that package next churns. A delta that lands
-nowhere is held in leader memory for the next pass; a crash there loses it, and
-the next audit that sees the package change re-commits it. A checkpoint carries `seq`, the sha256 of
+bucket moved since the reconcile, and the pass defers rather than races. The
+link may also only chain onto the head the audit's walk *began* from. A link
+that landed while the walk ran came from an audit that may have observed newer
+bytes, and chaining after it would commit this pass's older sha over them; so a
+moved head defers, and so does a lost CAS. Links therefore land in the order
+their walks observed storage.
+
+Deferring never loses a delta, because none is held anywhere: **a package's
+audit fingerprint advances only after the checkpoint committing it lands.** The
+shard write keeps a rebuilt package's previous fingerprint, and the audit
+records the new one once the link is on the arbiter. Any pass that ends without
+a checkpoint — a deferral, a failed package elsewhere in the sweep, a crash, a
+lease handoff to another node — leaves the package looking changed, so whichever
+node audits next rebuilds it and commits the delta from storage. A crash between
+the append and the fingerprint write costs a duplicate commitment of identical
+maps, which replays the same. While the chain is stalled, each audit rebuilds
+every package that churned since the stall began; the deferral counter is the
+alarm for that. A checkpoint carries `seq`, the sha256 of
 the previous checkpoint, and a churn-sized delta: for each package whose
 fingerprint changed since the last checkpoint, the per-file map filename →
 artifact sha256, taken from the sidecar. Genesis commits the whole corpus.
@@ -857,6 +867,10 @@ _dirty/<pkg>!<root>[~<seq>].intent       # empty marker: a writer is touching th
 _dirty/<pkg>!<root>[~<seq>].commit       # empty marker: truth changed, rebuild now
 _state/fp-<shard>.json                   # audit fingerprints: pkg -> listing hash at last rebuild
 _state/inventory.json                    # regenerable aggregate (pkg/file counts); nodes read it for `/`
+_state/proxy-dependencies.json           # proxy `include-dependencies` memo: per project, each
+                                         #   served release's Requires-Dist, read from upstream
+                                         #   PEP 658 files. Pure cache (keyed by upstream URL):
+                                         #   delete it and the next start re-reads every release.
 _sync/cursors.json                       # mirror-over-HTTP sync memo: pkg -> last upstream ETag
                                          #   (config-keyed). Pure cache for conditional fetch;
                                          #   never truth, never a view — delete it and the next

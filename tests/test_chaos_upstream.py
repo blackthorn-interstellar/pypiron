@@ -88,6 +88,8 @@ SPRAY_PAYLOAD = 512 * 1024
 # How long each sprayed request stays connected — enough for the server to fetch
 # the listing and get the fill going, and well inside the throttled transfer.
 SPRAY_HOLD_SECS = 1.5
+# How long a "stall" index fault holds the listing response.
+INDEX_STALL_SECS = 1.0
 
 
 class _FaultHandler(http.server.BaseHTTPRequestHandler):
@@ -109,6 +111,17 @@ class _FaultHandler(http.server.BaseHTTPRequestHandler):
             if info is None:
                 self.send_error(404)
                 return
+            server = self.server  # type: ignore[attr-defined]
+            with server.lock:
+                server.index_hits[pkg] = server.index_hits.get(pkg, 0) + 1
+            fault = server.index_faults.get(pkg)
+            if fault == "error500":
+                self.send_error(500)
+                return
+            if fault == "stall":
+                # Hold the listing long enough that concurrent cold requests
+                # overlap on it.
+                time.sleep(INDEX_STALL_SECS)
             self._serve_index(pkg, info)
             return
 
@@ -290,6 +303,9 @@ class _FaultServer:
         self.httpd.completed = {}  # type: ignore[attr-defined]
         self.httpd.completed_at = {}  # type: ignore[attr-defined]
         self.httpd.pace = {}  # type: ignore[attr-defined]
+        self.httpd.index_faults = {}  # type: ignore[attr-defined]
+        self.httpd.index_hits = {}  # type: ignore[attr-defined]
+        self.httpd.lock = threading.Lock()  # type: ignore[attr-defined]
         self.base = f"http://127.0.0.1:{port}"
         self._thread = threading.Thread(target=self.httpd.serve_forever, daemon=True)
         self._thread.start()
@@ -315,6 +331,14 @@ class _FaultServer:
             # "slow" only: stretch this package's transfer past the default, for
             # tests that need to land an event in the middle of a download.
             self.httpd.pace[pkg] = pace  # type: ignore[attr-defined]
+
+    def set_index_fault(self, pkg: str, mode: Optional[str]) -> None:
+        """Fault the `/simple/<pkg>/` listing: "error500", "stall", or None."""
+        self.httpd.index_faults[pkg] = mode  # type: ignore[attr-defined]
+
+    def index_hits(self, pkg: str) -> int:
+        """Listing GETs this upstream has served for `pkg`."""
+        return self.httpd.index_hits.get(pkg, 0)  # type: ignore[attr-defined]
 
     def heal(self, pkg: str) -> None:
         self.httpd.faults[pkg] = "healthy"  # type: ignore[attr-defined]
@@ -737,3 +761,51 @@ def test_hanging_upstream_is_bounded_and_clean(proxy_over_fault, tmp_path):
 
     upstream.heal(pkg)
     _healthy_fetch_matches(proxy, pkg, filename, sha256_file(wheel))
+
+
+def test_listing_error_is_not_remembered_as_missing(proxy_over_fault, tmp_path):
+    """One failed upstream listing fetch must not read as "no such package" for
+    a full listing TTL (60s) after upstream recovers."""
+    proxy, upstream = proxy_over_fault
+    pkg = "blippkg"
+    filename = upstream.register(pkg, make_wheel(pkg, "1.0", tmp_path))
+    url = f"{proxy['base_url']}/simple/{pkg}/"
+
+    upstream.set_index_fault(pkg, "error500")
+    code, _, _ = http_get(url, timeout=FAULT_GET_TIMEOUT)
+    assert code == 404, "nothing cached yet, so the blip falls back to the local index"
+
+    upstream.set_index_fault(pkg, None)
+    deadline = time.monotonic() + 20
+    while True:
+        code, body, _ = http_get(url, timeout=FAULT_GET_TIMEOUT)
+        if code == 200:
+            break
+        assert time.monotonic() < deadline, "listing still missing 20s after upstream recovered"
+        time.sleep(0.5)
+    assert filename in body.decode()
+
+
+def test_concurrent_listing_misses_share_one_fetch(proxy_over_fault, tmp_path):
+    """N concurrent cold requests for one package make one upstream listing GET."""
+    proxy, upstream = proxy_over_fault
+    pkg = "herdpkg"
+    filename = upstream.register(pkg, make_wheel(pkg, "1.0", tmp_path))
+    upstream.set_index_fault(pkg, "stall")
+    url = f"{proxy['base_url']}/simple/{pkg}/"
+
+    n = 16
+    start = threading.Barrier(n)
+    results: list = [None] * n
+
+    def get(i: int) -> None:
+        start.wait()
+        results[i] = http_get(url, timeout=FAULT_GET_TIMEOUT)
+
+    threads = [threading.Thread(target=get, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert all(r is not None and r[0] == 200 and filename in r[1].decode() for r in results)
+    assert upstream.index_hits(pkg) == 1

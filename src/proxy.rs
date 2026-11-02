@@ -9,7 +9,10 @@
 //! correct; only the package *listing* needs freshness, and it is fetched
 //! from the upstream PEP 691 API (which carries PEP 700 upload times, so
 //! `--exclude-newer` stays historically correct) and cached for
-//! [`LISTING_TTL`].
+//! [`LISTING_TTL`]. Concurrent misses for one package share one fetch. A
+//! failed fetch is remembered only for [`LISTING_ERROR_TTL`], and the last good
+//! listing keeps being served through an outage for at most
+//! [`LISTING_MAX_STALE`].
 //!
 //! Package pages are rendered from the upstream listing with our own
 //! `/files/` URLs; artifact GETs download-verify-commit through the upload
@@ -50,6 +53,14 @@ use crate::upload::{FinishedSpool, UploadSpool};
 /// refetching. Bounds the lag for "a new release appeared upstream"; the
 /// artifacts themselves are immutable and cached forever.
 const LISTING_TTL: Duration = Duration::from_secs(60);
+/// How long a failed upstream fetch is remembered when there is no usable last
+/// good listing. Long enough that a dead upstream isn't probed on every request,
+/// short enough that a recovered one is used again almost at once.
+const LISTING_ERROR_TTL: Duration = Duration::from_secs(5);
+/// The oldest last good listing still served while upstream keeps failing. Past
+/// it the package falls back to local-only, so an upstream yank or quarantine
+/// can't go unseen for longer than this.
+const LISTING_MAX_STALE: Duration = Duration::from_secs(3600);
 /// Hard ceiling on cached listings. Each `/simple/:pkg` miss against a proxy
 /// upstream inserts one entry (including negative `Missing` ones for 404s), and
 /// there are unbounded distinct normalized names, so without a cap a stream of
@@ -137,11 +148,50 @@ enum Listing {
     /// Upstream said 404 — cached as hard as a hit, or a stampede of typo'd
     /// installs becomes an upstream hammer.
     Missing,
+    /// Upstream failed and there was nothing fresh enough to reuse. Served like
+    /// `Missing` (local-only), but held for [`LISTING_ERROR_TTL`], never a full
+    /// TTL: an upstream blip must not read as "no such package" after recovery.
+    Unreachable,
 }
 
 struct CacheEntry {
     listing: Listing,
+    /// When upstream last really answered. Never moved by a failed refresh, so
+    /// it is what [`LISTING_MAX_STALE`] measures.
     fetched: Instant,
+    /// Serve from cache until this instant.
+    expires: Instant,
+}
+
+impl CacheEntry {
+    fn served(&self) -> Option<Arc<Found>> {
+        match &self.listing {
+            Listing::Found(found) => Some(found.clone()),
+            Listing::Missing | Listing::Unreachable => None,
+        }
+    }
+}
+
+/// What a failed refresh leaves in the cache: the last good listing, if it is
+/// younger than [`LISTING_MAX_STALE`] (and never served past that age), else a
+/// short-lived [`Listing::Unreachable`].
+fn after_error(prev: Option<CacheEntry>, now: Instant) -> CacheEntry {
+    match prev {
+        Some(CacheEntry {
+            listing: Listing::Found(found),
+            fetched,
+            ..
+        }) if now.saturating_duration_since(fetched) < LISTING_MAX_STALE => CacheEntry {
+            listing: Listing::Found(found),
+            fetched,
+            expires: (now + LISTING_TTL).min(fetched + LISTING_MAX_STALE),
+        },
+        _ => CacheEntry {
+            listing: Listing::Unreachable,
+            fetched: now,
+            expires: now + LISTING_ERROR_TTL,
+        },
+    }
 }
 
 pub struct Proxy {
@@ -1548,74 +1598,67 @@ impl Proxy {
     }
 
     /// The filtered upstream listing for `pkg`, served from cache within
-    /// [`LISTING_TTL`]. On upstream errors a stale entry is reused for one
-    /// more TTL (already-resolved installs keep working through blips);
-    /// with nothing to reuse the package is treated as missing for one TTL,
-    /// so a dead upstream degrades to local-only instead of a per-request
-    /// timeout.
+    /// [`LISTING_TTL`]. Concurrent misses share one fetch. On an upstream error
+    /// the last good listing is reused (already-resolved installs keep working
+    /// through blips) until it is [`LISTING_MAX_STALE`] old; with nothing to
+    /// reuse the package is served local-only for [`LISTING_ERROR_TTL`], so a
+    /// dead upstream isn't a per-request timeout and a recovered one is used
+    /// again within seconds.
     async fn listing(&self, state: &AppState, pkg: &str) -> Option<Arc<Found>> {
-        if let Some(cached) = self.cached_listing(pkg, false) {
+        if let Some(cached) = self.cached_listing(pkg) {
+            return cached;
+        }
+        // Single-flight on the fill slot map; artifact keys start `packages/`,
+        // so this key can't collide. A waiter rechecks and takes the leader's
+        // result. Held through the status persist and the cache insert.
+        let _slot = self.acquire_download_slot(&format!("listing:{pkg}")).await;
+        if let Some(cached) = self.cached_listing(pkg) {
             return cached;
         }
         state
             .metrics
             .proxy_listing_fetches
             .fetch_add(1, Ordering::Relaxed);
-        let listing = match self.fetch_listing(state, pkg).await {
-            Ok(listing) => listing,
+        let fetched = self.fetch_listing(state, pkg).await;
+        if let Ok(Listing::Found(found)) = &fetched {
+            // Persist the observed upstream status durably. The in-memory listing
+            // renders the freeze, but a lockfile-pinned `/files/...` download of an
+            // already-cached artifact never re-fetches the listing — only the
+            // durable `.project-status.json`, folded into the byte gate's
+            // quarantined set by the audit sweep, blocks those bytes.
+            self.persist_observed_status(state, pkg, &found.status)
+                .await;
+        }
+        let mut map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
+        let now = Instant::now();
+        let entry = match fetched {
+            Ok(listing) => CacheEntry {
+                listing,
+                fetched: now,
+                expires: now + LISTING_TTL,
+            },
             Err(e) => {
                 state
                     .metrics
                     .proxy_listing_errors
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(%pkg, upstream = %self.upstream, error=?e, "proxy: upstream listing fetch failed");
-                if let Some(stale) = self.cached_listing(pkg, true) {
-                    return stale;
-                }
-                Listing::Missing
+                after_error(map.remove(pkg), now)
             }
         };
-        let result = match &listing {
-            Listing::Found(found) => Some(found.clone()),
-            Listing::Missing => None,
-        };
-        // Persist the observed upstream status durably. The in-memory listing
-        // renders the freeze, but a lockfile-pinned `/files/...` download of an
-        // already-cached artifact never re-fetches the listing — only the
-        // durable `.project-status.json`, folded into the byte gate's
-        // quarantined set by the audit sweep, blocks those bytes.
-        if let Listing::Found(found) = &listing {
-            self.persist_observed_status(state, pkg, &found.status)
-                .await;
-        }
-        let mut map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
+        let served = entry.served();
         if map.len() >= MAX_LISTINGS && !map.contains_key(pkg) {
-            evict_listings(&mut map);
+            evict_listings(&mut map, now);
         }
-        map.insert(
-            pkg.to_string(),
-            CacheEntry {
-                listing,
-                fetched: Instant::now(),
-            },
-        );
-        result
+        map.insert(pkg.to_string(), entry);
+        served
     }
 
-    /// Cached listing lookup. `revive` refreshes the entry's timestamp and
-    /// ignores expiry — the stale-on-upstream-error path.
-    fn cached_listing(&self, pkg: &str, revive: bool) -> Option<Option<Arc<Found>>> {
-        let mut map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
-        let entry = map.get_mut(pkg)?;
-        if revive {
-            entry.fetched = Instant::now();
-        } else if entry.fetched.elapsed() >= LISTING_TTL {
-            return None;
-        }
-        Some(match &entry.listing {
-            Listing::Found(found) => Some(found.clone()),
-            Listing::Missing => None,
-        })
+    /// Cached listing lookup: `None` when absent or expired.
+    fn cached_listing(&self, pkg: &str) -> Option<Option<Arc<Found>>> {
+        let map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.get(pkg)?;
+        (Instant::now() < entry.expires).then(|| entry.served())
     }
 
     /// Persist the upstream PEP 792 status so the byte gate blocks cached bytes
@@ -1972,17 +2015,18 @@ fn download_grace() -> Duration {
         .map_or(DOWNLOAD_GRACE, Duration::from_secs)
 }
 
-/// Keep the listings cache bounded: first drop everything past its TTL (those
+/// Keep the listings cache bounded: first drop everything expired (those
 /// would be re-fetched anyway), and if that didn't free a slot, evict the
-/// oldest entries down to half the cap so this stays amortized O(1) per insert.
-fn evict_listings(map: &mut HashMap<String, CacheEntry>) {
-    map.retain(|_, e| e.fetched.elapsed() < LISTING_TTL);
+/// soonest-expiring entries down to half the cap so this stays amortized O(1)
+/// per insert.
+fn evict_listings(map: &mut HashMap<String, CacheEntry>, now: Instant) {
+    map.retain(|_, e| e.expires > now);
     if map.len() < MAX_LISTINGS {
         return;
     }
     let mut by_age: Vec<(String, Instant)> =
-        map.iter().map(|(k, e)| (k.clone(), e.fetched)).collect();
-    by_age.sort_by_key(|(_, fetched)| *fetched);
+        map.iter().map(|(k, e)| (k.clone(), e.expires)).collect();
+    by_age.sort_by_key(|(_, expires)| *expires);
     for (k, _) in by_age.into_iter().take(MAX_LISTINGS / 2) {
         map.remove(&k);
     }
@@ -1992,6 +2036,71 @@ fn evict_listings(map: &mut HashMap<String, CacheEntry>) {
 mod tests {
     use super::*;
     use std::str::FromStr;
+
+    fn found_entry(fetched: Instant) -> CacheEntry {
+        CacheEntry {
+            listing: Listing::Found(Arc::new(Found {
+                files: Vec::new(),
+                html: rendered(String::new()),
+                json: rendered(String::new()),
+                status: crate::status::ProjectStatusDoc::default(),
+            })),
+            fetched,
+            expires: fetched + LISTING_TTL,
+        }
+    }
+
+    fn is_unreachable(entry: &CacheEntry, now: Instant) -> bool {
+        matches!(entry.listing, Listing::Unreachable)
+            && entry.fetched == now
+            && entry.expires == now + LISTING_ERROR_TTL
+    }
+
+    #[test]
+    fn a_failed_fetch_with_nothing_to_reuse_is_remembered_briefly() {
+        let now = Instant::now();
+        assert!(is_unreachable(&after_error(None, now), now));
+        // A cached 404 that then errors is not re-armed for a full TTL either.
+        let missing = CacheEntry {
+            listing: Listing::Missing,
+            fetched: now,
+            expires: now + LISTING_TTL,
+        };
+        let later = now + Duration::from_secs(61);
+        assert!(is_unreachable(&after_error(Some(missing), later), later));
+    }
+
+    #[test]
+    fn a_failed_fetch_reuses_the_last_good_listing_without_aging_it() {
+        let t0 = Instant::now();
+        let now = t0 + Duration::from_secs(600);
+        let kept = after_error(Some(found_entry(t0)), now);
+        assert!(kept.served().is_some());
+        assert_eq!(kept.fetched, t0);
+        assert_eq!(kept.expires, now + LISTING_TTL);
+        // A second error later still measures from the real fetch.
+        let again = now + LISTING_TTL;
+        let kept = after_error(Some(kept), again);
+        assert_eq!(kept.fetched, t0);
+        assert_eq!(kept.expires, again + LISTING_TTL);
+    }
+
+    #[test]
+    fn the_last_good_listing_is_never_served_past_max_stale() {
+        let t0 = Instant::now();
+        // Revived just before the cap: the expiry is clamped to the cap.
+        let edge = t0 + LISTING_MAX_STALE - Duration::from_secs(1);
+        let kept = after_error(Some(found_entry(t0)), edge);
+        assert!(kept.served().is_some());
+        assert_eq!(kept.expires, t0 + LISTING_MAX_STALE);
+        // Past the cap: dropped.
+        let past = t0 + LISTING_MAX_STALE + Duration::from_secs(1);
+        assert!(is_unreachable(
+            &after_error(Some(found_entry(t0)), past),
+            past
+        ));
+        assert!(is_unreachable(&after_error(Some(kept), past), past));
+    }
 
     #[test]
     fn relative_and_absolute_upstream_urls_resolve() {

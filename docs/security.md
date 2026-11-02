@@ -109,6 +109,9 @@ The `[mirror]` configuration can allow or deny package names and versions, then
 filter by file type, Python or ABI tag, platform, size, release age, and
 pre-release status. The on-demand proxy and `sync` share these rules.
 
+`sync --include-dependencies` extends an approval to everything the approved
+packages need; the proxy serves only the names on the list.
+
 Approval does not bypass the cooldown, malware block, hash check, or upstream
 withdrawals. [Configure mirror selection](reference/configuration.md#mirror-selection)
 

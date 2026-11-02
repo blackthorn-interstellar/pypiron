@@ -232,6 +232,9 @@
 # off a private devpi/Artifactory/Nexus). Required with source-kind = "pypicloud".
 # Source upload dates are preserved when available; yank state is not.
 # as-private = false
+# Also mirror everything the selected packages need, transitively: every extra
+# and platform of the packages you list, and each version a requirement allows.
+# include-dependencies = false
 # One-off repair of old migration dates: pass --repair-upload-times (CLI/env
 # only), with --as-private and --dry-run to preview. Upgrade client and server.
 # concurrency = 16                          # files transferring at once, all packages

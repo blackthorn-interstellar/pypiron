@@ -300,10 +300,11 @@ pub(crate) async fn sync_cursors_put(
     // Authenticate on headers alone before touching the body. A body extractor
     // (`body: String`) runs before the handler, so an unauthenticated caller could
     // otherwise force axum to buffer up to the global 1 GiB limit before this
-    // check ever runs. A cursor doc is a few KiB of JSON — read it under a tight
-    // cap only once the admin credential is proven.
+    // check ever runs. A cursor doc is ~200 bytes a project, plus each release's
+    // dependency memo under `--include-dependencies` — read it under a cap sized
+    // for a large mirror only once the admin credential is proven.
     require_admin(&state, request.headers())?;
-    let body = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+    let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
         .await
         .map_err(|_| {
             (

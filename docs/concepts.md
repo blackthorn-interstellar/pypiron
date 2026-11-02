@@ -25,8 +25,8 @@ a file hides it from normal resolution while keeping pinned installs working.
   a package when a client first asks for it, checks the upstream hash, stores
   it, and serves later installs from your storage.
 - **Sync ahead of time.** `pypiron sync` copies an approved set of packages to
-  your server. Use this for predictable builds and networks without internet
-  access.
+  your server, and with `--include-dependencies` everything they need. Use this
+  for predictable builds and networks without internet access.
 
 Both methods use the `[mirror]` rules in `pypiron.toml`. You can select package
 names and versions, wheel tags, platforms, file types, sizes, release ages, and

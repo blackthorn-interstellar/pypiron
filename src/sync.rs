@@ -24,12 +24,12 @@
 
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args, ValueEnum};
-use futures::stream::{self, StreamExt};
+use futures::stream::{self, StreamExt, TryStreamExt};
 use pep440_rs::{Version, VersionSpecifiers};
 use reqwest::{multipart, Client};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
@@ -43,7 +43,8 @@ use tracing::{debug, error, info, warn};
 use crate::config::{self, ConfigFile, UpstreamConfig};
 use crate::denylist::Denylist;
 use crate::names::{
-    checked_pkg_name, infer_version_from_filename, parse_wheel_tags, PrivateNames, WheelTags,
+    checked_pkg_name, infer_version_from_filename, normalize_pkg_name, parse_wheel_tags,
+    PrivateNames, WheelTags,
 };
 use crate::origin;
 use crate::render::SIMPLE_JSON_CONTENT_TYPE;
@@ -172,6 +173,16 @@ pub struct SyncArgs {
     /// Requires --as-private; copies no new files. Use --dry-run to preview.
     #[arg(long, env = "PYPIRON_SYNC_REPAIR_UPLOAD_TIMES")]
     pub repair_upload_times: bool,
+
+    /// Also mirror every dependency of the selected packages, and theirs, until
+    /// nothing new turns up. Follows every extra and every platform, and takes
+    /// each version some requirement allows, so any approved release installs.
+    /// The `[mirror]` filters and package excludes still apply; a dependency
+    /// never widens a package you listed yourself. Reads each release's
+    /// metadata file (PEP 658), so a release without one is reported and its
+    /// dependencies are not followed.
+    #[arg(long, env = "PYPIRON_SYNC_INCLUDE_DEPENDENCIES")]
+    pub include_dependencies: bool,
 
     /// Ferry the advisory snapshot (the OSV malware/vulnerability feed) to the
     /// destination alongside the packages. Unset (the default): relay the source
@@ -886,6 +897,8 @@ struct Resolved {
     /// field and the mirror-only metadata, and skips yank reconcile / status relay.
     as_private: bool,
     repair_upload_times: bool,
+    /// Follow every selected package's dependencies (`--include-dependencies`).
+    include_dependencies: bool,
     /// The reserved private names: a mirror run refuses them before any network
     /// traffic (the server enforces it again), and a pypicloud migration expands
     /// its project work list from them.
@@ -1011,6 +1024,13 @@ impl Resolved {
         if args.repair_upload_times && !as_private {
             bail!("--repair-upload-times requires --as-private");
         }
+        let include_dependencies =
+            args.include_dependencies || sync.include_dependencies.unwrap_or(false);
+        // A migration drains private packages; their public dependencies are a
+        // mirror's business, and would land here as private.
+        if include_dependencies && as_private {
+            bail!("--include-dependencies cannot be combined with --as-private");
+        }
         let allow_insecure_source =
             args.allow_insecure_source || sync.allow_insecure_source.unwrap_or(false);
 
@@ -1109,6 +1129,7 @@ impl Resolved {
             source_auth,
             as_private,
             repair_upload_times: args.repair_upload_times,
+            include_dependencies,
             private,
             advisory_feed,
             advisories: None,
@@ -1450,6 +1471,180 @@ fn parse_spec_line(line: &str) -> Result<PackageSpec> {
     Ok(PackageSpec { name, specifiers })
 }
 
+/// One project a run syncs and the versions it takes: those admitted by any of
+/// `specifiers`, or every version when `None`. A listed package brings its own
+/// spec; a dependency brings each requirement that pulled it in.
+struct Job {
+    name: String,
+    specifiers: Option<Vec<VersionSpecifiers>>,
+    /// Pulled in by `--include-dependencies` rather than listed.
+    dependency: bool,
+}
+
+impl Job {
+    fn admits(&self, filename: &str) -> bool {
+        self.specifiers
+            .as_ref()
+            .is_none_or(|any| any.iter().any(|s| spec_matches_filename(s, filename)))
+    }
+}
+
+/// The versions a run takes of one project, as specifier strings; `None` takes
+/// every version. Strings, so two rounds can tell whether anything changed.
+type Want = Option<BTreeSet<String>>;
+
+fn widen(want: &mut Want, specifiers: Option<&VersionSpecifiers>) {
+    match (want.as_mut(), specifiers) {
+        (Some(set), Some(s)) => {
+            set.insert(s.to_string());
+        }
+        (Some(_), None) => *want = None,
+        (None, _) => {}
+    }
+}
+
+/// One `Requires-Dist` entry, as far as following it needs.
+#[derive(Debug, PartialEq)]
+struct Requirement {
+    name: String,
+    /// `None` admits every version, as does a range that doesn't parse.
+    specifiers: Option<VersionSpecifiers>,
+    /// Extras this requirement asks of `name` (`urllib3[socks]`).
+    extras: Vec<String>,
+    /// The requirer's extras it belongs to (`; extra == "x"`); empty = always.
+    only_for: Vec<String>,
+}
+
+/// Parse a `Requires-Dist` entry. Platform and Python markers are ignored, so
+/// every platform is followed; only the `extra` ones matter. `None` for a
+/// direct URL reference, which no index can serve.
+fn parse_requirement(req: &str) -> Option<Requirement> {
+    let (req, marker) = req.split_once(';').unwrap_or((req, ""));
+    let req = req.trim();
+    if req.contains('@') {
+        return None;
+    }
+    let end = req
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | '.')))
+        .unwrap_or(req.len());
+    let name = checked_pkg_name(&req[..end])?;
+    let mut rest = req[end..].trim_start();
+    let mut extras = Vec::new();
+    if let Some(open) = rest.strip_prefix('[') {
+        let (list, after) = open.split_once(']')?;
+        extras = list
+            .split(',')
+            .map(|e| normalize_pkg_name(e.trim()))
+            .filter(|e| !e.is_empty())
+            .collect();
+        rest = after;
+    }
+    let rest = rest
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .trim();
+    let specifiers = (!rest.is_empty())
+        .then(|| VersionSpecifiers::from_str(rest).ok())
+        .flatten();
+    Some(Requirement {
+        name,
+        specifiers,
+        extras,
+        only_for: marker_extras(marker),
+    })
+}
+
+/// The extras an environment marker names with `extra == "…"` (either way
+/// round). Any other test of `extra` is unusual enough to follow always.
+fn marker_extras(marker: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut rest = marker.trim_start();
+    while let Some(c) = rest.chars().next() {
+        let len = match c {
+            '"' | '\'' => rest[1..].find(c).map_or(rest.len(), |i| i + 2),
+            c if c.is_alphanumeric() || c == '_' => rest
+                .find(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .unwrap_or(rest.len()),
+            _ => rest
+                .find(|c: char| c.is_alphanumeric() || "_\"' ()".contains(c))
+                .filter(|&i| i > 0)
+                .unwrap_or(c.len_utf8()),
+        };
+        tokens.push(&rest[..len]);
+        rest = rest[len..].trim_start();
+    }
+    let quoted = |t: &str| {
+        (t.len() >= 2 && (t.starts_with('"') || t.starts_with('\'')))
+            .then(|| normalize_pkg_name(&t[1..t.len() - 1]))
+    };
+    tokens
+        .windows(3)
+        .filter(|w| w[1] == "==")
+        .filter_map(|w| match (w[0], w[2]) {
+            ("extra", value) | (value, "extra") => quoted(value),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Everything a run syncs: the listed packages as given, plus every project
+/// their known requirements reach, each taking the versions some requirement
+/// admits. A listed package keeps its own spec — approval is explicit, and a
+/// dependency never widens it. Every extra of a listed package is followed;
+/// a dependency's extras only when a requirement asks for them, as an
+/// installer would. Reserved private names are never followed: the
+/// destination serves those itself.
+fn closure(
+    roots: &[PackageSpec],
+    requires: &HashMap<String, Vec<String>>,
+    private: &PrivateNames,
+) -> BTreeMap<String, Want> {
+    let mut wants = BTreeMap::new();
+    for spec in roots {
+        widen(
+            wants
+                .entry(spec.name.clone())
+                .or_insert_with(|| Some(Default::default())),
+            spec.specifiers.as_ref(),
+        );
+    }
+    let listed: HashSet<String> = wants.keys().cloned().collect();
+    // The extras followed so far per dependency; a project is revisited when
+    // they grow. Listed projects follow all of theirs.
+    let mut extras: HashMap<String, BTreeSet<String>> = HashMap::new();
+    let mut queue: Vec<String> = listed.iter().cloned().collect();
+    while let Some(name) = queue.pop() {
+        for req in requires.get(&name).into_iter().flatten() {
+            let Some(req) = parse_requirement(req) else {
+                continue;
+            };
+            let active = listed.contains(&name)
+                || req.only_for.is_empty()
+                || extras
+                    .get(&name)
+                    .is_some_and(|on| req.only_for.iter().any(|e| on.contains(e)));
+            if !active || listed.contains(&req.name) || private.matches(&req.name) {
+                continue;
+            }
+            let first = !wants.contains_key(&req.name);
+            widen(
+                wants
+                    .entry(req.name.clone())
+                    .or_insert_with(|| Some(Default::default())),
+                req.specifiers.as_ref(),
+            );
+            let on = extras.entry(req.name.clone()).or_default();
+            let before = on.len();
+            on.extend(req.extras);
+            if first || on.len() > before {
+                queue.push(req.name);
+            }
+        }
+    }
+    wants
+}
+
 pub(crate) fn spec_matches_filename(specifiers: &VersionSpecifiers, filename: &str) -> bool {
     infer_version_from_filename(filename)
         .and_then(|v| Version::from_str(&v).ok())
@@ -1495,6 +1690,20 @@ struct CursorEntry {
     /// changed too, forcing one full sweep that recomputes it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     next_eligible_at: Option<i64>,
+    /// With `--include-dependencies`: what the releases read so far require, so
+    /// a re-run reads metadata only for new releases and an unchanged listing
+    /// (304) still knows where to go next. A release's metadata never changes,
+    /// so this outlives a config change. Absent = never read; that forces a 200.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    deps: Option<DepsMemo>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct DepsMemo {
+    /// Releases whose metadata was read, or found missing.
+    versions: BTreeSet<String>,
+    /// Their `Requires-Dist` entries.
+    requires: BTreeSet<String>,
 }
 
 /// project name -> its cursor.
@@ -1505,7 +1714,7 @@ type Cursors = HashMap<String, CursorEntry>;
 /// beside the ETag so a config change forces a full fetch instead of trusting a
 /// 304 against a listing that was filtered differently. Tag vectors are sorted
 /// so argument order doesn't perturb the key.
-fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
+fn config_key(resolved: &Resolved, job: &Job) -> String {
     let m = &resolved.mirror;
     let mut h = Sha256::new();
     // Bump when the *meaning* of a filter changes, so cursors keyed on the old
@@ -1590,7 +1799,12 @@ fn config_key(resolved: &Resolved, spec: &PackageSpec) -> String {
         h.update([0]);
     }
     h.update([0x1d]);
-    if let Some(s) = &spec.specifiers {
+    // One spec hashes exactly as it always has, so a listed package's cursor
+    // survives; a dependency's union separates its specs with a NUL.
+    for (i, s) in job.specifiers.iter().flatten().enumerate() {
+        if i > 0 {
+            h.update([0]);
+        }
         h.update(s.to_string().as_bytes());
     }
     format!("{:x}", h.finalize())
@@ -1803,7 +2017,8 @@ async fn relay_from_source(client: &Client, resolved: &Resolved) -> Option<Vec<u
         warn!(%status, "advisory feed: source has no advisory feed to relay; skipping (package sync continues)");
         return None;
     }
-    match read_capped_feed_body(resp).await {
+    // The same ceiling the server applies to its own feed pulls.
+    match read_capped_body(resp, crate::advisories::MAX_FEED_BYTES, "advisory feed").await {
         Ok(bytes) => Some(bytes),
         Err(e) => {
             warn!(error = %e, "advisory feed: reading the source feed failed; skipping the relay (package sync continues)");
@@ -1812,19 +2027,18 @@ async fn relay_from_source(client: &Client, resolved: &Resolved) -> Option<Vec<u
     }
 }
 
-/// Read a feed response body into memory with the same ceiling the server applies
-/// to its own pulls, so a hostile/misconfigured source can't OOM the sync host.
-async fn read_capped_feed_body(resp: reqwest::Response) -> Result<Vec<u8>> {
-    let cap = crate::advisories::MAX_FEED_BYTES;
+/// Read a response body into memory under `cap` bytes, so a hostile or
+/// misconfigured source can't OOM the sync host. `what` names it in errors.
+async fn read_capped_body(resp: reqwest::Response, cap: u64, what: &str) -> Result<Vec<u8>> {
     if resp.content_length().is_some_and(|len| len > cap) {
-        bail!("advisory feed exceeds {cap} bytes (Content-Length)");
+        bail!("{what} exceeds {cap} bytes (Content-Length)");
     }
     let mut bytes = Vec::new();
     let mut stream = resp.bytes_stream();
     while let Some(chunk) = stream.next().await {
-        let chunk = chunk.context("reading advisory feed body")?;
+        let chunk = chunk.with_context(|| format!("reading {what} body"))?;
         if bytes.len() as u64 + chunk.len() as u64 > cap {
-            bail!("advisory feed exceeds {cap} bytes");
+            bail!("{what} exceeds {cap} bytes");
         }
         bytes.extend_from_slice(&chunk);
     }
@@ -1909,7 +2123,8 @@ async fn head_dest_feed(
 /// the package/file fan-out updates them.
 struct Progress {
     start: Instant,
-    pkgs_total: usize,
+    /// Grows as `--include-dependencies` finds more projects.
+    pkgs_total: AtomicUsize,
     pkgs_done: AtomicUsize,
     /// Packages whose selection is known (their bytes are in `bytes_seen`).
     pkgs_known: AtomicUsize,
@@ -1920,6 +2135,8 @@ struct Progress {
     bytes_seen: AtomicU64,
     skipped: AtomicU64,
     legacy_skipped: AtomicU64,
+    /// Releases whose dependencies couldn't be read: no metadata file.
+    no_metadata: AtomicU64,
     errors: AtomicU64,
     /// Signalled when the run is over so the ticker stops immediately instead of
     /// sleeping out its interval.
@@ -1930,7 +2147,7 @@ impl Progress {
     fn new(pkgs_total: usize) -> Self {
         Self {
             start: Instant::now(),
-            pkgs_total,
+            pkgs_total: AtomicUsize::new(pkgs_total),
             pkgs_done: AtomicUsize::new(0),
             pkgs_known: AtomicUsize::new(0),
             files_done: AtomicU64::new(0),
@@ -1938,6 +2155,7 @@ impl Progress {
             bytes_seen: AtomicU64::new(0),
             skipped: AtomicU64::new(0),
             legacy_skipped: AtomicU64::new(0),
+            no_metadata: AtomicU64::new(0),
             errors: AtomicU64::new(0),
             done: tokio::sync::Notify::new(),
         }
@@ -1954,6 +2172,12 @@ impl Progress {
     }
     fn legacy_skip(&self) {
         self.legacy_skipped.fetch_add(1, Ordering::Relaxed);
+    }
+    fn no_metadata(&self) {
+        self.no_metadata.fetch_add(1, Ordering::Relaxed);
+    }
+    fn add_packages(&self, n: usize) {
+        self.pkgs_total.fetch_add(n, Ordering::Relaxed);
     }
     fn downloaded(&self, bytes: u64) {
         self.bytes_done.fetch_add(bytes, Ordering::Relaxed);
@@ -1980,6 +2204,7 @@ impl Progress {
         let bytes_done = self.bytes_done.load(Ordering::Relaxed);
         let skipped = self.skipped.load(Ordering::Relaxed);
         let legacy = self.legacy_skipped.load(Ordering::Relaxed);
+        let pkgs_total = self.pkgs_total.load(Ordering::Relaxed);
         let errors = self.errors.load(Ordering::Relaxed);
         let rate = if el > 0.0 {
             bytes_done as f64 / el
@@ -1993,9 +2218,12 @@ impl Progress {
             } else {
                 String::new()
             };
+            let no_metadata = match self.no_metadata.load(Ordering::Relaxed) {
+                0 => String::new(),
+                n => format!(" · {} releases without dependency metadata", fmt_count(n)),
+            };
             return format!(
-                "sync done: {pkgs_done}/{} pkgs · {} files · {} in {} (avg {}/s) · {} already present{legacy} · {errors} errors",
-                self.pkgs_total,
+                "sync done: {pkgs_done}/{pkgs_total} pkgs · {} files · {} in {} (avg {}/s) · {} already present{legacy}{no_metadata} · {errors} errors",
                 fmt_count(files_done),
                 human_bytes(bytes_done),
                 human_dur(el),
@@ -2010,7 +2238,7 @@ impl Progress {
         let known = self.pkgs_known.load(Ordering::Relaxed).max(pkgs_done);
         let est_total = (known > 0).then(|| {
             let seen = self.bytes_seen.load(Ordering::Relaxed) as f64;
-            (seen * self.pkgs_total as f64 / known as f64).max(bytes_done as f64)
+            (seen * pkgs_total as f64 / known as f64).max(bytes_done as f64)
         });
         let bytes = match est_total {
             Some(total) if total > 0.0 => format!(
@@ -2028,8 +2256,7 @@ impl Progress {
             _ => String::new(),
         };
         format!(
-            "sync {pkgs_done}/{} pkgs · {} files · {bytes} · {}/s · {} elapsed{eta} · {errors} err",
-            self.pkgs_total,
+            "sync {pkgs_done}/{pkgs_total} pkgs · {} files · {bytes} · {}/s · {} elapsed{eta} · {errors} err",
             fmt_count(files_done),
             human_bytes(rate as u64),
             human_dur(el),
@@ -2139,6 +2366,7 @@ pub async fn run_sync(
     let sync = &mut cfg.sync;
     for (id, slot) in [
         ("as_private", &mut sync.as_private),
+        ("include_dependencies", &mut sync.include_dependencies),
         ("allow_insecure_source", &mut sync.allow_insecure_source),
         ("allow_legacy_versions", &mut sync.allow_legacy_versions),
     ] {
@@ -2243,41 +2471,89 @@ pub async fn run_sync(
     // --full, or any read error) simply means every project full-fetches.
     let cursors = load_cursors(&client, &resolved).await;
 
-    // Keep the package slots occupied as each finishes; a slow package must
-    // not prevent later packages from starting. Files in flight are bounded
-    // globally by `file_slots`, not per package.
-    let progress = Arc::new(Progress::new(resolved.mirror.include_packages.len()));
+    // Sync in rounds. Each round works the projects whose selection is new or
+    // widened: round one is the listed packages, plus — with
+    // `--include-dependencies` — everything last run's memos already reach, so
+    // a steady-state run is one round of 304s. Later rounds follow what this
+    // run newly read. Wants only grow, so this ends.
+    //
+    // Within a round, keep the package slots occupied as each finishes; a slow
+    // package must not prevent later packages from starting. Files in flight
+    // are bounded globally by `file_slots`, not per package.
+    let mut requires: HashMap<String, Vec<String>> = cursors
+        .iter()
+        .filter(|_| resolved.include_dependencies)
+        .filter_map(|(name, c)| {
+            Some((
+                name.clone(),
+                c.deps.as_ref()?.requires.iter().cloned().collect(),
+            ))
+        })
+        .collect();
+    let mut done: HashMap<String, Want> = HashMap::new();
+    let progress = Arc::new(Progress::new(0));
     let ticker = (!args.no_progress).then(|| spawn_progress(progress.clone()));
     let mut failures = 0usize;
     let mut refreshed: Cursors = Cursors::new();
-    {
-        let mut packages = stream::iter(&resolved.mirror.include_packages)
-            .map(|spec| {
-                let job = sync_one_package(
-                    &client,
-                    &resolved,
-                    &endpoint,
-                    spec,
-                    cursors.get(&spec.name),
-                    &progress,
-                );
-                async move { (spec, job.await) }
+    loop {
+        let jobs: Vec<(Job, Want)> = closure(
+            &resolved.mirror.include_packages,
+            &requires,
+            &resolved.private,
+        )
+        .into_iter()
+        .filter(|(name, want)| done.get(name) != Some(want))
+        .map(|(name, want)| {
+            let job = Job {
+                dependency: !resolved
+                    .mirror
+                    .include_packages
+                    .iter()
+                    .any(|s| s.name == name),
+                specifiers: want.as_ref().map(|set| {
+                    set.iter()
+                        .filter_map(|s| VersionSpecifiers::from_str(s).ok())
+                        .collect()
+                }),
+                name,
+            };
+            (job, want)
+        })
+        .collect();
+        if jobs.is_empty() {
+            break;
+        }
+        if !done.is_empty() {
+            info!("following dependencies: {} more project(s)", jobs.len());
+        }
+        progress.add_packages(jobs.len());
+        let mut packages = stream::iter(&jobs)
+            .map(|(job, _)| {
+                // A project this run already synced resumes from that result.
+                let prev = refreshed.get(&job.name).or(cursors.get(&job.name));
+                let run = sync_one_package(&client, &resolved, &endpoint, job, prev, &progress);
+                async move { (job, run.await) }
             })
             .buffer_unordered(resolved.package_concurrency);
-        while let Some((spec, result)) = packages.next().await {
+        let mut finished = Vec::new();
+        while let Some((job, result)) = packages.next().await {
             progress.package_done();
             match result {
-                Ok(outcome) => {
-                    if let Some(entry) = outcome.new_cursor {
-                        refreshed.insert(spec.name.clone(), entry);
-                    }
-                }
+                Ok(outcome) => finished.push((job.name.clone(), outcome)),
                 Err(e) => {
-                    error!(package=%spec.name, error=?e, "package sync failed");
+                    error!(package=%job.name, error=?e, "package sync failed");
                     failures += 1;
                 }
             }
         }
+        drop(packages);
+        for (name, outcome) in finished {
+            if let Some(entry) = outcome.new_cursor {
+                refreshed.insert(name.clone(), entry);
+            }
+            requires.insert(name, outcome.requires);
+        }
+        done.extend(jobs.into_iter().map(|(job, want)| (job.name, want)));
     }
 
     // Keep cursors for projects this run didn't touch (or 304'd), overwrite the
@@ -2309,17 +2585,21 @@ struct PackageOutcome {
     /// `None` means "leave the existing cursor as-is" (a 304 skip, a dry run, or
     /// a source with no ETag).
     new_cursor: Option<CursorEntry>,
+    /// With `--include-dependencies`: the `Requires-Dist` entries of every
+    /// release read for this project, the next round's leads.
+    requires: Vec<String>,
 }
 
 async fn sync_one_package(
     client: &Client,
     resolved: &Resolved,
     endpoint: &str,
-    spec: &PackageSpec,
+    job: &Job,
     prev_cursor: Option<&CursorEntry>,
     progress: &Progress,
 ) -> Result<PackageOutcome> {
-    let pkg = spec.name.as_str();
+    let pkg = job.name.as_str();
+    let prev_deps = prev_cursor.and_then(|c| c.deps.as_ref());
 
     // Policy gate before any network traffic. The server enforces it again —
     // defense in both places. A migration (`--as-private`) is the one writer
@@ -2329,13 +2609,16 @@ async fn sync_one_package(
     }
     if resolved.denylist.name_fully_denied(pkg) {
         info!("{pkg}: excluded by mirror package denylist");
-        return Ok(PackageOutcome { new_cursor: None });
+        return Ok(PackageOutcome {
+            new_cursor: None,
+            requires: Vec::new(),
+        });
     }
 
     // Conditional fetch: replay last run's ETag (unless its config differs, or
     // this is a dry run that wants the full picture). A 304 means nothing
     // changed upstream — no files to add, nothing to reconcile — so skip.
-    let cfg_key = config_key(resolved, spec);
+    let cfg_key = config_key(resolved, job);
     let if_none_match = if resolved.dry_run || resolved.repair_upload_times {
         None
     } else {
@@ -2361,6 +2644,8 @@ async fn sync_one_package(
             // while upstream's ETag stays put, so a package with a fix advisory
             // younger than the cooldown always re-selects. A handful a week.
             .filter(|_| !recent_fix(resolved, pkg))
+            // A 304 says nothing about dependencies; only a memo can.
+            .filter(|_| !resolved.include_dependencies || prev_deps.is_some())
             .map(|c| c.etag.as_str())
     };
     let fetched = match resolved.source_kind {
@@ -2392,7 +2677,21 @@ async fn sync_one_package(
     let (index, etag, last_serial) = match fetched {
         IndexFetch::NotModified => {
             info!("{pkg}: upstream unchanged since last sync (304)");
-            return Ok(PackageOutcome { new_cursor: None });
+            return Ok(PackageOutcome {
+                new_cursor: None,
+                requires: prev_deps
+                    .map(|d| d.requires.iter().cloned().collect())
+                    .unwrap_or_default(),
+            });
+        }
+        // Old releases name projects since deleted upstream; that must not
+        // fail every future run.
+        IndexFetch::NotFound if job.dependency => {
+            warn!("{pkg}: required by a mirrored package but not found on the source");
+            return Ok(PackageOutcome {
+                new_cursor: None,
+                requires: Vec::new(),
+            });
         }
         IndexFetch::NotFound => bail!("Package not found on source: {pkg}"),
         IndexFetch::Found {
@@ -2403,7 +2702,19 @@ async fn sync_one_package(
     };
 
     let (selected, upstream_status, upstream_files, next_eligible_at) =
-        select_from_index(index, resolved, spec, progress);
+        select_from_index(index, resolved, job, progress);
+
+    // Read before any upload, so a dry run previews the whole closure too.
+    let deps = if resolved.include_dependencies {
+        let memo = prev_deps.cloned().unwrap_or_default();
+        Some(read_dependencies(client, resolved, pkg, &selected, memo, progress).await?)
+    } else {
+        None
+    };
+    let requires: Vec<String> = deps
+        .iter()
+        .flat_map(|d| d.requires.iter().cloned())
+        .collect();
 
     let mut errors = 0usize;
 
@@ -2456,7 +2767,10 @@ async fn sync_one_package(
             bail!("timestamp repair requires a private destination package: {pkg}");
         }
         repair_upload_times(client, resolved, pkg, &selected, local, progress).await?;
-        return Ok(PackageOutcome { new_cursor: None });
+        return Ok(PackageOutcome {
+            new_cursor: None,
+            requires,
+        });
     }
 
     // The check above can only refuse a claim the destination stated in terms
@@ -2511,7 +2825,10 @@ async fn sync_one_package(
         for s in &selected {
             println!("[dry-run] would copy {} ({})", s.file.filename, s.file.url);
         }
-        return Ok(PackageOutcome { new_cursor: None });
+        return Ok(PackageOutcome {
+            new_cursor: None,
+            requires,
+        });
     }
 
     // Biggest first: a multi-GB wheel started last would run alone at the end.
@@ -2632,9 +2949,13 @@ async fn sync_one_package(
             config: cfg_key,
             serial: last_serial,
             next_eligible_at,
+            deps,
         })
     };
-    Ok(PackageOutcome { new_cursor })
+    Ok(PackageOutcome {
+        new_cursor,
+        requires,
+    })
 }
 
 /// Fetch the destination's locally-materialized PEP 691 index (its own truth:
@@ -2871,7 +3192,7 @@ async fn relay_status(
 fn select_from_index(
     index: SimpleIndex,
     resolved: &Resolved,
-    spec: &PackageSpec,
+    job: &Job,
     progress: &Progress,
 ) -> (
     Vec<Selected>,
@@ -2884,7 +3205,7 @@ fn select_from_index(
     // Resolve relative URLs against the SAME listing URL the fetch used (see
     // simple_root) — an explicit `+simple`/`simple` base must climb from the
     // right depth, or devpi's `../../+f/...` links resolve to the wrong path.
-    let base_url = format!("{}/{}/", simple::simple_root(&resolved.src_base), spec.name);
+    let base_url = format!("{}/{}/", simple::simple_root(&resolved.src_base), job.name);
 
     // PEP 691 file URLs may be relative; resolve them (and provenance URLs)
     // against the index page so a non-PyPI source — another pypiron, whose
@@ -2951,30 +3272,28 @@ fn select_from_index(
             progress.legacy_skip();
             if resolved.list_legacy_skips {
                 warn!(
-                    package = %spec.name,
+                    package = %job.name,
                     filename = %file.filename,
                     "sync: skipping non-PEP-440 (legacy) version; pass --allow-legacy-versions to mirror it"
                 );
             }
             continue;
         }
-        if let Some(specifiers) = &spec.specifiers {
-            // A specifier gates by version, which the Simple API doesn't carry —
-            // we infer it from the filename. A file whose version can't be
-            // parsed can't be proven to match, so it's skipped (the same
-            // conservative rule the release-keyed API applied to junk versions).
-            if !spec_matches_filename(specifiers, &file.filename) {
-                continue;
-            }
+        // A specifier gates by version, which the Simple API doesn't carry — we
+        // infer it from the filename. A file whose version can't be parsed can't
+        // be proven to match, so it's skipped (the same conservative rule the
+        // release-keyed API applied to junk versions).
+        if !job.admits(&file.filename) {
+            continue;
         }
-        if resolved.denylist.file_denied(&spec.name, &file.filename) {
+        if resolved.denylist.file_denied(&job.name, &file.filename) {
             continue;
         }
         let security_fix = resolved.mirror.fix_lifts_cooldown()
             && version.as_deref().is_some_and(|v| {
                 resolved.advisories.as_ref().is_some_and(|db| {
                     db.security_fix(
-                        &spec.name,
+                        &job.name,
                         v,
                         crate::clock::now_utc(),
                         resolved.mirror.fix_settle,
@@ -2991,7 +3310,7 @@ fn select_from_index(
         }
     }
     if selected.is_empty() {
-        warn!("No matching files for package '{}'", spec.name);
+        warn!("No matching files for package '{}'", job.name);
     }
     (selected, upstream_status, upstream_files, next_eligible_at)
 }
@@ -3018,6 +3337,110 @@ fn recent_fix(resolved: &Resolved, pkg: &str) -> bool {
 const MAX_PROVENANCE_BYTES: u64 = 4 * 1024 * 1024;
 
 /// Best-effort provenance fetch — supplemental, never fails the file.
+/// Read the dependencies of each selected release `memo` hasn't seen: one
+/// metadata file per release, a wheel's when there is one. A release with no
+/// metadata file is counted and remembered, so it is reported once.
+async fn read_dependencies(
+    client: &Client,
+    resolved: &Resolved,
+    pkg: &str,
+    selected: &[Selected],
+    mut memo: DepsMemo,
+    progress: &Progress,
+) -> Result<DepsMemo> {
+    let rank = |f: &SimpleFile| {
+        (
+            f.has_core_metadata(),
+            file_format(&f.filename) == Format::Wheel,
+        )
+    };
+    let mut pick: BTreeMap<&str, &SimpleFile> = BTreeMap::new();
+    for s in selected {
+        let Some(version) = s.version.as_deref() else {
+            continue;
+        };
+        if memo.versions.contains(version) {
+            continue;
+        }
+        let best = pick.entry(version).or_insert(&s.file);
+        if rank(&s.file) > rank(best) {
+            *best = &s.file;
+        }
+    }
+    let read: Vec<(&str, Option<Vec<String>>)> = stream::iter(pick)
+        .map(|(version, file)| async move {
+            let requires = if file.has_core_metadata() {
+                Some(fetch_requires(client, resolved, file).await?)
+            } else {
+                None
+            };
+            Ok::<_, anyhow::Error>((version, requires))
+        })
+        .buffer_unordered(resolved.concurrency)
+        .try_collect()
+        .await?;
+    for (version, requires) in read {
+        match requires {
+            Some(r) => memo.requires.extend(r),
+            None => {
+                info!("{pkg} {version}: no metadata file on the source; its dependencies are not followed");
+                progress.no_metadata();
+            }
+        }
+        memo.versions.insert(version.to_string());
+    }
+    Ok(memo)
+}
+
+/// Ceiling for one release's metadata file; its README rides inside it.
+const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
+
+/// A release's `Requires-Dist`, from its PEP 658 metadata file, checked against
+/// the digest the listing published for it.
+async fn fetch_requires(
+    client: &Client,
+    resolved: &Resolved,
+    file: &SimpleFile,
+) -> Result<Vec<String>> {
+    let base = file.url.split('#').next().unwrap_or(&file.url);
+    let url = reqwest::Url::parse(&format!("{base}.metadata"))
+        .with_context(|| format!("unparseable file URL for {}", file.filename))?;
+    let mut last_err = None;
+    for attempt in 1..=DOWNLOAD_ATTEMPTS {
+        let fetched = async {
+            let resp = crate::ssrf::guarded_get_with(
+                client,
+                &resolved.guard,
+                url.clone(),
+                None,
+                |req, hop| match hop_auth(resolved.source_auth.as_ref(), hop) {
+                    Some((u, p)) => req.basic_auth(u, Some(p)),
+                    None => req,
+                },
+            )
+            .await?
+            .error_for_status()?;
+            read_capped_body(resp, MAX_METADATA_BYTES, "metadata file").await
+        }
+        .await;
+        match fetched {
+            Ok(bytes) => match file.core_metadata_sha256() {
+                Some(want) if !crate::hash::sha256_hex(&bytes).eq_ignore_ascii_case(want) => {
+                    last_err = Some(anyhow!("metadata sha256 mismatch for {}", file.filename));
+                }
+                _ => return Ok(crate::coremeta::parse(&bytes).requires_dist),
+            },
+            Err(e) if e.downcast_ref::<crate::ssrf::Blocked>().is_some() => return Err(e),
+            Err(e) => last_err = Some(e),
+        }
+        if attempt < DOWNLOAD_ATTEMPTS {
+            warn!(file=%file.filename, attempt, error=?last_err, "metadata fetch failed; retrying");
+            tokio::time::sleep(std::time::Duration::from_secs(2u64.pow(attempt))).await;
+        }
+    }
+    Err(last_err.unwrap_or_else(|| anyhow!("metadata fetch failed for {}", file.filename)))
+}
+
 async fn download_provenance(
     client: &Client,
     guard: &crate::ssrf::Guard,
@@ -4674,6 +5097,7 @@ mod tests {
             source_auth: None,
             as_private: false,
             repair_upload_times: false,
+            include_dependencies: false,
             private: PrivateNames::default(),
             advisory_feed: None,
             advisories: None,
@@ -4701,6 +5125,142 @@ mod tests {
         }
     }
 
+    /// A job taking every version (`&[]`) or any of `specifiers`.
+    fn job(name: &str, specifiers: &[&str]) -> Job {
+        Job {
+            name: name.to_string(),
+            specifiers: (!specifiers.is_empty()).then(|| {
+                specifiers
+                    .iter()
+                    .map(|s| VersionSpecifiers::from_str(s).unwrap())
+                    .collect()
+            }),
+            dependency: false,
+        }
+    }
+
+    #[test]
+    fn parse_requirement_reads_name_range_and_extras() {
+        let req = |name: &str, s: Option<&str>, extras: &[&str], only_for: &[&str]| {
+            Some(Requirement {
+                name: name.to_string(),
+                specifiers: s.map(|s| VersionSpecifiers::from_str(s).unwrap()),
+                extras: extras.iter().map(|e| e.to_string()).collect(),
+                only_for: only_for.iter().map(|e| e.to_string()).collect(),
+            })
+        };
+        assert_eq!(
+            parse_requirement("idna<4,>=2.5"),
+            req("idna", Some("<4,>=2.5"), &[], &[])
+        );
+        assert_eq!(
+            parse_requirement("PySocks!=1.5.7,>=1.5.6; extra == \"socks\""),
+            req("pysocks", Some("!=1.5.7,>=1.5.6"), &[], &["socks"])
+        );
+        assert_eq!(
+            parse_requirement("chardet (<6,>=3.0.2) ; 'Use_Chardet' == extra"),
+            req("chardet", Some("<6,>=3.0.2"), &[], &["use-chardet"])
+        );
+        assert_eq!(
+            parse_requirement(
+                "Foo_Bar[Baz, qux]>=1; python_version<'3.9' and (extra=='a' or extra == \"b\")"
+            ),
+            req("foo-bar", Some(">=1"), &["baz", "qux"], &["a", "b"])
+        );
+        // Non-ASCII in a marker is just another token.
+        assert_eq!(
+            parse_requirement("x; extra ≥ \"é\" or extra == \"ok\""),
+            req("x", None, &[], &["ok"])
+        );
+        // Platform markers don't gate anything: every platform is followed.
+        assert_eq!(
+            parse_requirement("pywin32; sys_platform == \"win32\""),
+            req("pywin32", None, &[], &[])
+        );
+        // An unparseable range admits every version; a URL is no index's to serve.
+        assert_eq!(
+            parse_requirement("odd >=1.0-beta-legacy"),
+            req("odd", None, &[], &[])
+        );
+        assert_eq!(parse_requirement("pkg @ https://example.com/pkg.whl"), None);
+        assert_eq!(parse_requirement(""), None);
+    }
+
+    #[test]
+    fn closure_follows_requirements_and_keeps_listed_specs() {
+        let requires: HashMap<String, Vec<String>> = [
+            (
+                "app",
+                vec!["lib>=2", "extra-dep; extra == \"x\"", "acme-auth"],
+            ),
+            ("lib", vec!["leaf==1.0", "app>=9"]),
+            ("other", vec!["lib<3"]),
+            ("unlisted", vec!["never"]),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
+        .collect();
+        let private = PrivateNames::new(Some("acme"), Vec::new()).unwrap();
+        let want = |set: &[&str]| Some(set.iter().map(|s| s.to_string()).collect::<BTreeSet<_>>());
+
+        let wants = closure(&[spec("app", Some("==1.0"))], &requires, &private);
+        assert_eq!(
+            wants.into_iter().collect::<Vec<_>>(),
+            vec![
+                // A dependency never widens a listed package (lib wants app>=9).
+                ("app".to_string(), want(&["==1.0"])),
+                ("extra-dep".to_string(), None),
+                ("leaf".to_string(), want(&["==1.0"])),
+                ("lib".to_string(), want(&[">=2"])),
+            ]
+        );
+
+        // Two requirers union their ranges; a listed package keeps its own.
+        let wants = closure(
+            &[spec("app", None), spec("other", None)],
+            &requires,
+            &private,
+        );
+        assert_eq!(wants["lib"], want(&["<3", ">=2"]));
+        let wants = closure(
+            &[spec("app", None), spec("lib", Some(">=2"))],
+            &requires,
+            &private,
+        );
+        assert_eq!(wants["lib"], want(&[">=2"]));
+        // A dependency's extras are followed only when a requirement asks.
+        let requires: HashMap<String, Vec<String>> = [
+            ("top", vec!["mid", "opt[fast]; extra == \"perf\""]),
+            ("mid", vec!["test-only; extra == \"test\"", "opt"]),
+            (
+                "opt",
+                vec!["speedup; extra == \"fast\"", "docs-only; extra == \"docs\""],
+            ),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.into_iter().map(String::from).collect()))
+        .collect();
+        let wants = closure(&[spec("top", None)], &requires, &private);
+        assert_eq!(
+            wants.keys().map(String::as_str).collect::<Vec<_>>(),
+            ["mid", "opt", "speedup", "top"]
+        );
+
+        // Listing a name twice unions its specs; a bare listing takes everything.
+        let wants = closure(
+            &[spec("app", Some("<1")), spec("app", Some(">2"))],
+            &requires,
+            &private,
+        );
+        assert_eq!(wants["app"], want(&["<1", ">2"]));
+        let wants = closure(
+            &[spec("app", Some("<1")), spec("app", None)],
+            &requires,
+            &private,
+        );
+        assert_eq!(wants["app"], None);
+    }
+
     #[test]
     fn desired_yank_reflects_upstream_or_flags_removal() {
         let mut by_name = HashMap::new();
@@ -4722,7 +5282,7 @@ mod tests {
     #[test]
     fn config_key_is_stable_and_change_sensitive() {
         let r = resolved_with(time_filter(None, None), "https://pypi.org");
-        let s = spec("requests", None);
+        let s = job("requests", &[]);
         let k = config_key(&r, &s);
 
         // Deterministic across calls.
@@ -4752,7 +5312,12 @@ mod tests {
             k,
             config_key(&resolved_with(wheels, "https://pypi.org"), &s)
         );
-        assert_ne!(k, config_key(&r, &spec("requests", Some(">=2"))));
+        assert_ne!(k, config_key(&r, &job("requests", &[">=2"])));
+        // A dependency's union of specs is its own selection.
+        assert_ne!(
+            config_key(&r, &job("requests", &[">=2"])),
+            config_key(&r, &job("requests", &[">=2", "<1"]))
+        );
 
         // A mirror-mode cursor must never let an --as-private run 304-skip.
         let mut as_private = resolved_with(time_filter(None, None), "https://pypi.org");
@@ -4781,7 +5346,7 @@ mod tests {
 
     #[test]
     fn config_key_cutoffs_are_stable_across_relative_runs() {
-        let s = spec("requests", None);
+        let s = job("requests", &[]);
 
         // Two runs of the same relative cutoff resolve to two different instants
         // (now slides), but the raw input is identical. The key must stay stable

@@ -5,8 +5,8 @@ description: Serve packages without internet access by syncing an approved packa
 # Run without internet access
 
 An offline pypiron server never contacts PyPI. Put every required package in
-its storage before clients need it. `sync` does not resolve dependencies, so
-your list must include direct and transitive packages.
+its storage before clients need it. List the packages you approve and add
+`include-dependencies = true`: `sync` brings everything they need with them.
 
 Choose one transfer path:
 
@@ -52,25 +52,13 @@ the removable-media path does not.
 
 ## The connected host
 
-Create `packages.txt` with one approved package requirement per line:
+Create `packages.txt` with one approved package per line, optionally with a
+version range:
 
 ```text
-six==1.17.0
+requests
+fastapi>=0.110
 ```
-
-For a real uv project, export its locked dependency set:
-
-```bash
-uv export --frozen --no-dev --no-emit-project \
-  --no-hashes --no-annotate --no-header \
-  | sed -E 's/[[:space:]]*;.*$//' > packages.txt
-```
-
-The command removes environment markers, so the result is a conservative union
-of locked registry packages. Review it before syncing and remove local paths or
-Git dependencies, which cannot be fetched from PyPI. Use
-[mirror filters](../reference/configuration.md#mirror-selection) to restrict
-wheels by the offline clients' Python versions and platforms.
 
 For a private network transfer, save this as `pypiron.toml` beside the list:
 
@@ -83,8 +71,30 @@ exclude-newer = "7 days"
 from = "https://pypi.org"
 to = "https://pypi.internal"
 admin-user = "admin"
+include-dependencies = true
 advisory-feed = "https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip"
 ```
+
+With `include-dependencies`, every listed release installs offline, with any
+of its extras, on any platform: sync also copies each version of each
+dependency that some requirement allows. That is often far more than the list
+itself — `fastapi` alone brings about a hundred projects. Use
+[mirror filters](../reference/configuration.md#mirror-selection) to keep only
+the offline clients' Python versions and platforms. A package you list keeps
+its own range even when a dependency asks for more.
+
+To copy only the exact versions one project locks instead, export them and
+leave `include-dependencies` out:
+
+```bash
+uv export --frozen --no-dev --no-emit-project \
+  --no-hashes --no-annotate --no-header \
+  | sed -E 's/[[:space:]]*;.*$//' > packages.txt
+```
+
+The command removes environment markers, so the result is a conservative union
+of locked registry packages. Review it before syncing and remove local paths or
+Git dependencies, which cannot be fetched from PyPI.
 
 Preview the transfer, then run it:
 
@@ -103,7 +113,7 @@ Confirm an install from inside the offline network:
 ```bash
 uv venv verify-install
 uv pip install --python verify-install/bin/python \
-  --default-index https://pypi.internal/simple/ six==1.17.0
+  --default-index https://pypi.internal/simple/ requests
 ```
 
 ## Plan a large first sync

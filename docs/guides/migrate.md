@@ -157,9 +157,9 @@ Then replace repeated `--include-package` arguments with:
 --include-packages-from packages.txt
 ```
 
-`sync` does not resolve dependencies. Include every private package you need;
+A migration copies only what you list. Include every private package you need;
 for public packages, enable pypiron's PyPI proxy or sync a separate approved
-public list.
+public list with `--include-dependencies`.
 
 ## What migration preserves
 

@@ -223,6 +223,8 @@ pub struct SyncConfig {
     pub allow_insecure_source: Option<bool>,
     /// Migrate into the private namespace instead of mirroring.
     pub as_private: Option<bool>,
+    /// Also mirror the dependencies of every selected package, transitively.
+    pub include_dependencies: Option<bool>,
     /// Download spool directory (default: the system temp dir).
     pub spool_dir: Option<PathBuf>,
     /// Extra CA bundle for source TLS; a relative path resolves next to this file.

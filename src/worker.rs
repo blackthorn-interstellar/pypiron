@@ -1450,8 +1450,9 @@ pub async fn audit(
     // guarantee from OSV blocking (a compromised project PyPI froze stays refused
     // even with malware blocking off). This is a repair pass, not the propagation
     // path: a status write publishes its own increment the moment it lands
-    // (`advisories::arm_quarantine`), and this sweep re-derives the whole set from
-    // the sidecars to heal any drift. The publish merges against
+    // (`advisories::arm_quarantine`), the tick re-derives that one name again
+    // when it drains the write's marker (`republish_quarantine`), and this sweep
+    // re-derives the whole set from the sidecars to heal whatever both missed. The publish merges against
     // `quarantine_base`, so a set derived before a concurrent increment cannot
     // undo it; it persists on change only, so an unchanged set writes nothing.
     let set: std::collections::BTreeSet<String> = quarantined_names.into_iter().collect();
@@ -2607,6 +2608,7 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
         // Move an owned handle into the task — the tick's pin, so every rebuild
         // this tick spawns writes to the same bucket it captured at entry.
         let storage = pinned.storage.clone();
+        let index = pinned.index;
         handles.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await;
             let rebuilt = match rebuild_selected_package(
@@ -2618,7 +2620,17 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
             )
             .await
             {
-                Ok(rebuilt) => Some(rebuilt.still_live),
+                Ok(rebuilt) => {
+                    match republish_quarantine(&state, storage.as_ref(), index, &package, &rebuilt)
+                        .await
+                    {
+                        Ok(()) => Some(rebuilt.still_live),
+                        Err(e) => {
+                            error!(package=%package, error=?e, "quarantine publish failed; markers retained for retry");
+                            None
+                        }
+                    }
+                }
                 Err(e) => {
                     error!(package=%package, error=?e, "rebuild failed; markers retained for retry");
                     None
@@ -2702,6 +2714,32 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
     Ok(())
 }
 
+/// Re-derive one drained package's membership in the fleet's quarantined set
+/// from its durable status, and publish it (a no-op GET when it already
+/// matches). Every status writer leaves a dirty marker after its own publish, so
+/// this is both the retry for an increment that failed or crashed mid-write and
+/// the last word when two writers' increments landed out of order — on the
+/// marker drain, not a day later on the audit sweep. Only the selected-bucket
+/// tick does this: it is the bucket the fleet serves, the one the sweep derives
+/// the whole set from too.
+async fn republish_quarantine(
+    state: &AppState,
+    storage: &dyn Storage,
+    index: usize,
+    pkg: &str,
+    rebuilt: &RebuiltPackage,
+) -> Result<()> {
+    let blocked = match rebuilt.quarantined {
+        Some(blocked) => blocked,
+        None => crate::status::read_status(storage, pkg)
+            .await?
+            .status
+            .blocks_downloads(),
+    };
+    let replicas = state.singleton_replicas(index);
+    crate::advisories::arm_quarantine(storage, &replicas, &state.advisories, pkg, blocked).await
+}
+
 /// Regenerate one package's indexes from a storage listing.
 /// Returns whether the package still has artifacts; with none, its indexes
 /// are removed (index first, per the ordering invariant).
@@ -2775,6 +2813,9 @@ pub(crate) struct RebuiltPackage {
     /// The package views this rebuild left: key → rendered bytes, empty when
     /// it removed them. The audit reads them back before trusting a listing.
     views: Vec<(String, Vec<u8>)>,
+    /// Whether the status the views were rendered from blocks downloads. `None`
+    /// when the package had nothing to render, so no status was read.
+    quarantined: Option<bool>,
 }
 
 /// Rebuild only a package's index views from `storage`'s own truth, touching no
@@ -2866,8 +2907,11 @@ async fn rebuild_package_indexes_inner(
     // audit, so the two inventory writers can't disagree.
     let live = !files.is_empty();
     let mut views = Vec::new();
+    let mut quarantined = None;
     if live {
-        views = write_pkg_indexes(state, storage, pkg, &files).await?;
+        let (written, blocked) = write_pkg_indexes(state, storage, pkg, &files).await?;
+        views = written;
+        quarantined = Some(blocked);
     } else {
         let keys = [
             format!("{SIMPLE_PREFIX}{pkg}/index.html"),
@@ -2888,6 +2932,7 @@ async fn rebuild_package_indexes_inner(
         raw_artifacts: raw,
         file_shas: shas,
         views,
+        quarantined,
     })
 }
 
@@ -4537,7 +4582,7 @@ async fn write_pkg_indexes(
     storage: &dyn Storage,
     pkg: &str,
     files: &[FileMetadata],
-) -> Result<Vec<(String, Vec<u8>)>> {
+) -> Result<(Vec<(String, Vec<u8>)>, bool)> {
     // Status is per-project truth (PEP 792). A read error propagates — we
     // re-render against the prior index rather than assume `active` and, say,
     // re-expose links for a project that should be quarantined.
@@ -4571,7 +4616,7 @@ async fn write_pkg_indexes(
     {
         put_if_changed(state, storage, key, bytes.clone(), ct).await?;
     }
-    Ok(views)
+    Ok((views, status.status.blocks_downloads()))
 }
 
 async fn write_global_indexes(
@@ -4997,6 +5042,88 @@ mod tests {
             .head_exists(&format!("{SIMPLE_PREFIX}{pkg}/index.json"))
             .await
             .unwrap());
+    }
+
+    fn frozen() -> crate::status::ProjectStatusDoc {
+        crate::status::ProjectStatusDoc {
+            status: crate::status::ProjectStatus::Quarantined,
+            reason: Some("operator".into()),
+        }
+    }
+
+    async fn stored_set(storage: &dyn Storage) -> Vec<String> {
+        crate::advisories::stored_quarantined(storage)
+            .await
+            .unwrap()
+            .0
+            .into_iter()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn tick_publishes_a_quarantine_its_writer_never_did() {
+        // The writer made the status durable and left its marker, then its own
+        // publish failed (or it crashed). Draining the marker finishes the job.
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "frozenpkg";
+        seed_private_artifact(storage.as_ref(), pkg, "frozenpkg-1.0.whl");
+        crate::status::write_status(storage.as_ref(), pkg, &frozen())
+            .await
+            .unwrap();
+        let marker = format!("{DIRTY_PREFIX}{pkg}!n.commit");
+        storage.insert(&marker, Vec::new());
+        let state = Arc::new(AppState::headless(storage.clone()));
+
+        tick(&state, &state.pin()).await.unwrap();
+
+        assert_eq!(stored_set(storage.as_ref()).await, [pkg]);
+        assert!(crate::advisories::AdvisoryState::read(&state.advisories).is_quarantined(pkg));
+        assert!(!storage.head_exists(&marker).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn tick_drops_a_stale_blocked_entry_even_for_an_emptied_package() {
+        // A dequarantine whose publish never landed (or a relay's stale freeze
+        // that landed after it): the status says active, the set still blocks.
+        // The package has no artifacts left, so no view renders a status — the
+        // tick must still read it.
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "released";
+        let state = Arc::new(AppState::headless(storage.clone()));
+        let freeze = crate::advisories::QuarantinedEdit::One {
+            name: pkg.into(),
+            blocked: true,
+        };
+        crate::advisories::publish_quarantined(storage.as_ref(), &[], &state.advisories, &freeze)
+            .await
+            .unwrap();
+        storage.insert(&format!("{DIRTY_PREFIX}{pkg}!n.commit"), Vec::new());
+
+        tick(&state, &state.pin()).await.unwrap();
+
+        assert!(stored_set(storage.as_ref()).await.is_empty());
+        assert!(!crate::advisories::AdvisoryState::read(&state.advisories).is_quarantined(pkg));
+    }
+
+    #[tokio::test]
+    async fn tick_holds_markers_when_the_quarantine_publish_fails() {
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "frozenpkg";
+        seed_private_artifact(storage.as_ref(), pkg, "frozenpkg-1.0.whl");
+        crate::status::write_status(storage.as_ref(), pkg, &frozen())
+            .await
+            .unwrap();
+        // An increment cannot merge into a body it cannot read.
+        storage.insert(crate::advisories::QUARANTINED_KEY, br#"["bare"]"#.to_vec());
+        let marker = format!("{DIRTY_PREFIX}{pkg}!n.commit");
+        storage.insert(&marker, Vec::new());
+        let state = Arc::new(AppState::headless(storage.clone()));
+
+        assert!(tick(&state, &state.pin()).await.is_err());
+        assert!(
+            storage.head_exists(&marker).await.unwrap(),
+            "the marker is the retry; consuming it would leave only the sweep"
+        );
     }
 
     #[tokio::test]

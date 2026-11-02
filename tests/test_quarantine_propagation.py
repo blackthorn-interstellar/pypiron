@@ -176,3 +176,27 @@ def test_a_freeze_and_a_release_both_reach_the_other_node(pypiron_bin, tmp_path)
         for proc in (proc_b, proc_a):
             if proc is not None:
                 kill_process_tree(proc)
+
+
+def test_a_freeze_whose_writer_died_before_publishing_still_takes_hold(pypiron_bin, tmp_path):
+    """A status write that became durable but never reached the shared set — the
+    writer's publish failed, or it crashed between the two — is finished by the
+    worker that drains the write's dirty marker, not left for a day-long sweep.
+    Stood in for here by writing the status file and its marker by hand, which is
+    exactly what such a writer leaves behind."""
+    pkg = "orphanfreeze"
+    data_dir = tmp_path / "data"
+    proc, base, _log = _start(pypiron_bin, data_dir)
+    try:
+        file_path = _seed_mirror_wheel(base, pkg, tmp_path)
+        code, _, _ = http_get(f"{base}{file_path}")
+        assert code in {200, 302}, f"the clean mirror file was not served (status {code})"
+
+        (data_dir / "packages" / pkg / ".project-status.json").write_text(
+            '{"status":"quarantined","reason":"compromised release"}'
+        )
+        (data_dir / "_dirty" / pkg).write_text("")
+
+        _await_status(f"{base}{file_path}", {403}, timeout=PROPAGATION_BOUND)
+    finally:
+        kill_process_tree(proc)

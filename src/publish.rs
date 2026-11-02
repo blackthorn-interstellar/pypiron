@@ -2028,8 +2028,14 @@ async fn write_project_status(
     // is far too slow to be the propagation path for a freeze. Both directions go
     // through here: an un-quarantine must not wait for a sweep either. Idempotent,
     // so it is called after every status write rather than diffing membership.
+    //
+    // A failed publish is not the request's failure: the status is durable, and
+    // the commit marker below — written after the publish, whatever it returned —
+    // makes the worker re-derive this name from that status and publish it again.
+    // Only when that marker cannot be written either is nothing left to finish the
+    // job, and then the operator hears about it (the write is idempotent to retry).
     let replicas = state.singleton_replicas(pinned.index);
-    crate::advisories::arm_quarantine(
+    let published = crate::advisories::arm_quarantine(
         storage,
         &replicas,
         &state.advisories,
@@ -2037,9 +2043,18 @@ async fn write_project_status(
         doc.status.blocks_downloads(),
     )
     .await;
+    if let Err(e) = &published {
+        warn!(package=%pkg, error=?e, "status: saved, but publishing it to the fleet's quarantined set failed; the worker retries from the status");
+    }
 
     if let Err(e) = intent.commit().await {
         warn!(error=?e, "status: failed to write commit marker");
+        if published.is_err() {
+            return Err((
+                StatusCode::SERVICE_UNAVAILABLE,
+                "status saved, but it could not be shared with the other servers; retry the request".to_string(),
+            ));
+        }
     }
     if replicate_private {
         replicate::fanout_sync(state, &pinned, &pkg, replicate::PROJECT_STATUS_MARKER, None)

@@ -41,7 +41,10 @@ pub const FEED_KEY: &str = "_advisories/osv-pypi.zip";
 /// deletable, and rebuilt by the next audit sweep — carried in an epoch-bearing
 /// envelope so every writer CASes it forward and no reader ever moves back.
 /// A status write publishes its own one-name increment ([`arm_quarantine`]);
-/// the sweep republishes the whole set as repair ([`QuarantinedEdit::Sweep`]).
+/// the worker re-derives that name from the durable status when it drains the
+/// write's dirty marker (the retry for a failed or crashed increment, and what
+/// orders two racing ones); the sweep republishes the whole set as last-resort
+/// repair ([`QuarantinedEdit::Sweep`]).
 pub(crate) const QUARANTINED_KEY: &str = "_advisories/quarantined.json";
 
 /// Materialized org audit report: the walked inventory joined with the advisory
@@ -1176,9 +1179,12 @@ async fn reload_quarantined(
         }
     };
     let epoch = stored.epoch;
-    if let Refused::Older { live } =
-        adopt_quarantined(slot, stored.quarantined.into_iter().collect(), epoch, etag)
-    {
+    if let Refused::Older { live } = adopt_quarantined(
+        slot,
+        stored.quarantined.into_iter().collect(),
+        epoch,
+        Some(etag),
+    ) {
         // The newer set stays — a quarantine must never un-block by moving
         // backwards — and the etag was still adopted, so this poll stops
         // re-reading the same stale body. The leader's reseed writes ours back.
@@ -1224,15 +1230,18 @@ enum Refused {
 /// the same epoch that arm is newer information than the stored body. An equal
 /// epoch carrying the identical set is a confirmation and clears the flag. Only a
 /// strictly newer epoch overrides a pending arm; that arm's own publish (or the
-/// marker-driven retry behind it) is what puts it back. The etag, a change
-/// detector only, is always adopted, so a refused body is not re-read every poll.
+/// marker-driven retry behind it) is what puts it back.
+///
+/// `etag` is the listing etag to record — a change detector only, so it is
+/// recorded even on a refusal and a refused body is not re-read every poll.
+/// `None` keeps the one recorded (a confirmation read no listing etag).
 ///
 /// Carries the db and feed identity forward (a refcount bump each, no await).
 fn adopt_quarantined(
     slot: &RwLock<Arc<AdvisoryState>>,
     set: HashSet<String>,
     epoch: u64,
-    etag: Option<String>,
+    etag: Option<Option<String>>,
 ) -> Refused {
     let mut guard = slot.write().unwrap_or_else(|p| p.into_inner());
     let refused = if epoch < guard.quarantined_epoch {
@@ -1247,6 +1256,7 @@ fn adopt_quarantined(
     } else {
         Refused::No
     };
+    let etag = etag.unwrap_or_else(|| guard.quarantined_etag.clone());
     *guard = Arc::new(if refused == Refused::No {
         AdvisoryState {
             quarantined: set,
@@ -1419,8 +1429,10 @@ pub async fn publish_quarantined(
             }
         };
         if next == have {
-            // A confirmation is not a reason to drop a newer set. No etag: the
-            // listing etag is a different token from the one just read.
+            // A confirmation is not a reason to drop a newer set. The recorded
+            // listing etag stays: this read did not produce one (a different
+            // token space), and keeping it costs the poll nothing — the worker
+            // confirms after every rebuild it drains.
             adopt_quarantined(slot, next.into_iter().collect(), stored.epoch, None);
             return Ok(());
         }
@@ -1470,7 +1482,7 @@ pub async fn publish_quarantined(
         // never learn about the newer set. `None` costs one GET on the next poll
         // and can never hide a freeze. Adopted through the guarded path: a poll
         // may have taken a newer epoch while the write-throughs above ran.
-        adopt_quarantined(slot, next.into_iter().collect(), epoch, None);
+        adopt_quarantined(slot, next.into_iter().collect(), epoch, Some(None));
         return Ok(());
     }
     bail!("could not publish the quarantined set after {QUARANTINED_CAS_ATTEMPTS} attempts")
@@ -1504,24 +1516,26 @@ pub fn hold_fenced_quarantine(slot: &RwLock<Arc<AdvisoryState>>, pkg: &str, bloc
 /// no-op plus one small GET, so callers may call it after every status write
 /// rather than tracking membership themselves.
 ///
-/// Best-effort by design. If the shared publish fails, this node stays armed (the
-/// local edit is never rolled back) and the audit sweep repairs the fleet — which
-/// is why the local arm happens first.
+/// The local arm happens first and is never rolled back, so this node's gate
+/// follows the write even when the shared publish fails. A failure is returned,
+/// not swallowed — but a status writer must still write its dirty marker AFTER
+/// this call whatever it returns, never `?` past it: the worker that drains the
+/// marker re-derives this name from the durable status and publishes it again
+/// (the retry), and a marker that follows the publish is what makes the worker's
+/// publish the last word when two writers' increments land out of order.
 pub async fn arm_quarantine(
     storage: &dyn Storage,
     replicas: &[crate::layout::ReplicaTarget<'_>],
     slot: &RwLock<Arc<AdvisoryState>>,
     pkg: &str,
     blocked: bool,
-) {
+) -> Result<()> {
     arm_local_quarantine(slot, pkg, blocked);
     let edit = QuarantinedEdit::One {
         name: pkg.to_string(),
         blocked,
     };
-    if let Err(error) = publish_quarantined(storage, replicas, slot, &edit).await {
-        error!(package = %pkg, blocked, error = ?error, "quarantine: could not publish the change to the shared set; this node is armed, other nodes stay stale until the audit sweep repairs it");
-    }
+    publish_quarantined(storage, replicas, slot, &edit).await
 }
 
 // ---------------------------------------------------------------------------
@@ -2584,7 +2598,12 @@ mod tests {
         hold_fenced_quarantine(&slot, "pkg", true);
         assert!(AdvisoryState::read(&slot).is_quarantined("pkg"));
         // A peer publishes an unrelated change: the poll swaps the whole set.
-        adopt_quarantined(&slot, ["newer".to_string()].into(), 2, Some("e2".into()));
+        adopt_quarantined(
+            &slot,
+            ["newer".to_string()].into(),
+            2,
+            Some(Some("e2".into())),
+        );
         let snap = AdvisoryState::read(&slot);
         assert!(snap.is_quarantined("pkg"), "the hold is not the shared set");
         assert!(!snap.quarantined.contains("pkg"), "and never leaks into it");
@@ -2948,7 +2967,7 @@ mod tests {
         arm_local_quarantine(&slot, "b", true);
         // The stored body at epoch 5 predates the arm: keep the arm.
         assert_eq!(
-            adopt_quarantined(&slot, ["a".to_string()].into(), 5, Some("e".into())),
+            adopt_quarantined(&slot, ["a".to_string()].into(), 5, Some(Some("e".into()))),
             Refused::PendingArm
         );
         assert_eq!(live_names(&slot), ["a", "b"]);
@@ -3028,7 +3047,7 @@ mod tests {
         let polled = Arc::clone(&slot);
         peer.before_write_of(QUARANTINED_KEY, move |_| {
             let newer = ["a", "b", "evil"].map(String::from).into();
-            adopt_quarantined(&polled, newer, 7, Some("e7".into()));
+            adopt_quarantined(&polled, newer, 7, Some(Some("e7".into())));
         });
         let peers = [crate::layout::ReplicaTarget {
             storage: &peer,

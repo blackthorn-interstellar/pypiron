@@ -1649,16 +1649,29 @@ impl Proxy {
             // refresh. On a change, arm this node's byte gate and hand the
             // increment to the rest of the fleet — the audit sweep is repair, not
             // propagation.
+            //
+            // A second dirty marker follows the publish, whatever it returned. The
+            // first (written with the status) keeps the index crash-safe; this one
+            // is the retry for a failed publish, and it is what keeps a delayed
+            // relay harmless: when this publish lands after an operator's newer
+            // event and the rebuild for it, the worker drains this marker next,
+            // re-derives the name from the durable status and publishes it last.
             Ok(true) => {
                 let replicas = state.singleton_replicas(pinned.index);
-                crate::advisories::arm_quarantine(
+                if let Err(e) = crate::advisories::arm_quarantine(
                     pinned.storage.as_ref(),
                     &replicas,
                     &state.advisories,
                     pkg,
                     observed.status.blocks_downloads(),
                 )
-                .await;
+                .await
+                {
+                    warn!(%pkg, error=?e, "proxy: publishing the upstream status to the fleet's quarantined set failed; the worker retries from the status");
+                }
+                if let Err(e) = crate::markers::mark_dirty(pinned.storage.as_ref(), pkg).await {
+                    warn!(%pkg, error=?e, "proxy: could not mark the package dirty after publishing its status; the audit sweep repairs the set");
+                }
             }
             Ok(false) => {}
             Err(e) => warn!(%pkg, error=?e, "proxy: failed to persist upstream project status"),
@@ -2298,6 +2311,45 @@ mod tests {
                 .iter()
                 .any(|key| key.starts_with(crate::app::DIRTY_PREFIX)),
             "a declined relay marks nothing dirty"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_relayed_status_change_marks_dirty_after_its_quarantine_publish() {
+        // A delayed relay's publish can land after an operator's newer event and
+        // the worker's rebuild for it. Only a marker written AFTER the publish
+        // makes the worker re-derive the name and publish last.
+        let storage = Arc::new(crate::storage::test_support::InMemStorage::default());
+        let state = AppState::headless(storage.clone());
+        let proxy = Proxy::new(
+            "https://pypi.org",
+            ResolvedMirror::default(),
+            false,
+            &[],
+            &[],
+        )
+        .unwrap();
+        // An existing set, so the publish is a logged conditional replace.
+        let other = crate::advisories::QuarantinedEdit::One {
+            name: "other".into(),
+            blocked: true,
+        };
+        crate::advisories::publish_quarantined(storage.as_ref(), &[], &state.advisories, &other)
+            .await
+            .unwrap();
+        proxy
+            .persist_observed_status(&state, "pkg", &quarantined("upstream"))
+            .await;
+        let log = storage.write_log();
+        let publish = log
+            .iter()
+            .position(|key| key == crate::advisories::QUARANTINED_KEY)
+            .expect("the change was published");
+        assert!(
+            log[publish..]
+                .iter()
+                .any(|key| key.starts_with(crate::app::DIRTY_PREFIX)),
+            "no dirty marker follows the publish: {log:?}"
         );
     }
 

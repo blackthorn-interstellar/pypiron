@@ -1025,17 +1025,30 @@ rather than fleet-wide.
 carries a monotone `pypiron-epoch` (the envelope pattern `.project-status.json`
 already uses), and every writer goes through one read-modify-CAS: read the
 envelope, apply the edit, `epoch+1`, `put_if_match` (or `put_if_none_match` when
-absent), bounded retries, error when they run out. Two kinds of edit:
+absent), bounded retries, error when they run out. Three sources of edit:
 
 - an **increment** from a status write — the admin API, or the proxy relaying an
   upstream freeze — adds or drops exactly that one name, so two nodes freezing two
   projects at the same moment both land. The writing node also arms its own
   in-memory set first, so it refuses the bytes on the request that follows;
-- the audit sweep's **repair**, the whole set re-derived from the sidecars,
-  applied only while the stored epoch is still the one the walk read before it
-  started. That is what makes an expired leader harmless: the lease has no fencing
-  token, but a stale sweep's `base_epoch` no longer matches, so it skips rather
-  than un-blocking a project its successor froze.
+- the worker's **re-derive**: draining a package's dirty marker, the selected
+  bucket's tick reads that package's durable status and publishes the same
+  one-name increment from it (a GET and nothing more when it already matches).
+  Every status writer leaves its marker *after* its own publish, whatever that
+  publish returned, so this is both the retry for an increment that failed or
+  crashed mid-write and what orders two racing increments: a stale relay whose
+  publish lands after an operator's newer one is followed by its own marker, and
+  the rebuild that drains it publishes from the final status, last. A failed
+  re-derive holds the package's markers, like a failed rebuild. The admin API
+  still answers 200 when only its publish failed — the status and its marker are
+  durable, and the worker finishes the job; it answers 503 only when the marker
+  could not be written either;
+- the audit sweep's **repair**, the whole set re-derived from the sidecars. When
+  the stored epoch has moved since the walk began, the repair is three-way merged
+  onto it — what the other writers added since the walk's base stays, what they
+  removed stays removed — rather than skipped, so a busy fleet still repairs.
+  That is also what makes an expired leader harmless: the lease has no fencing
+  token, but every edit made since its own base survives its merge.
 
 Every node re-checks the key every 30 s by default (`--quarantine-poll-secs`), on its own
 worker tick — never behind the advisory tick, which runs on `reconcile_interval`

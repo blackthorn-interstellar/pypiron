@@ -72,6 +72,9 @@ job payload is redundant — the truth is the storage listing. Instead:
    are unique: an event arriving during the rebuild is a new key and
    survives. A crash anywhere before the delete replays the tick — rebuilds
    are idempotent, so the only cost is repeated work, never a lost update.
+   A failed rebuild consumes nothing: the observed markers are its retry, so
+   a multi-bucket rebuild's own maintenance intent is cleared on failure
+   rather than paired, and a package that keeps failing adds no keys.
 3. A commit (or an intent whose pair arrived) rebuilds immediately. An
    unpaired intent younger than the grace period (`--intent-grace-secs`)
    means a writer is in flight — skip. Older means the writer crashed —

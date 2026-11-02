@@ -2514,8 +2514,16 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
         let storage = pinned.storage.clone();
         handles.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await;
-            let rebuilt = match rebuild_package(&state, storage.as_ref(), &package).await {
-                Ok(has_artifacts) => Some(has_artifacts),
+            let rebuilt = match rebuild_selected_package(
+                &state,
+                storage.as_ref(),
+                &package,
+                None,
+                OnFailure::MarkersHeld,
+            )
+            .await
+            {
+                Ok(rebuilt) => Some(rebuilt.still_live),
                 Err(e) => {
                     error!(package=%package, error=?e, "rebuild failed; markers retained for retry");
                     None
@@ -2617,24 +2625,46 @@ pub async fn rebuild_package_excluding(
     pkg: &str,
     omit: Option<&str>,
 ) -> Result<(bool, FileShas)> {
-    let RebuiltPackage {
-        still_live: live,
-        raw_artifacts: raw,
-        file_shas: shas,
-    } = rebuild_package_indexes(state, storage, pkg, omit).await?;
-    // Maintain the in-memory inventory. This is the one choke point every
-    // rebuild against the *selected* bucket — tick, audit, delete — flows
-    // through, and `upsert` is an idempotent absolute set, so concurrent or
-    // repeated rebuilds never double-count. The audit re-baselines the whole
-    // map periodically.
+    let rebuilt = rebuild_selected_package(state, storage, pkg, omit, OnFailure::Rearm).await?;
+    // `file_shas` is the renderable file→sha256 map the transparency audit
+    // commits; the delete/verify callers discard it.
+    Ok((rebuilt.still_live, rebuilt.file_shas))
+}
+
+/// [`rebuild_package_indexes`] plus the node-local inventory. This is the one
+/// choke point every rebuild against the *selected* bucket — tick, audit,
+/// delete — flows through, and `upsert` is an idempotent absolute set, so
+/// concurrent or repeated rebuilds never double-count. The audit re-baselines
+/// the whole map periodically.
+async fn rebuild_selected_package(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    omit: Option<&str>,
+    on_failure: OnFailure,
+) -> Result<RebuiltPackage> {
+    let rebuilt = rebuild_package_indexes(state, storage, pkg, omit, on_failure).await?;
     state
         .inventory
         .lock()
         .await
-        .upsert(pkg, PkgStat::from_raw(&raw));
-    // `shas` is the renderable file→sha256 map the transparency audit commits;
-    // the delete/tick callers discard it, the audit threads it into the chain.
-    Ok((live, shas))
+        .upsert(pkg, PkgStat::from_raw(&rebuilt.raw_artifacts));
+    Ok(rebuilt)
+}
+
+/// Who guarantees a failed multi-bucket rebuild runs again.
+#[derive(Clone, Copy)]
+pub(crate) enum OnFailure {
+    /// The caller drains `_dirty/` and keeps the markers it observed when the
+    /// rebuild fails; those already re-run the package, so the rebuild's own
+    /// maintenance intent is just cleared. Pairing it instead minted a fresh,
+    /// immediately consumable pair per attempt: a package failing every
+    /// one-second tick grew `_dirty/` by ~170k keys a day, and every tick and
+    /// intent probe lists the whole prefix.
+    MarkersHeld,
+    /// Nothing else would retry (delete, audit, verify): pair the maintenance
+    /// intent so the worker does.
+    Rearm,
 }
 
 /// The outcome of rebuilding a package's derived index views (see
@@ -2659,6 +2689,7 @@ pub(crate) async fn rebuild_package_indexes(
     storage: &dyn Storage,
     pkg: &str,
     omit: Option<&str>,
+    on_failure: OnFailure,
 ) -> Result<RebuiltPackage> {
     if !state.buckets.is_multi() {
         return rebuild_package_indexes_inner(state, storage, pkg, omit).await;
@@ -2684,9 +2715,14 @@ pub(crate) async fn rebuild_package_indexes(
         }
         Err(error) => {
             // The failed rebuild may already have changed one of the derived
-            // views. Pair the intent so the ordinary worker retries it; never
-            // erase the only crash-recovery event on an error path.
-            let _ = mark_commit(storage, pkg, &nonce).await;
+            // views, so something must retry it. A caller holding markers
+            // retries from those (pairing here would add a redundant event
+            // per attempt); for anyone else, pair the intent so the ordinary
+            // worker does — never erase the only recovery event.
+            let _ = match on_failure {
+                OnFailure::MarkersHeld => clear_intent(storage, pkg, &nonce).await,
+                OnFailure::Rearm => mark_commit(storage, pkg, &nonce).await,
+            };
             cancel_guard.disarm();
             Err(error)
         }
@@ -3421,7 +3457,8 @@ pub async fn drain_dirty_uncached(state: &AppState, storage: &dyn Storage) -> Re
         stale_intents,
     } in work
     {
-        match rebuild_package_indexes(state, storage, &package, None).await {
+        match rebuild_package_indexes(state, storage, &package, None, OnFailure::MarkersHeld).await
+        {
             Ok(RebuiltPackage {
                 still_live: live, ..
             }) => {
@@ -5866,6 +5903,121 @@ mod tests {
             String::from_utf8(global).unwrap().contains("alpha"),
             "a live package must stay in the global index across a transient read error"
         );
+    }
+
+    async fn dirty_keys(storage: &InMemStorage) -> Vec<String> {
+        let mut keys: Vec<String> = storage
+            .list_dir_entries(DIRTY_PREFIX)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|entry| entry.key)
+            .collect();
+        keys.sort();
+        keys
+    }
+
+    /// Two in-memory buckets under the multi-bucket protocol (maintenance
+    /// intents on), with `alpha` seeded and marked dirty on `bucket` and its
+    /// view write failing until healed.
+    async fn failing_rebuild_in_two_buckets(
+        on_selected: bool,
+    ) -> (Arc<AppState>, Arc<InMemStorage>, Vec<String>) {
+        const FILE: &str = "alpha-1.0-py3-none-any.whl";
+        let (a, b) = (
+            Arc::new(InMemStorage::default()),
+            Arc::new(InMemStorage::default()),
+        );
+        let state = Arc::new(crate::sim::multi_bucket_state(vec![
+            ("a".into(), a.clone() as Arc<dyn Storage>),
+            ("b".into(), b.clone() as Arc<dyn Storage>),
+        ]));
+        assert_eq!(
+            state.pin().index,
+            0,
+            "test setup broken: a must be selected"
+        );
+        let bucket = if on_selected { a } else { b };
+        seed_private_artifact(&bucket, "alpha", FILE);
+        mark_dirty(bucket.as_ref(), "alpha").await.unwrap();
+        let before = dirty_keys(&bucket).await;
+        bucket.fail_writes_of(&format!("{SIMPLE_PREFIX}alpha/index.json"));
+        (state, bucket, before)
+    }
+
+    /// A rebuild that keeps failing must not grow `_dirty/`. The tick already
+    /// holds the markers that brought it to the package and keeps them on
+    /// failure; the multi-bucket rebuild used to pair its own maintenance
+    /// intent too, minting a fresh consumable pair every one-second tick.
+    #[tokio::test]
+    async fn a_persistently_failing_rebuild_does_not_grow_the_dirty_prefix() {
+        let (state, a, before) = failing_rebuild_in_two_buckets(true).await;
+        let pinned = state.pin();
+        for attempt in 0..5 {
+            tick(&state, &pinned).await.unwrap_err();
+            assert_eq!(
+                dirty_keys(&a).await,
+                before,
+                "failed tick {attempt} must leave exactly the markers it found"
+            );
+        }
+        let listing = a.list_dir_entries(DIRTY_PREFIX).await.unwrap();
+        let work = consumable_dirty_work(&listing, crate::clock::now_utc(), state.intent_grace);
+        assert!(
+            work.iter().any(|w| w.package == "alpha"),
+            "the retained markers must still schedule the package"
+        );
+
+        a.heal_writes();
+        tick(&state, &pinned).await.unwrap();
+        assert!(dirty_keys(&a).await.is_empty());
+        assert!(a
+            .head_exists(&format!("{SIMPLE_PREFIX}alpha/index.json"))
+            .await
+            .unwrap());
+    }
+
+    /// The warm-bucket drain has the same contract: it reports package
+    /// failures by keeping markers (and returns `Ok`), so its rebuild must not
+    /// add any of its own.
+    #[tokio::test]
+    async fn a_failing_warm_drain_does_not_grow_the_dirty_prefix() {
+        let (state, b, before) = failing_rebuild_in_two_buckets(false).await;
+        for attempt in 0..5 {
+            drain_dirty_uncached(&state, b.as_ref()).await.unwrap();
+            assert_eq!(
+                dirty_keys(&b).await,
+                before,
+                "failed drain {attempt} must leave exactly the markers it found"
+            );
+        }
+        b.heal_writes();
+        drain_dirty_uncached(&state, b.as_ref()).await.unwrap();
+        assert!(dirty_keys(&b).await.is_empty());
+    }
+
+    /// A caller with no markers of its own (delete, audit, verify) still gets
+    /// a retry: the failed rebuild pairs its maintenance intent.
+    #[tokio::test]
+    async fn a_failed_rebuild_without_held_markers_still_rearms() {
+        let (state, a, _) = failing_rebuild_in_two_buckets(true).await;
+        a.delete_keys(&dirty_keys(&a).await).await.unwrap();
+
+        rebuild_package(&state, a.as_ref(), "alpha")
+            .await
+            .unwrap_err();
+
+        let keys = dirty_keys(&a).await;
+        let nonces: Vec<(&str, &str)> = keys
+            .iter()
+            .filter_map(|key| key.strip_prefix(&format!("{DIRTY_PREFIX}alpha!")))
+            .filter_map(|event| event.rsplit_once('.'))
+            .collect();
+        assert_eq!(nonces.len(), 2, "want one intent+commit pair, got {keys:?}");
+        assert_eq!(nonces[0].0, nonces[1].0, "the pair must share a nonce");
+        let listing = a.list_dir_entries(DIRTY_PREFIX).await.unwrap();
+        let work = consumable_dirty_work(&listing, crate::clock::now_utc(), state.intent_grace);
+        assert!(work.iter().any(|w| w.package == "alpha"));
     }
 
     /// The sidecar memo saves re-reading unchanged sidecars, never a changed one:

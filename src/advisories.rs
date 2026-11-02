@@ -1564,6 +1564,22 @@ pub struct ProbeMemo {
 /// ten minutes at the default probe interval).
 const PROBE_MAL_FETCH_ATTEMPTS: u32 = 5;
 
+/// Whether a failed advisory read says the source was unavailable — a
+/// timeout, a dropped connection, a 5xx or a 429 — rather than anything about
+/// the record. Such a failure costs the id no attempt: a short outage of the
+/// per-advisory JSON must delay a block, never drop it.
+fn source_unavailable(error: &anyhow::Error) -> bool {
+    error
+        .chain()
+        .filter_map(|cause| cause.downcast_ref::<reqwest::Error>())
+        .any(|e| match e.status() {
+            Some(status) => {
+                status.is_server_error() || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            }
+            None => e.is_timeout() || e.is_connect() || e.is_request() || e.is_body(),
+        })
+}
+
 /// Count one failed read of `id`. True once its budget is spent: the id leaves
 /// the retry set and the caller reports it skipped.
 fn note_mal_failure(retries: &mut BTreeMap<String, u32>, id: &str) -> bool {
@@ -1945,13 +1961,23 @@ async fn probe_once(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) -> R
     let mut delta = ProbeDelta::default();
     let mut applied_ids: Vec<String> = Vec::new();
     let mut withdrawn_ids: Vec<String> = Vec::new();
+    let mut read_any = false;
+    let mut outage = None;
     for csv_id in &mal_ids {
         let adv = match source.fetch_advisory(csv_id).await {
             Ok(adv) => {
                 memo.mal_retries.remove(csv_id);
+                read_any = true;
                 adv
             }
+            Err(e) if source_unavailable(&e) => {
+                debug!(id = %csv_id, error = %e, "malware probe: advisory source unavailable; retrying next cycle");
+                memo.mal_retries.entry(csv_id.clone()).or_insert(0);
+                outage = Some(e);
+                continue;
+            }
             Err(e) => {
+                read_any = true; // the source answered, about this record
                 if note_mal_failure(&mut memo.mal_retries, csv_id) {
                     warn!(id = %csv_id, attempts = PROBE_MAL_FETCH_ATTEMPTS, error = %e, "malware probe: advisory unreadable; skipped until OSV modifies it");
                     ctx.metrics.record_malware_probe_skipped();
@@ -2024,7 +2050,13 @@ async fn probe_once(ctx: &RefreshCtx<'_>, feed: &str, memo: &mut ProbeMemo) -> R
         memo.watermark = Some(max);
     }
     memo.csv_etag = etag;
-    Ok(true)
+    // Every advisory read this cycle hit an outage: the ids wait in the retry
+    // set, and the cycle reports the source down so the age gauge and the
+    // unreachable warning say so instead of a healthy probe that blocks nothing.
+    match outage {
+        Some(e) if !read_any => Err(e.context("malware probe: no advisory could be read")),
+        _ => Ok(true),
+    }
 }
 
 /// Read a storage key's bytes, mapping a "not found" error to `None`.

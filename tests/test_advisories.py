@@ -1654,8 +1654,9 @@ class _MutableFeedState:
         self.records = dict(baseline_records)
         self.csv_version = 0
         self.log: list[tuple[str, str]] = []
-        # Ids listed in the CSV whose JSON 404s (an unreadable record).
-        self.broken: set[str] = set()
+        # Ids listed in the CSV whose JSON fails, with the status it fails with:
+        # 404 is an unreadable record, 503 an outage at the source.
+        self.broken: dict[str, int] = {}
 
     def csv_body(self) -> bytes:
         rows = sorted(self.records.values(), key=lambda r: r["modified"], reverse=True)
@@ -1697,7 +1698,7 @@ class _ProbeFeedHandler(http.server.BaseHTTPRequestHandler):
                 resp = (
                     (200, json.dumps(rec).encode(), "application/json", f'"{adv_id}"')
                     if rec is not None and adv_id not in st.broken
-                    else (404, b"", "text/plain", None)
+                    else (st.broken.get(adv_id, 404), b"", "text/plain", None)
                 )
             else:
                 resp = (404, b"", "text/plain", None)
@@ -1737,17 +1738,17 @@ class _FeedControl:
             self._st.records[adv_id] = rec
             self._st.csv_version += 1
 
-    def publish_broken(self, record: dict) -> None:
-        """List `record` in the CSV but 404 its JSON until `heal`."""
+    def publish_broken(self, record: dict, status: int = 404) -> None:
+        """List `record` in the CSV but fail its JSON with `status` until `heal`."""
         with self._st.lock:
-            self._st.broken.add(record["id"])
+            self._st.broken[record["id"]] = status
             self._st.records[record["id"]] = record
             self._st.csv_version += 1
 
     def heal(self, adv_id: str) -> None:
         """Serve the JSON again, leaving the CSV (and its ETag) untouched."""
         with self._st.lock:
-            self._st.broken.discard(adv_id)
+            self._st.broken.pop(adv_id, None)
 
     def count(self, method: str, needle: str) -> int:
         with self._st.lock:
@@ -1933,6 +1934,47 @@ def test_probe_skips_unreadable_mal_and_blocks_newer(tmp_path_factory, pypiron_b
             assert feed.count("GET", "/all.zip") == zip_before, "recovered via the snapshot"
             age = _metric_value(_metrics_text(base), "pypiron_malware_probe_age_seconds")
             assert age is not None and age < 10, "a bad record is not a source outage"
+
+
+def test_probe_outage_never_spends_an_advisorys_retry_budget(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """A new MAL advisory whose JSON the source keeps answering 503 is an outage,
+    not a bad record: it used to burn the five-try budget and be dropped until
+    the next daily snapshot while the probe reported healthy. Now it is retried
+    for as long as the outage lasts, the probe age shows the source down, and
+    it blocks as soon as it reads."""
+    mal_id = "MAL-2025-79996"
+    with _probe_feed_server(_baseline_records(), tmp_path) as (feed_url, feed):
+        with advisory_server(
+            tmp_path_factory,
+            pypiron_bin,
+            feed_url,
+            extra_args=["--malware-probe-secs", "1"],
+            extra_env=_DIRECT_EGRESS,
+        ) as server:
+            base = server["base_url"]
+            assert _poll_metric(base, "pypiron_malware_probe_age_seconds") is not None
+            wheel = make_wheel("outagemal", "1.0.0", tmp_path)
+            _mirror_upload(server, wheel)
+            wait_for_file_in_index(server["simple"], "outagemal", wheel.name)
+            url = f"{base}/files/outagemal/{wheel.name}"
+            assert _poll_http_status(url, {200, 302})
+
+            feed.publish_broken(
+                _mal_record(mal_id, "outagemal", "1.0.0", "2025-03-01T00:00:00Z"), status=503
+            )
+            deadline = time.time() + 30
+            while feed.count("GET", f"/{mal_id}.json") < 8:
+                assert time.time() < deadline, "the probe stopped retrying"
+                time.sleep(0.2)
+            metrics = _metrics_text(base)
+            assert _metric_value(metrics, "pypiron_malware_probe_skipped_total") == 0
+            age = _metric_value(metrics, "pypiron_malware_probe_age_seconds")
+            assert age is not None and age >= 3, "an outage reported as a healthy probe"
+
+            feed.heal(mal_id)
+            assert _poll_http_status(url, {403}, timeout=15), "never blocked once it read"
 
 
 def test_probe_backfills_new_mal_after_restart(tmp_path_factory, pypiron_bin, tmp_path):

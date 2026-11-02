@@ -267,7 +267,9 @@ With the advisory feed enabled, use
 `pypiron_blocked_downloads_total` counts refused malware downloads.
 `pypiron_malware_probe_skipped_total` counts new malware advisories a node
 could not read after several tries; each is blocked once OSV updates it or a
-newer daily snapshot includes it.
+newer daily snapshot includes it. An outage at OSV (timeouts, `5xx`, `429`)
+never counts as a try: the node keeps retrying, and while no advisory reads,
+the probe age keeps rising.
 
 ### Reserved private names
 

@@ -238,3 +238,36 @@ def test_rebuild_index_drops_a_package_removed_out_of_band(pypiron_bin, tmp_path
     assert cp.returncode == 0, cp.stdout + cp.stderr
     assert "ghostpkg" not in _global_html_names(data_dir)
     assert "ghostpkg" not in (data_dir / "simple" / "index.json").read_text()
+
+
+def test_rebuild_index_lists_a_package_it_repaired(pypiron_bin, tmp_path):
+    """A package whose only file lost its sidecar (a crash between the body and
+    the sidecar write) is repaired by `rebuild-index` — and must reach the
+    global index in the same run. The audit leaves a package it repaired to the
+    server's next tick, which an offline command never had, so the package got
+    its own page but no global listing, and a `_dirty/` marker nothing drained."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    wheel = make_wheel("bareonly", "1.0", tmp_path)
+    (data_dir / "packages" / "bareonly").mkdir(parents=True)
+    shutil.copy(wheel, data_dir / "packages" / "bareonly" / wheel.name)
+
+    cp = subprocess.run(
+        [str(pypiron_bin), "rebuild-index", "--data-dir", str(data_dir)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        env={**os.environ, "PYPIRON_ADVISORY_FEED": ""},
+    )
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    assert (data_dir / "packages" / "bareonly" / f"{wheel.name}.meta.json").exists()
+    assert "bareonly" in _global_html_names(data_dir)
+    assert "bareonly" in (data_dir / "simple" / "index.json").read_text()
+
+    cp = subprocess.run(
+        [str(pypiron_bin), "verify-index", "--deep", "--data-dir", str(data_dir)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert cp.returncode == 0, f"rebuild-index left the views stale:\n{cp.stdout}{cp.stderr}"

@@ -84,8 +84,15 @@ async fn run_rebuild_index(args: RebuildIndexArgs, fallback: denylist::Denylist)
     let denylist = worker::enforced_denylist(storage.as_ref(), &fallback).await?;
     let mut state = AppState::headless(storage);
     state.denylist = Some(Arc::new(denylist));
+    let state = Arc::new(state);
     let pinned = state.pin();
     worker::audit(&state, &pinned, true).await?;
+    // The audit's own repairs (a backfilled sidecar, a finished delete) change
+    // truth under its walk, so it leaves those packages to the next tick
+    // rather than vouch for a listing it no longer holds. A server runs that
+    // tick a second later; this command has to run it itself, or the global
+    // index misses a package it just repaired.
+    worker::tick(&state, &pinned).await?;
     // Leave the enforced-denylist stamp consistent with what this pass applied.
     // The audit above rebuilt every package with the denylist in force; recording
     // it here stops a later `serve` boot's reconcile from concluding the config
@@ -2068,7 +2075,11 @@ async fn log_requests(
             .ok()
             .or(peer)
             .map(|ip| {
-                let guess = (!state.authenticates(req.headers()))
+                // A read the server answers without looking at the credential
+                // can't answer a guess, so it reserves no budget.
+                let unchecked = is_read
+                    && read_ignores_credential(req.uri().path(), state.read_credential().is_none());
+                let guess = (!unchecked && !state.authenticates(req.headers()))
                     .then(|| state.login_throttle.fingerprint(req.headers()));
                 state.login_throttle.admit(ip, guess)
             })
@@ -2482,6 +2493,16 @@ async fn favicon() -> Response<Body> {
 }
 
 /// Fallback handler for unmatched routes
+/// Whether a GET/HEAD of `path` is answered without evaluating its
+/// credential: an index or file read on a server with no read credential
+/// (`public_reads`). Whatever such a request carries is attribution at most,
+/// so the login throttle must not count it as a guess — six CI jobs behind
+/// one NAT, each with its own stale password, would otherwise 429 each other's
+/// installs.
+fn read_ignores_credential(path: &str, public_reads: bool) -> bool {
+    public_reads && (path.starts_with("/simple") || path.starts_with("/files/"))
+}
+
 async fn fallback_handler(req: Request) -> impl IntoResponse {
     let method = req.method();
     let uri = req.uri();
@@ -2670,6 +2691,25 @@ pub(crate) fn internal(label: &'static str, e: impl std::fmt::Display) -> (Statu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_public_index_and_file_reads_ignore_the_credential() {
+        for path in [
+            "/simple",
+            "/simple/",
+            "/simple/index.json",
+            "/simple/pkg/",
+            "/files/pkg/pkg-1.0.tar.gz",
+        ] {
+            assert!(read_ignores_credential(path, true), "{path}");
+            // A read credential makes every read a check of the credential.
+            assert!(!read_ignores_credential(path, false), "{path}");
+        }
+        // Admin and token routes evaluate whatever they are sent.
+        for path in ["/audit.json", "/sync/cursors", "/tokens", "/stats/x", "/"] {
+            assert!(!read_ignores_credential(path, true), "{path}");
+        }
+    }
 
     #[test]
     fn artifact_write_semaphore_maps_zero_to_unbounded_and_n_to_n_budgets() {

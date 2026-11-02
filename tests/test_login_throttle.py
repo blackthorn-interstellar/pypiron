@@ -15,6 +15,7 @@ from urllib.parse import urlsplit
 
 import pytest
 
+from .conftest import _start_disk_server
 from .helpers import _encode_basic_auth, http_get, http_request_auth
 
 pytestmark = pytest.mark.integration
@@ -147,23 +148,30 @@ def _release(sock: socket.socket) -> int:
 
 def test_concurrent_guesses_share_one_budget(disk_server_login_cooldown):
     """Ten different wrong passwords in flight at once get five evaluations,
-    not ten: the budget is reserved on admission, not tallied after a 401."""
+    not ten: the budget is reserved on admission, not tallied after a 401.
+    Which five is up to the order the server reads the request heads in."""
     server = disk_server_login_cooldown
     url = f"{server['simple']}index.json"
-    held = [_held_mint(server, "reader", f"wrong{i}") for i in range(5)]
-    time.sleep(0.5)  # let the server admit the first five
+    held = [_held_mint(server, "reader", f"wrong{i}") for i in range(10)]
 
-    for i in range(5, 10):
-        sock = _held_mint(server, "reader", f"wrong{i}")
-        assert _answered_early(sock), f"guess {i} was admitted past the budget"
-        assert _status(sock) == 429
+    # Five are refused without waiting for their bodies; five wait.
+    refused: list[socket.socket] = []
+    deadline = time.time() + 10
+    while len(refused) < 5 and time.time() < deadline:
+        waiting = [sock for sock in held if sock not in refused]
+        readable, _, _ = select.select(waiting, [], [], 0.2)
+        refused += readable
+    assert len(refused) == 5, f"{len(refused)} guesses refused early, not 5"
+    admitted = [sock for sock in held if sock not in refused]
+    assert not any(_answered_early(sock) for sock in admitted[:1]), "a sixth was refused"
+    assert [_status(sock) for sock in refused] == [429] * 5
 
     # The right password is refused too while the budget is spoken for —
     # a 200 here would answer the guess the 429s were meant to withhold.
     code, _, _ = http_get(url, headers=_auth_header("reader", "readersecret"))
     assert code == 429
 
-    assert [_release(sock) for sock in held] == [401] * 5
+    assert [_release(sock) for sock in admitted] == [401] * 5
     code, _, _ = http_get(url, headers=_auth_header("reader", "readersecret"))
     assert code == 429
 
@@ -195,3 +203,55 @@ def test_stale_credential_on_public_reads_is_never_refused(disk_server):
     with ThreadPoolExecutor(max_workers=20) as pool:
         codes = list(pool.map(lambda _: http_get(url, headers=stale)[0], range(20)))
     assert codes == [200] * 20
+
+
+@pytest.fixture()
+def public_read_server_over_a_hung_upstream(tmp_path_factory, pypiron_bin):
+    """A public-read server with an uploader credential, proxying an upstream
+    that accepts connections and never answers: a read of an unknown project
+    stays in flight for as long as the test needs."""
+    hung = socket.socket()
+    hung.bind(("127.0.0.1", 0))
+    hung.listen(64)
+    upstream = f"http://127.0.0.1:{hung.getsockname()[1]}/simple/"
+    server = _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--proxy-upstream", upstream, "--allow-insecure-upstream"],
+    )
+    try:
+        yield next(server)
+    finally:
+        server.close()
+        hung.close()
+
+
+def _held_read(server: dict, path: str, user: str, password: str) -> socket.socket:
+    url = urlsplit(server["base_url"])
+    sock = socket.create_connection((url.hostname, url.port), timeout=10)
+    sock.sendall(
+        (
+            f"GET {path} HTTP/1.1\r\nHost: {url.netloc}\r\n"
+            f"Authorization: {_encode_basic_auth(user, password)}\r\n"
+            "Connection: close\r\n\r\n"
+        ).encode()
+    )
+    return sock
+
+
+def test_distinct_stale_credentials_on_public_reads_are_never_refused(
+    public_read_server_over_a_hung_upstream,
+):
+    """Eight CI jobs behind one address, each with its own stale password, all
+    installing at once from a public-read server: none is refused. The reads
+    never evaluate the credential, so they used to take one of the address's
+    five login slots each, and the sixth was answered 429."""
+    server = public_read_server_over_a_hung_upstream
+    held = [_held_read(server, "/simple/hungpkg/", f"job{i}", "stale") for i in range(8)]
+    try:
+        readable, _, _ = select.select(held, [], [], 2)
+        refused = [_status(sock) for sock in readable]
+        assert refused == [], f"public reads refused: {refused}"
+    finally:
+        for sock in held:
+            sock.close()

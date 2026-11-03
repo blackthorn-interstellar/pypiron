@@ -1003,9 +1003,15 @@ _counters/day/<metric>/<day>/_summary@<bucket>.json # that bucket's day total + 
 _staging/<ts>-<pid>-<filename>           # cloud only: a >64 MB upload streams here, then
                                          #   copy-if-not-exists publishes it to its final key.
                                          #   Transient (the object-store analog of disk's .tmp +
-                                         #   rename); never referenced by an index. A hard crash
-                                         #   mid-publish may orphan one — harmless, like a leftover
-                                         #   .tmp on disk.
+                                         #   rename); never referenced by an index. A dropped
+                                         #   request aborts its multipart upload or deletes its
+                                         #   staging object in the background (StagingGuard); a
+                                         #   hard crash or a failed delete can still orphan one,
+                                         #   and so can an unfinished multipart upload — on
+                                         #   _staging/ or, during S3's multipart copy, on the
+                                         #   final key. The operator's bucket lifecycle rules
+                                         #   (docs: standard-cloud) reap both; the server cannot
+                                         #   list unfinished multipart uploads.
 ```
 
 **Per-file record states.** What the objects under one

@@ -22,7 +22,9 @@ proxy-upstream = "https://pypi.org"
 ```
 
 Each node needs credentials for every bucket. Start nodes as described in
-[Deploy on cloud storage](standard-cloud.md).
+[Deploy on cloud storage](standard-cloud.md), and give every bucket the
+[lifecycle rules for interrupted uploads](standard-cloud.md#clean-up-interrupted-uploads):
+replication writes large files to each of them.
 
 The first start on a new bucket list needs every bucket to answer. If one
 can't be reached, the node refuses to start and names it. After that first

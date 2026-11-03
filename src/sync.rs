@@ -2230,6 +2230,8 @@ pub async fn run_sync(
         }
     }
     let mut resolved = Resolved::merge(&args, cfg).await?;
+    // Spools a crashed run left behind (serve does the same at boot).
+    tokio::spawn(crate::upload::reap_stale_spools(resolved.spool_dir.clone()));
 
     // Extra upstream trust roots (a corporate MITM CA presented on the source
     // TLS) before the client is built. Fail-closed: a bad --upstream-ca-cert

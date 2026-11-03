@@ -12,10 +12,19 @@ from __future__ import annotations
 import hashlib
 import io
 import os
+import re
 import tarfile
+import time
 
 import pytest
 
+from .conftest import (
+    _minio_buckets,
+    _minio_fault_proxy,
+    _s3_list,
+    _s3_signed,
+    _start_s3_server,
+)
 from .helpers import http_get_bytes, upload_legacy, wait_for_file_in_index
 
 pytestmark = pytest.mark.integration
@@ -74,3 +83,88 @@ def test_large_upload_multipart_publish_and_immutability(server, tmp_path):
         expect_status=409,
     )
     assert code == 409
+
+
+@pytest.fixture()
+def s3_server_faulty(tmp_path_factory, pypiron_bin, request):
+    """An S3 server whose bucket is reached through the fault-injecting proxy."""
+    buckets = _minio_buckets(request.getfixturevalue("_minio_container"), 1, "mpu")
+    minio = next(buckets)
+    try:
+        proxied = _minio_fault_proxy(minio)
+        try:
+            yield from _start_s3_server(tmp_path_factory, pypiron_bin, next(proxied))
+        finally:
+            proxied.close()
+    finally:
+        buckets.close()
+
+
+def _open_multipart_uploads(minio, bucket):
+    code, body = _s3_signed(minio, "GET", f"/{bucket}", query={"uploads": ""})
+    assert code == 200, body[:200]
+    return re.findall(r"<UploadId>(.*?)</UploadId>", body.decode())
+
+
+@pytest.mark.s3
+def test_dropped_large_upload_aborts_its_multipart(s3_server_faulty, tmp_path):
+    """An upload whose request goes away mid-write (the client hung up, the
+    write timed out) must not leave its multipart upload open: the provider
+    bills its parts and nothing lists them."""
+    server = s3_server_faulty
+    faults, minio = server["faults"], server["minio"]
+    bucket = minio["bucket"]
+    sdist = _make_large_sdist("abandoned", "1.0", tmp_path, os.urandom(LARGE_PAYLOAD))
+
+    # The upload starts, but its part writes hang; the client then gives up.
+    faults.hold_puts(bucket, "_staging/")
+    try:
+        upload_legacy(
+            server["legacy"], sdist, username=server["user"], password=server["password"], timeout=5
+        )
+    except OSError:  # the client's read timeout: it hung up on the server
+        pass
+    else:
+        pytest.fail("the upload should still have been writing its parts")
+    assert faults.count(bucket=bucket, method="POST", needle="uploads") >= 1
+
+    deadline = time.monotonic() + 10
+    while _open_multipart_uploads(minio, bucket) and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert _open_multipart_uploads(minio, bucket) == [], "the dropped upload must be aborted"
+
+    # The same file uploads cleanly once the bucket behaves.
+    faults.recover(bucket)
+    upload_legacy(
+        server["legacy"], sdist, username=server["user"], password=server["password"], timeout=120
+    )
+    wait_for_file_in_index(server["simple"], "abandoned", sdist.name)
+    assert _open_multipart_uploads(minio, bucket) == []
+
+
+@pytest.mark.s3
+def test_dropped_large_upload_cleans_up_its_staging_copy(s3_server_faulty, tmp_path):
+    """Hung up on while the finished staging copy is being published to its
+    final name: the staging object must not be left behind."""
+    server = s3_server_faulty
+    faults, minio = server["faults"], server["minio"]
+    bucket = minio["bucket"]
+    sdist = _make_large_sdist("halfway", "1.0", tmp_path, os.urandom(LARGE_PAYLOAD))
+
+    # The staging upload completes; the copy to the final key hangs.
+    final_key = f"packages/halfway/{sdist.name}"
+    faults.hold_puts(bucket, final_key)
+    try:
+        upload_legacy(
+            server["legacy"], sdist, username=server["user"], password=server["password"], timeout=5
+        )
+    except OSError:  # the client's read timeout: it hung up on the server
+        pass
+    else:
+        pytest.fail("the upload should still have been publishing")
+    assert faults.count(bucket=bucket, method="PUT", needle=f"{final_key}?") >= 1
+
+    deadline = time.monotonic() + 10
+    while _s3_list(minio, bucket, "_staging/") and time.monotonic() < deadline:
+        time.sleep(0.2)
+    assert _s3_list(minio, bucket, "_staging/") == [], "the staging copy must be deleted"

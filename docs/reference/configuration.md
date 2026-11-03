@@ -221,7 +221,7 @@ backends are supported. With more than one bucket:
 | `--malware-block true\|false` | `PYPIRON_MALWARE_BLOCK` | `true` | Refuse public files named by OSV `MAL-*` advisories. The binary includes a first-boot block set; a live or synced snapshot replaces it. Explicit `true` requires a live snapshot at startup. Does not control PEP 792 quarantine. |
 | `--malware-probe-secs N` | `PYPIRON_MALWARE_PROBE_SECS` | `120` | Check OSV for new malware between daily snapshots. `0` disables. Requires malware blocking and the standard OSV `all.zip` feed. |
 | `--metrics-project-labels` | `PYPIRON_METRICS_PROJECT_LABELS` | `false` | Attach per-client `project` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label derives from the username tag, so exposing it lets any scraper list internal project names. |
-| `--spool-dir PATH` | `PYPIRON_SPOOL_DIR` | system temp | Upload/proxy spool directory. |
+| `--spool-dir PATH` | `PYPIRON_SPOOL_DIR` | system temp | Upload/proxy spool directory. Spool files a crash left behind are removed once they are a day old. |
 | `--artifact-delivery auto\|redirect\|stream` | `PYPIRON_ARTIFACT_DELIVERY` | `auto` | Redirect object-store downloads for compatible clients or stream through the server. A first uncached proxy download may stream under `--proxy-stream-threshold`. |
 | `--wait-on-upload` | `PYPIRON_WAIT_ON_UPLOAD` | `false` | Wait for index visibility before upload returns. |
 | `--wait-on-upload-secs N` | `PYPIRON_WAIT_ON_UPLOAD_SECS` | `10` | Bound for that wait. |
@@ -430,7 +430,7 @@ require pypiron 0.0.23 or newer on both the sync client and destination server.
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | relay from `--from` | Deliver an advisory snapshot to the destination. A URL or path overrides the source feed; `""` disables. Failure warns but does not stop package sync. |
 | `--concurrency N` | `PYPIRON_SYNC_CONCURRENCY` | `16` | Files transferring at once, across all packages; within a package, the largest start first. Through v0.0.23 it counted per package: multiply an old value by `--package-concurrency` to keep the same parallelism. |
 | `--package-concurrency N` | `PYPIRON_SYNC_PACKAGE_CONCURRENCY` | `16` | Packages checked in parallel. Each completed package frees a slot for the next, even while another package is stalled. |
-| `--spool-dir PATH` | `PYPIRON_SYNC_SPOOL_DIR` | system temp | Download spool directory. |
+| `--spool-dir PATH` | `PYPIRON_SYNC_SPOOL_DIR` | system temp | Download spool directory. Spool files a crash left behind are removed at startup once they are a day old. |
 | `--dry-run` | `PYPIRON_SYNC_DRY_RUN` | `false` | Print work, write nothing. |
 | `--full` | `PYPIRON_SYNC_FULL` | `false` | Ignore cursors and reconcile every selected project. |
 | `--no-progress` | `PYPIRON_SYNC_NO_PROGRESS` | `false` | Hide the live progress line (packages, bytes, rate, time left). |

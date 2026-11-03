@@ -33,6 +33,89 @@ need the equivalent object permissions. See
 [Configuration](../reference/configuration.md#storage) for named profiles,
 service-account files, and S3-compatible endpoints.
 
+### Clean up interrupted uploads
+
+A crash or a dropped connection during an upload over 64 MB can leave two kinds
+of leftovers in the bucket: a partial upload, which the provider bills but never
+lists, and a scratch copy under `_staging/`. pypiron cleans up after the cases it
+sees; add two lifecycle rules once per bucket to catch the rest. If you set
+`storage-prefix`, put it in front of `_staging/` below.
+
+!!! warning
+    Expire only `_staging/`. The rest of the bucket holds your packages and the
+    records of what was deleted.
+
+For S3, save this as `lifecycle.json`:
+
+```json
+{
+  "Rules": [
+    {
+      "ID": "abort-incomplete-uploads",
+      "Status": "Enabled",
+      "Filter": {},
+      "AbortIncompleteMultipartUpload": { "DaysAfterInitiation": 1 }
+    },
+    {
+      "ID": "expire-pypiron-staging",
+      "Status": "Enabled",
+      "Filter": { "Prefix": "_staging/" },
+      "Expiration": { "Days": 1 },
+      "NoncurrentVersionExpiration": { "NoncurrentDays": 1 }
+    }
+  ]
+}
+```
+
+This command replaces the bucket's whole lifecycle configuration. Check for
+existing rules with `aws s3api get-bucket-lifecycle-configuration --bucket
+acme-pypiron` and add them to the file first:
+
+```bash
+aws s3api put-bucket-lifecycle-configuration --bucket acme-pypiron \
+  --lifecycle-configuration file://lifecycle.json
+```
+
+For GCS, the same two rules, which also replace any existing ones:
+
+```json
+{
+  "rule": [
+    { "action": { "type": "AbortIncompleteMultipartUpload" }, "condition": { "age": 1 } },
+    { "action": { "type": "Delete" }, "condition": { "age": 1, "matchesPrefix": ["_staging/"] } }
+  ]
+}
+```
+
+```bash
+gcloud storage buckets update gs://acme-pypiron --lifecycle-file=lifecycle.json
+```
+
+Azure discards partial uploads by itself after seven days, so it needs only
+the `_staging/` rule. The prefix starts with the container name. This also
+replaces the storage account's existing policy:
+
+```json
+{
+  "rules": [
+    {
+      "name": "expire-pypiron-staging",
+      "enabled": true,
+      "type": "Lifecycle",
+      "definition": {
+        "filters": { "blobTypes": ["blockBlob"], "prefixMatch": ["acme-pypiron/_staging/"] },
+        "actions": { "baseBlob": { "delete": { "daysAfterModificationGreaterThan": 1 } } }
+      }
+    }
+  ]
+}
+```
+
+```bash
+az storage account management-policy create --account-name acmestorage \
+  --resource-group acme-rg --policy @lifecycle.json
+```
+
 `proxy-upstream` caches public packages on demand. Remove it when this server
 must not reach PyPI. New public releases wait seven days by default; your own
 uploads do not.

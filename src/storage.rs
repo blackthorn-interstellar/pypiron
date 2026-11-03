@@ -32,7 +32,7 @@ use object_store::signer::Signer;
 use object_store::{
     Attribute, Attributes, Error as OsError, GetOptions, GetRange, ObjectStore, ObjectStoreExt,
     PutMode, PutMultipartOptions, PutOptions, PutPayload, PutPayloadMut, RetryConfig,
-    StaticCredentialProvider, UpdateVersion, WriteMultipart,
+    StaticCredentialProvider, UpdateVersion,
 };
 
 use crate::config::BucketOverride;
@@ -2108,11 +2108,7 @@ impl Storage for DiskStorage {
             };
             if md.is_file() {
                 if let Some(name) = entry.file_name().to_str() {
-                    let last_modified = md
-                        .modified()
-                        .ok()
-                        .map(OffsetDateTime::from)
-                        .and_then(|t| t.format(&Rfc3339).ok());
+                    let last_modified = md.modified().ok().and_then(rfc3339);
                     files.push(FileEntry {
                         key: format!("{}{}", dir_prefix, name),
                         size: md.len(),
@@ -2942,49 +2938,95 @@ impl ObjectStorage {
         }
     }
 
-    /// Stream a spooled file into a multipart upload at `staging`, bounding
-    /// resident memory to a few parts in flight. Aborts on any error so no
-    /// orphaned parts linger billable.
-    async fn stream_multipart(
-        &self,
-        staging: &OsPath,
-        path: &std::path::Path,
-        content_type: Option<&str>,
-    ) -> Result<()> {
-        // Open the local spool BEFORE initiating the multipart upload: a failure
-        // here (spool vanished, EMFILE) must not leave an initiated multipart with
-        // orphan parts billing forever, since we'd drop the writer without abort().
-        let mut file = fs::File::open(path)
-            .await
-            .with_context(|| format!("open upload spool {}", path.display()))?;
-        let opts = PutMultipartOptions::from(ct_attrs(content_type));
-        let upload = self
-            .store
-            .put_multipart_opts(staging, opts)
-            .await
-            .map_err(|error| self.store_err(error, "begin multipart", staging))?;
-        let mut writer = WriteMultipart::new_with_chunk_size(upload, MULTIPART_PART_SIZE);
-        let mut buf = vec![0u8; READ_CHUNK];
+    /// Upload a spooled file as a multipart upload at `guard`'s staging key and
+    /// complete it, holding at most `MULTIPART_CONCURRENCY` parts in flight
+    /// (bounded RSS). On error the caller aborts; on a dropped future the guard
+    /// does. The upload stays in the guard throughout, so no await point can
+    /// strand it.
+    async fn upload_parts(&self, file: &mut fs::File, guard: &mut StagingGuard) -> Result<()> {
+        let Some(upload) = guard.upload.as_mut() else {
+            bail!("multipart upload {} already finished", guard.staging);
+        };
+        let mut parts = tokio::task::JoinSet::new();
         loop {
-            let n = match file.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => n,
-                Err(e) => {
-                    let _ = writer.abort().await;
-                    return Err(anyhow::Error::from(e).context("read upload spool"));
+            // One fixed-size block per part: same-sized allocations recycle
+            // (see READ_CHUNK for why that matters).
+            let mut part = vec![0u8; MULTIPART_PART_SIZE];
+            let mut filled = 0;
+            while filled < part.len() {
+                match file.read(&mut part[filled..]).await {
+                    Ok(0) => break,
+                    Ok(n) => filled += n,
+                    Err(e) => return Err(anyhow::Error::from(e).context("read upload spool")),
                 }
-            };
-            if let Err(e) = writer.wait_for_capacity(MULTIPART_CONCURRENCY).await {
-                let _ = writer.abort().await;
-                return Err(anyhow::Error::from(e).context("multipart part upload"));
             }
-            writer.write(&buf[..n]);
+            if filled == 0 {
+                break;
+            }
+            part.truncate(filled);
+            while parts.len() >= MULTIPART_CONCURRENCY {
+                join_part(&mut parts).await?;
+            }
+            parts.spawn(upload.put_part(PutPayload::from(part)));
+            if filled < MULTIPART_PART_SIZE {
+                break;
+            }
         }
-        writer
-            .finish()
+        while !parts.is_empty() {
+            join_part(&mut parts).await?;
+        }
+        upload
+            .complete()
             .await
-            .with_context(|| format!("{}: finish multipart {staging}", self.backend))?;
+            .with_context(|| format!("{}: finish multipart {}", self.backend, guard.staging))?;
+        // Completed: there is no upload left to abort, only an object to delete.
+        guard.upload = None;
         Ok(())
+    }
+}
+
+/// Wait for one in-flight multipart part and surface its error.
+async fn join_part(parts: &mut tokio::task::JoinSet<object_store::Result<()>>) -> Result<()> {
+    match parts.join_next().await {
+        Some(Ok(result)) => result.context("multipart part upload"),
+        Some(Err(join)) => Err(anyhow::Error::from(join).context("multipart part upload")),
+        None => Ok(()),
+    }
+}
+
+/// The debris a large upload leaves until its explicit cleanup runs: an open
+/// multipart upload (billed, invisible to LIST), then a completed `_staging/`
+/// object. A future dropped mid-write — the artifact write timeout, a client
+/// disconnect, the request deadline — never reaches that cleanup, so dropping
+/// an armed guard does it in the background: abort the upload if one is still
+/// open, then delete the staging object (a completion already on the wire may
+/// have landed it). Best effort: a crash, or a runtime already shutting down,
+/// leaves the rest to the bucket's lifecycle rules (docs: standard-cloud).
+struct StagingGuard {
+    store: Arc<dyn ObjectStore>,
+    staging: OsPath,
+    upload: Option<Box<dyn object_store::MultipartUpload>>,
+    armed: bool,
+}
+
+impl Drop for StagingGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        // Outside a runtime (or mid-shutdown) there is nothing to run on.
+        let Ok(rt) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let store = Arc::clone(&self.store);
+        let staging = self.staging.clone();
+        let upload = self.upload.take();
+        rt.spawn(async move {
+            if let Some(mut upload) = upload {
+                let _ = upload.abort().await;
+            }
+            let _ = store.delete(&staging).await;
+        });
     }
 }
 
@@ -3110,8 +3152,36 @@ impl Storage for ObjectStorage {
         // RSS), then publish atomically. copy_if_not_exists is the race-free
         // create-if-absent for large objects — native on GCS/Azure, a
         // multipart copy on S3.
+        //
+        // Open the spool BEFORE initiating the upload, so a failure here (spool
+        // vanished, EMFILE) never leaves an upload to clean up.
+        let mut file = fs::File::open(path)
+            .await
+            .with_context(|| format!("open upload spool {}", path.display()))?;
         let staging = self.oskey(&staging_key(key));
-        self.stream_multipart(&staging, path, content_type).await?;
+        let opts = PutMultipartOptions::from(ct_attrs(content_type));
+        let upload = self
+            .store
+            .put_multipart_opts(&staging, opts)
+            .await
+            .map_err(|error| self.store_err(error, "begin multipart", &staging))?;
+        let mut guard = StagingGuard {
+            store: Arc::clone(&self.store),
+            staging: staging.clone(),
+            upload: Some(upload),
+            armed: true,
+        };
+        if let Err(e) = self.upload_parts(&mut file, &mut guard).await {
+            // Abort in line, keeping the upload in the guard until the abort
+            // returns so a drop mid-abort still aborts. The guard stays armed:
+            // a completion that failed only on the way back may have landed
+            // the staging object, and its drop deletes it.
+            if let Some(upload) = guard.upload.as_mut() {
+                let _ = upload.abort().await;
+            }
+            guard.upload = None;
+            return Err(e);
+        }
         let outcome = match self
             .store
             .copy_if_not_exists(&staging, &self.oskey(key))
@@ -3121,7 +3191,10 @@ impl Storage for ObjectStorage {
             Err(OsError::AlreadyExists { .. }) => Ok(false),
             Err(e) => Err(self.store_err(e, "publish", key)),
         };
-        let _ = self.store.delete(&staging).await;
+        if let Err(error) = self.store.delete(&staging).await {
+            tracing::warn!(key = %staging, error = %error, "could not delete a staging object; the bucket's _staging/ lifecycle rule reaps it");
+        }
+        guard.armed = false;
         outcome
     }
 
@@ -3456,6 +3529,20 @@ fn content_type_of(attrs: &Attributes) -> String {
         .unwrap_or_else(|| "application/octet-stream".to_string())
 }
 
+/// A file's mtime as RFC 3339, or None when it has no RFC 3339 form (a year
+/// outside 0..=9999, which tmpfs and btrfs will store). Checked, because
+/// `OffsetDateTime::from(SystemTime)` panics past year ±9999.
+fn rfc3339(mtime: std::time::SystemTime) -> Option<String> {
+    let nanos = match mtime.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => i128::try_from(after.as_nanos()).ok()?,
+        Err(before) => -i128::try_from(before.duration().as_nanos()).ok()?,
+    };
+    OffsetDateTime::from_unix_timestamp_nanos(nanos)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
 /// A unique staging key for a large upload, namespaced by its final filename.
 fn staging_key(key: &str) -> String {
     // A per-process atomic counter — not the clock alone — guarantees a distinct
@@ -3624,6 +3711,20 @@ fn expand_home(path: &str, home: Option<&str>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_mtime_without_an_rfc3339_form_is_none_not_a_panic() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let year = |secs: u64| Duration::from_secs(secs * 31_556_952);
+        assert_eq!(
+            rfc3339(UNIX_EPOCH + Duration::from_secs(86_400)).as_deref(),
+            Some("1970-01-02T00:00:00Z")
+        );
+        assert!(rfc3339(UNIX_EPOCH - year(1)).is_some()); // 1969
+        assert_eq!(rfc3339(UNIX_EPOCH - year(1971)), None); // year -1
+        assert_eq!(rfc3339(UNIX_EPOCH + year(20_000)), None); // panicked before
+        assert_eq!(rfc3339(UNIX_EPOCH - year(20_000)), None);
+    }
 
     #[test]
     fn a_config_file_tilde_data_dir_expands_to_home() {

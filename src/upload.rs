@@ -5,7 +5,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::Result;
 use md5::{Digest as _, Md5};
@@ -20,19 +20,80 @@ static SPOOL_COUNTER: AtomicU64 = AtomicU64::new(0);
 const SPOOL_WRITE_BUF: usize = 256 * 1024;
 
 /// Temp-file path that cleans up after itself; survives every early-return
-/// path of the upload handler without leaking spool files.
-pub struct TempPath(PathBuf);
+/// path of the upload handler without leaking spool files. It also keeps a
+/// handle on the file that holds the spool's lock (see [`reap_stale_spools`])
+/// for as long as the spool is in use.
+pub struct TempPath {
+    path: PathBuf,
+    _lock: Option<std::fs::File>,
+}
 
 impl TempPath {
     pub fn path(&self) -> &Path {
-        &self.0
+        &self.path
     }
 }
 
 impl Drop for TempPath {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
+        let _ = std::fs::remove_file(&self.path);
     }
+}
+
+/// A spool file name, so the reaper only ever touches pypiron's own files.
+const SPOOL_PREFIX: &str = "pypiron-upload-";
+const SPOOL_SUFFIX: &str = ".spool";
+
+/// How old an unowned spool must be before the reaper removes it. Far past any
+/// live spool's life (the one-hour request deadline plus the store write), so
+/// even a pypiron build that predates the spool lock, sharing the directory, is
+/// safe.
+const STALE_SPOOL_AGE: Duration = Duration::from_secs(24 * 3600);
+
+/// Remove the spool files a crashed process left in `dir` and log how many.
+/// Normal exits, errors and cancels remove their own; a crash (SIGKILL, OOM)
+/// skips that. Touches only regular files named like a pypiron spool, more than
+/// a day old, whose lock no live process holds: every spool's owner holds an
+/// exclusive lock on it for its whole life and the kernel drops that lock when
+/// the process dies, so a suspended or slow owner keeps its file. Best effort:
+/// anything unreadable (another user's file in a shared /tmp) is left alone.
+pub async fn reap_stale_spools(dir: PathBuf) {
+    let reaped = tokio::task::spawn_blocking(move || reap_spools(&dir, STALE_SPOOL_AGE)).await;
+    if let Ok(n @ 1..) = reaped {
+        tracing::info!(removed = n, "removed upload spool files left by a crash");
+    }
+}
+
+fn reap_spools(dir: &Path, min_age: Duration) -> usize {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    let mut reaped = 0;
+    for entry in entries.flatten() {
+        let name = entry.file_name();
+        let ours = name
+            .to_str()
+            .is_some_and(|n| n.starts_with(SPOOL_PREFIX) && n.ends_with(SPOOL_SUFFIX));
+        // A DirEntry's metadata never follows a symlink.
+        let stale = entry.metadata().is_ok_and(|md| {
+            md.is_file()
+                && md
+                    .modified()
+                    .ok()
+                    .and_then(|m| m.elapsed().ok())
+                    .is_some_and(|age| age > min_age)
+        });
+        if !ours || !stale {
+            continue;
+        }
+        let Ok(file) = std::fs::File::open(entry.path()) else {
+            continue;
+        };
+        if file.try_lock().is_ok() && std::fs::remove_file(entry.path()).is_ok() {
+            reaped += 1;
+        }
+    }
+    reaped
 }
 
 pub struct UploadSpool {
@@ -77,7 +138,7 @@ impl UploadSpool {
                 .unwrap_or(0);
             let seq = SPOOL_COUNTER.fetch_add(1, Ordering::Relaxed);
             let path = dir.join(format!(
-                "pypiron-upload-{nanos}-{}-{seq}.spool",
+                "{SPOOL_PREFIX}{nanos}-{}-{seq}{SPOOL_SUFFIX}",
                 std::process::id()
             ));
             let mut opts = OpenOptions::new();
@@ -86,13 +147,20 @@ impl UploadSpool {
             opts.mode(0o600);
             match opts.open(&path).await {
                 Ok(file) => {
+                    // Mark the spool live for its whole life (see
+                    // reap_stale_spools): the lock rides on a duplicate handle in
+                    // TempPath, which outlives this writer. A filesystem without
+                    // locks only loses the reaper's liveness check.
+                    let file = file.into_std().await;
+                    let _ = file.try_lock();
+                    let lock = file.try_clone().ok();
                     return Ok(Self {
-                        file: BufWriter::with_capacity(SPOOL_WRITE_BUF, file),
-                        path: TempPath(path),
+                        file: BufWriter::with_capacity(SPOOL_WRITE_BUF, File::from_std(file)),
+                        path: TempPath { path, _lock: lock },
                         hasher: Sha256::new(),
                         md5: Md5::new(),
                         size: 0,
-                    })
+                    });
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
                     last_err = Some(e);
@@ -203,6 +271,37 @@ mod tests {
         assert!(path.exists());
         drop(done);
         assert!(!path.exists(), "spool file must not leak");
+    }
+
+    #[tokio::test]
+    async fn reaper_spares_a_live_spool_however_old() {
+        let dir = std::env::temp_dir().join(format!("pypiron-reap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = SystemTime::now() - Duration::from_secs(2 * 24 * 3600);
+        let age = |path: &Path| {
+            let file = std::fs::File::options().write(true).open(path).unwrap();
+            file.set_modified(old).unwrap();
+        };
+        let live = UploadSpool::new(&dir)
+            .await
+            .unwrap()
+            .finish(false)
+            .await
+            .unwrap();
+        age(live.path.path());
+        // A crash's leftover: same name shape, nobody holding its lock.
+        let leaked = dir.join(format!("{SPOOL_PREFIX}1-1-0{SPOOL_SUFFIX}"));
+        std::fs::write(&leaked, b"x").unwrap();
+        age(&leaked);
+
+        assert_eq!(reap_spools(&dir, STALE_SPOOL_AGE), 1);
+        assert!(
+            live.path.path().exists(),
+            "a live spool must survive the reaper"
+        );
+        assert!(!leaked.exists());
+        drop(live);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[tokio::test]

@@ -1882,6 +1882,15 @@ async fn run_serve(
     // lease on graceful exit)
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
     let worker_handle = tokio::spawn(worker::run_worker_until(state.clone(), shutdown_rx));
+    // Spools a crash left behind: at boot, then hourly, so one left by a crash
+    // just before this boot is still reaped once it ages.
+    let spool_dir = state.spool_dir.clone();
+    tokio::spawn(async move {
+        loop {
+            crate::upload::reap_stale_spools(spool_dir.clone()).await;
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+        }
+    });
     if let Some(proxy) = &state.proxy {
         proxy.follow_dependencies(state.clone());
     }

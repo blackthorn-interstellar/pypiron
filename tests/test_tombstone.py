@@ -13,7 +13,10 @@ so each scenario is deterministic: seed the tree, run one audit, look.
 from __future__ import annotations
 
 import os
+import shutil
 import subprocess
+import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -119,3 +122,33 @@ def test_aged_companions_kept_while_an_intent_is_live(disk_server, pypiron_bin, 
     assert left == [p.name for p in companions], (
         f"a live intent marker must hold off the sweep, missing {set(p.name for p in companions) - set(left)}"
     )
+
+
+#: tmpfs stores any 64-bit mtime, including ones with no RFC 3339 form.
+SHM = Path("/dev/shm")
+#: 1 January of year -1, in Unix seconds.
+YEAR_MINUS_ONE = -62198755200
+
+
+@pytest.mark.skipif(
+    not (sys.platform.startswith("linux") and os.access(SHM, os.W_OK)),
+    reason="needs tmpfs to store an mtime outside years 0-9999",
+)
+def test_untimed_orphan_companions_are_kept_and_warned(disk_server, pypiron_bin, tmp_path):
+    """A companion whose mtime has no usable form can never age past the gate.
+    Keeping it is the safe choice, but it must not be silent: the audit warns,
+    even when a fresh sibling would also have held the base back."""
+    _, companions = _strand_companions(disk_server, tmp_path, "orphanuntimed")
+    assert len(companions) > 1, f"need a fresh companion beside the untimed one: {companions}"
+    data = Path(tempfile.mkdtemp(dir=SHM, prefix="pypiron-untimed-"))
+    try:
+        shutil.copytree(disk_server["data_dir"], data, dirs_exist_ok=True)
+        copied = [data / "packages" / "orphanuntimed" / p.name for p in companions]
+        os.utime(copied[-1], (YEAR_MINUS_ONE, YEAR_MINUS_ONE))
+
+        cp = _rebuild_index(pypiron_bin, data)
+
+        assert all(p.exists() for p in copied), "an untimed companion must never be swept"
+        assert "no usable modification time" in cp.stdout + cp.stderr, cp.stdout + cp.stderr
+    finally:
+        shutil.rmtree(data, ignore_errors=True)

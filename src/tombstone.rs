@@ -11,7 +11,7 @@ use std::collections::HashMap;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, error};
+use tracing::{debug, error, warn};
 
 use crate::app::{AppState, PACKAGES_PREFIX};
 use crate::sidecar::{
@@ -123,7 +123,8 @@ pub async fn complete_interrupted_deletes(
 ///   artifact, so its window is a whole transfer; the proxy fill has already
 ///   spooled and verified the bytes before it writes anything, so its window is
 ///   one origin re-read plus the spooled-bytes PUT. The long one sets the bar.
-///   An absent or unparseable storage timestamp counts as young;
+///   An absent or unparseable storage timestamp counts as young, and is
+///   logged at warn: it can never age, so that debris stays until fixed;
 /// - the package must have no live (unpaired, in-grace) intent marker, since
 ///   all three writer paths declare intent before touching truth.
 ///
@@ -158,7 +159,7 @@ pub async fn drop_orphan_companions(
 
     let mut candidates: Vec<(String, Vec<String>)> = Vec::new();
     let mut kept_young = 0usize;
-    let mut kept_untimed = false;
+    let mut kept_untimed = 0usize;
     for filename in filenames {
         let akey = format!("{PACKAGES_PREFIX}{pkg}/{filename}");
         // Any anchor re-observed under a fresh read means the companions still
@@ -182,28 +183,38 @@ pub async fn drop_orphan_companions(
         if companions.is_empty() {
             continue;
         }
-        let aged = companions.iter().all(|key| {
-            let modified = listed.get(key).and_then(|modified| *modified);
-            if modified.is_none() {
-                kept_untimed = true;
-            }
-            modified.is_some_and(|written| now - written >= age_gate)
-        });
-        if !aged {
+        let written: Vec<Option<time::OffsetDateTime>> = companions
+            .iter()
+            .map(|key| listed.get(key).copied().flatten())
+            .collect();
+        // Every companion is checked, so a fresh one can't hide an untimed one.
+        if written.iter().any(Option::is_none) {
+            kept_untimed += 1;
+            continue;
+        }
+        if !written.iter().flatten().all(|&w| now - w >= age_gate) {
             kept_young += 1;
             continue;
         }
         candidates.push((akey, companions));
     }
     if kept_young > 0 {
-        // Otherwise a backend that stopped reporting `last_modified` would keep
-        // every candidate young forever and pile up debris behind a clean audit
-        // log — the failure is invisible from the outside.
+        // Routine: any audit that overlaps an in-flight write sees this.
         debug!(
             package = %pkg,
             kept_young,
-            untimed = kept_untimed,
             "audit: orphan companions held back by the age gate"
+        );
+    }
+    if kept_untimed > 0 {
+        // Never routine, and never self-healing: without a timestamp the age
+        // gate can't pass, so this debris stays until someone acts.
+        warn!(
+            package = %pkg,
+            files = kept_untimed,
+            "audit: orphan companions kept because storage reports no usable modification \
+             time for them (a timestamp outside years 0-9999, or a backend that omits it); \
+             fix their timestamps or delete them by hand"
         );
     }
     if candidates.is_empty() {

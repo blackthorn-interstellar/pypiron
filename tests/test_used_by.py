@@ -77,8 +77,10 @@ def test_audit_rebuilds_lost_used_by_files(disk_server_fast_reconcile, tmp_path)
     # must build both from the stored metadata alone.
     for path in [*state.glob("requires-*.json"), *(state / "used-by").glob("*.json")]:
         path.unlink()
+    # A tick can rewrite lib.json with only the packages it just rebuilt
+    # (the last seed upload is `any`) before the audit fills in the rest.
+    expected = {"any", "app", "old"}
     deadline = time.monotonic() + 30
-    while not used_by.exists():
-        assert time.monotonic() < deadline, "the audit never rebuilt lib.json"
+    while (got := set(json.loads(used_by.read_text())) if used_by.exists() else set()) != expected:
+        assert time.monotonic() < deadline, f"the audit never rebuilt lib.json: {got}"
         time.sleep(0.2)
-    assert set(json.loads(used_by.read_text())) == {"any", "app", "old"}

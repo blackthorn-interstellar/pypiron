@@ -266,14 +266,13 @@ async fn run_bucket_health_until(
 /// drain saturates the store for one second. Availability is the dedicated
 /// health loop's job (`probe_buckets`).
 ///
-/// Cancelling the check does not cancel a PUT that already reached the store:
-/// a timed-out check may still have won or renewed the lease. The next
-/// completed check claims it. A node whose every check outlasts the deadline
-/// keeps renewing a lease it never acts on (private/ROADMAP.md).
+/// A timed-out check keeps running and the next tick claims its answer
+/// ([`LeaseManager::is_leader_within`]), so a store slower than the deadline
+/// still gets a leader.
 async fn bounded_lease_check(state: &AppState, bucket: usize, lease: &LeaseManager) -> bool {
-    match timeout(BUCKET_HEALTH_IO_TIMEOUT, lease.is_leader()).await {
-        Ok(is_leader) => is_leader,
-        Err(_) => {
+    match lease.is_leader_within(BUCKET_HEALTH_IO_TIMEOUT).await {
+        Some(is_leader) => is_leader,
+        None => {
             warn!(
                 bucket = %state.buckets.handles()[bucket].name,
                 timeout_ms = BUCKET_HEALTH_IO_TIMEOUT.as_millis(),

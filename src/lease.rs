@@ -31,6 +31,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 use time::OffsetDateTime;
+use tokio::task::JoinHandle;
+use tokio::time::Instant;
 use tracing::{debug, info, warn};
 
 use crate::storage::Storage;
@@ -45,11 +47,18 @@ struct Lease {
     expires_at: i64,
 }
 
+/// A lease check still running, and when it started.
+type Pending = Option<(Instant, JoinHandle<bool>)>;
+
 #[derive(Clone)]
 pub struct LeaseManager {
     storage: Arc<dyn Storage>,
     holder: String,
     ttl_secs: i64,
+    /// A check [`LeaseManager::is_leader_within`] gave up waiting on, and when
+    /// it started. Shared by clones: the next bounded check awaits it instead
+    /// of starting another.
+    pending: Arc<std::sync::Mutex<Pending>>,
 }
 
 impl LeaseManager {
@@ -63,6 +72,39 @@ impl LeaseManager {
             storage,
             holder,
             ttl_secs: ttl.as_secs().max(1) as i64,
+            pending: Arc::default(),
+        }
+    }
+
+    /// [`LeaseManager::is_leader`], waiting at most `limit`; `None` when it
+    /// did not answer in time.
+    ///
+    /// Giving up does not abandon the check: its PUT may already have reached
+    /// the store, so the next call awaits that same check instead of starting
+    /// another. Dropping it instead left a node whose round trips outlast
+    /// `limit` renewing a lease every tick that it never acted on, and the
+    /// fleet ran no leader work until its latency dropped. A late win counts
+    /// only while at least half the TTL it was written with remains.
+    pub async fn is_leader_within(&self, limit: Duration) -> Option<bool> {
+        let carried = self.pending.lock().ok().and_then(|mut p| p.take());
+        let (started, mut check) = carried.unwrap_or_else(|| {
+            let lease = self.clone();
+            (
+                Instant::now(),
+                tokio::spawn(async move { lease.is_leader().await }),
+            )
+        });
+        match tokio::time::timeout(limit, &mut check).await {
+            Ok(held) => {
+                let fresh = started.elapsed() < Duration::from_secs(self.ttl_secs as u64) / 2;
+                Some(held.unwrap_or(false) && fresh)
+            }
+            Err(_) => {
+                if let Ok(mut p) = self.pending.lock() {
+                    *p = Some((started, check));
+                }
+                None
+            }
         }
     }
 
@@ -144,6 +186,10 @@ impl LeaseManager {
     /// never a delete: the store has no conditional delete, and a peer that
     /// took the lease in between must keep it.
     pub async fn release(&self) {
+        // A carried check landing after this would re-take the lease.
+        if let Some((_, check)) = self.pending.lock().ok().and_then(|mut p| p.take()) {
+            check.abort();
+        }
         let (term, etag) = match self.storage.get_with_etag(LEASE_KEY).await {
             Ok(Some((bytes, etag))) => match serde_json::from_slice::<Lease>(&bytes) {
                 Ok(lease) if lease.holder == self.holder => (lease.term, etag),
@@ -222,6 +268,28 @@ mod tests {
         );
         a.release().await;
         assert_eq!(stored(&storage).await.holder, "peer");
+    }
+
+    /// A check that outlasts its deadline is carried to the next call, not
+    /// dropped: a node slower than the deadline still becomes leader, and
+    /// renews the one lease it wrote instead of writing another blind.
+    #[tokio::test(start_paused = true)]
+    async fn a_slow_check_is_claimed_by_the_next_call() {
+        let storage = Arc::new(InMemStorage::default());
+        let lm = LeaseManager::new(storage.clone(), Duration::from_secs(30));
+        assert_eq!(lm.is_leader_within(Duration::ZERO).await, None);
+        tokio::task::yield_now().await;
+        assert_eq!(stored(&storage).await.term, 1, "the timed-out check landed");
+        assert_eq!(lm.is_leader_within(Duration::ZERO).await, Some(true));
+
+        // A late answer older than half the TTL is not trusted.
+        assert_eq!(lm.is_leader_within(Duration::ZERO).await, None);
+        tokio::time::advance(Duration::from_secs(15)).await;
+        assert_eq!(lm.is_leader_within(Duration::ZERO).await, Some(false));
+        assert_eq!(
+            lm.is_leader_within(Duration::from_secs(1)).await,
+            Some(true)
+        );
     }
 
     #[tokio::test]

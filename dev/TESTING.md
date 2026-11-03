@@ -207,9 +207,9 @@ all inside the enumerating tier's nominal scope.
   leaves equals a fresh render of truth — a stored fingerprint never vouches
   for a stale view. The pre-4b56403 audit (fingerprint whatever the post-write
   listing shows) is the kill-proof (`old_audit_blesses_a_stale_view`, 18
-  steps); the shipped one passes with one tick. With two ticks (a dual-leader
-  window) it does not: `dual_leader_ticks_aba_the_certificate` documents a
-  residual hole, below.
+  steps); the shipped one passes with one tick, and with two ticks (a
+  dual-leader window) once the certificate also checks each listed view's size
+  against its render (`dual_leader_ticks_cannot_aba_the_certificate`, below).
 
 ### What the bounds actually are
 
@@ -1964,13 +1964,18 @@ checker now does both: `tests/model_audit_fingerprint.rs` finds the race in
 the old audit and proves the shipped one over every single-leader
 interleaving. The concurrent-audit VOPR op is therefore still not landed — it
 would shift every pinned seed and need a fresh census to add coverage the
-model already gives exhaustively (roadmap). The same model found what the fix
-leaves open, and the VOPR cannot stage it either (`tick_lock` serializes
-ticks): with two ticks in flight, the certificate's relist can list one stale
-tick's view, a fresh tick then lands the right bytes for the read-back, and the
-second stale tick re-lands the stale bytes last. On content-digest ETags the
-certified fingerprint matches that stale view, and the audit skips it until the
-package next changes (`dual_leader_ticks_aba_the_certificate`, roadmap).
+model already gives exhaustively (roadmap). The same model found a hole the
+first fix left, which the VOPR cannot stage (`tick_lock` serializes ticks):
+with two ticks in flight, the certificate's relist can list one stale tick's
+view, a fresh tick then lands the right bytes for the read-back, and the second
+stale tick re-lands the stale bytes last. On content-digest ETags (S3, GCS) the
+certified fingerprint matched that stale view and the audit skipped it until
+the package next changed. The certificate now also requires each listed view's
+size to equal its render, and `dual_leader_ticks_cannot_aba_the_certificate`
+proves the race closed (it fails with the size check removed). The model gives
+every file set a distinct view length, as real views have; a stale view exactly
+as long as the fresh one is the residual, pinned by the
+`an_audit_certifies_only_its_own_render_of_unmoved_truth` unit test.
 
 So class 3 **stays**, and stays honestly labelled: `--break race` closes the
 *soundness* question — the arm evaluates and prints its finding, on both

@@ -2532,11 +2532,15 @@ async fn certify_audit_rebuild(
 /// package view must be present exactly when rendered, holding the rendered
 /// bytes (`read_back`, aligned with `rendered`).
 ///
-/// Known gap: `views` (listed) and `read_back` are taken at different instants.
-/// Under two concurrent ticks (a dual-leader window) the listing can show one
-/// tick's stale bytes, the read-back a fresh tick's, and a second stale tick can
-/// re-land the stale bytes after; with content-digest ETags the certificate
-/// then names that stale view (`dual_leader_ticks_aba_the_certificate`).
+/// `views` (listed) and `read_back` are taken at different instants. Under two
+/// concurrent ticks (a dual-leader window) the listing can show one tick's
+/// stale bytes, the read-back a fresh tick's, and a second stale tick can
+/// re-land the stale bytes after; with content-digest ETags (S3, GCS) the
+/// certificate would then name that stale view
+/// (`dual_leader_ticks_cannot_aba_the_certificate`). So each listed view's size
+/// must also equal its render: the listing then describes our bytes unless a
+/// stale render happens to be exactly as long as the fresh one — the residual
+/// gap, which `rebuild-index` or the package's next change repairs.
 ///
 /// `pub` only so tests/model_audit_fingerprint.rs model-checks this exact
 /// decision against every interleaving with the tick.
@@ -2556,12 +2560,15 @@ pub fn audit_certificate(
         format!("{SIMPLE_PREFIX}{pkg}/index.html"),
         format!("{SIMPLE_PREFIX}{pkg}/index.json"),
     ];
-    let mut listed: Vec<&str> = views
+    let mut listed: Vec<(&str, u64)> = views
         .iter()
-        .map(|view| view.key.as_str())
-        .filter(|key| canonical.iter().any(|c| c == key))
+        .filter(|view| canonical.contains(&view.key))
+        .map(|view| (view.key.as_str(), view.size))
         .collect();
-    let mut wanted: Vec<&str> = rendered.iter().map(|(key, _)| key.as_str()).collect();
+    let mut wanted: Vec<(&str, u64)> = rendered
+        .iter()
+        .map(|(key, bytes)| (key.as_str(), bytes.len() as u64))
+        .collect();
     listed.sort_unstable();
     wanted.sort_unstable();
     let views_are_ours = listed == wanted
@@ -5402,6 +5409,18 @@ mod tests {
             refused(&truth, &views, &[], &[]),
             "a removed view came back"
         );
+        // The relist saw another writer's (longer) bytes and the read-back
+        // ours: the listing does not describe our render.
+        let mut longer = views.clone();
+        longer[0].size = 2;
+        assert!(
+            refused(&truth, &longer, &rendered, &ours),
+            "a listed view's size is not our render's"
+        );
+        // Residual: a stale view exactly as long as ours is indistinguishable
+        // by listing alone, so it still certifies (documented on the fn).
+        let same_size = vec![meta(&html, "stale"), meta(&json, "j")];
+        assert!(!refused(&truth, &same_size, &rendered, &ours));
     }
 
     async fn stored_fingerprints(storage: &InMemStorage, shard: char) -> HashMap<String, String> {

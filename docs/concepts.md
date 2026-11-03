@@ -14,7 +14,8 @@ Publish with uv, twine, poetry, hatch, or flit. Point the client at
 `https://your-server/legacy/`; your build does not change.
 
 Published filenames are immutable. pypiron refuses to replace a file, even
-with identical bytes, so a version already in a lockfile cannot change. Yanking
+with identical bytes, or to reuse the name of a file you deleted or froze, so a
+version already in a lockfile cannot change. Yanking
 a file hides it from normal resolution while keeping pinned installs working.
 
 [Publish and install](guides/publish-install.md)
@@ -26,7 +27,7 @@ a file hides it from normal resolution while keeping pinned installs working.
   it, and serves later installs from your storage. If the upstream stops
   answering, packages you already cached keep installing, and pypiron keeps
   serving the last package list it saw for up to an hour. Once the upstream is
-  back, pypiron uses it again within seconds.
+  back, pypiron uses it again within a minute.
 - **Sync ahead of time.** `pypiron sync` copies an approved set of packages to
   your server, and with `--include-dependencies` everything they need. Use this
   for predictable builds and networks without internet access.

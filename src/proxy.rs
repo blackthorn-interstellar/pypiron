@@ -188,8 +188,9 @@ impl CacheEntry {
 
 /// What a failed refresh leaves in the cache: the last good listing, if it is
 /// younger than [`LISTING_MAX_STALE`] (and never served past that age), else a
-/// short-lived [`Listing::Unreachable`].
-fn after_error(prev: Option<CacheEntry>, now: Instant) -> CacheEntry {
+/// short-lived [`Listing::Unreachable`] — held at least as long as the failed
+/// fetch `took`, so a stalled upstream is not probed more often than it answers.
+fn after_error(prev: Option<CacheEntry>, now: Instant, took: Duration) -> CacheEntry {
     match prev {
         Some(CacheEntry {
             listing: Listing::Found(found),
@@ -203,7 +204,7 @@ fn after_error(prev: Option<CacheEntry>, now: Instant) -> CacheEntry {
         _ => CacheEntry {
             listing: Listing::Unreachable,
             fetched: now,
-            expires: now + LISTING_ERROR_TTL,
+            expires: now + LISTING_ERROR_TTL.max(took),
         },
     }
 }
@@ -1722,9 +1723,21 @@ impl Proxy {
             return cached;
         }
         // Single-flight on the fill slot map; artifact keys start `packages/`,
-        // so this key can't collide. A waiter rechecks and takes the leader's
-        // result. Held through the status persist and the cache insert.
-        let _slot = self.acquire_download_slot(&format!("listing:{pkg}")).await;
+        // so this key can't collide. A waiter that already has an answer (an
+        // expired entry still inside the stale bound) serves it rather than
+        // queue behind a refresh that may run the whole fetch timeout; only a
+        // cold miss waits, then rechecks and takes the leader's result. Held
+        // through the status persist and the cache insert.
+        let key = format!("listing:{pkg}");
+        let _slot = match self.try_acquire_download_slot(&key) {
+            Some(slot) => slot,
+            None => {
+                if let Some(stale) = self.stale_listing(pkg) {
+                    return stale;
+                }
+                self.acquire_download_slot(&key).await
+            }
+        };
         if let Some(cached) = self.cached_listing(pkg) {
             return cached;
         }
@@ -1732,6 +1745,7 @@ impl Proxy {
             .metrics
             .proxy_listing_fetches
             .fetch_add(1, Ordering::Relaxed);
+        let started = Instant::now();
         let fetched = self.fetch_listing(state, pkg).await;
         if let Ok(Listing::Found(found)) = &fetched {
             // Persist the observed upstream status durably. The in-memory listing
@@ -1756,7 +1770,7 @@ impl Proxy {
                     .proxy_listing_errors
                     .fetch_add(1, Ordering::Relaxed);
                 warn!(%pkg, upstream = %self.upstream, error=?e, "proxy: upstream listing fetch failed");
-                after_error(map.remove(pkg), now)
+                after_error(map.remove(pkg), now, now.saturating_duration_since(started))
             }
         };
         let served = entry.served();
@@ -1772,6 +1786,17 @@ impl Proxy {
         let map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get(pkg)?;
         (Instant::now() < entry.expires).then(|| entry.served())
+    }
+
+    /// What a waiter may serve while another task refreshes `pkg`: any entry,
+    /// expired or not, except a listing past [`LISTING_MAX_STALE`]. `None` when
+    /// there is nothing to serve, so the caller waits for the refresh.
+    fn stale_listing(&self, pkg: &str) -> Option<Option<Arc<Found>>> {
+        let map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
+        let entry = map.get(pkg)?;
+        let too_old = matches!(entry.listing, Listing::Found(_))
+            && Instant::now().saturating_duration_since(entry.fetched) >= LISTING_MAX_STALE;
+        (!too_old).then(|| entry.served())
     }
 
     /// Persist the upstream PEP 792 status so the byte gate blocks cached bytes
@@ -2470,7 +2495,7 @@ mod tests {
     #[test]
     fn a_failed_fetch_with_nothing_to_reuse_is_remembered_briefly() {
         let now = Instant::now();
-        assert!(is_unreachable(&after_error(None, now), now));
+        assert!(is_unreachable(&after_error(None, now, Duration::ZERO), now));
         // A cached 404 that then errors is not re-armed for a full TTL either.
         let missing = CacheEntry {
             listing: Listing::Missing,
@@ -2478,20 +2503,26 @@ mod tests {
             expires: now + LISTING_TTL,
         };
         let later = now + Duration::from_secs(61);
-        assert!(is_unreachable(&after_error(Some(missing), later), later));
+        assert!(is_unreachable(
+            &after_error(Some(missing), later, Duration::ZERO),
+            later
+        ));
+        // A fetch that stalled to its timeout is not retried sooner than it took.
+        let took = Duration::from_secs(30);
+        assert_eq!(after_error(None, now, took).expires, now + took);
     }
 
     #[test]
     fn a_failed_fetch_reuses_the_last_good_listing_without_aging_it() {
         let t0 = Instant::now();
         let now = t0 + Duration::from_secs(600);
-        let kept = after_error(Some(found_entry(t0)), now);
+        let kept = after_error(Some(found_entry(t0)), now, Duration::ZERO);
         assert!(kept.served().is_some());
         assert_eq!(kept.fetched, t0);
         assert_eq!(kept.expires, now + LISTING_TTL);
         // A second error later still measures from the real fetch.
         let again = now + LISTING_TTL;
-        let kept = after_error(Some(kept), again);
+        let kept = after_error(Some(kept), again, Duration::ZERO);
         assert_eq!(kept.fetched, t0);
         assert_eq!(kept.expires, again + LISTING_TTL);
     }
@@ -2501,16 +2532,19 @@ mod tests {
         let t0 = Instant::now();
         // Revived just before the cap: the expiry is clamped to the cap.
         let edge = t0 + LISTING_MAX_STALE - Duration::from_secs(1);
-        let kept = after_error(Some(found_entry(t0)), edge);
+        let kept = after_error(Some(found_entry(t0)), edge, Duration::ZERO);
         assert!(kept.served().is_some());
         assert_eq!(kept.expires, t0 + LISTING_MAX_STALE);
         // Past the cap: dropped.
         let past = t0 + LISTING_MAX_STALE + Duration::from_secs(1);
         assert!(is_unreachable(
-            &after_error(Some(found_entry(t0)), past),
+            &after_error(Some(found_entry(t0)), past, Duration::ZERO),
             past
         ));
-        assert!(is_unreachable(&after_error(Some(kept), past), past));
+        assert!(is_unreachable(
+            &after_error(Some(kept), past, Duration::ZERO),
+            past
+        ));
     }
 
     #[test]

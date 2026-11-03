@@ -90,6 +90,9 @@ SPRAY_PAYLOAD = 512 * 1024
 SPRAY_HOLD_SECS = 1.5
 # How long a "stall" index fault holds the listing response.
 INDEX_STALL_SECS = 1.0
+# How long a "stall-error" index fault holds the listing before failing it:
+# longer than the proxy's 5s memory of a failed listing fetch.
+INDEX_HANG_SECS = 8.0
 
 
 class _FaultHandler(http.server.BaseHTTPRequestHandler):
@@ -116,6 +119,10 @@ class _FaultHandler(http.server.BaseHTTPRequestHandler):
                 server.index_hits[pkg] = server.index_hits.get(pkg, 0) + 1
             fault = server.index_faults.get(pkg)
             if fault == "error500":
+                self.send_error(500)
+                return
+            if fault == "stall-error":
+                time.sleep(INDEX_HANG_SECS)
                 self.send_error(500)
                 return
             if fault == "stall":
@@ -333,7 +340,8 @@ class _FaultServer:
             self.httpd.pace[pkg] = pace  # type: ignore[attr-defined]
 
     def set_index_fault(self, pkg: str, mode: Optional[str]) -> None:
-        """Fault the `/simple/<pkg>/` listing: "error500", "stall", or None."""
+        """Fault the `/simple/<pkg>/` listing: "error500", "stall",
+        "stall-error", or None."""
         self.httpd.index_faults[pkg] = mode  # type: ignore[attr-defined]
 
     def index_hits(self, pkg: str) -> int:
@@ -784,6 +792,36 @@ def test_listing_error_is_not_remembered_as_missing(proxy_over_fault, tmp_path):
         assert time.monotonic() < deadline, "listing still missing 20s after upstream recovered"
         time.sleep(0.5)
     assert filename in body.decode()
+
+
+def test_a_stalled_listing_probe_does_not_hold_up_other_requests(proxy_over_fault, tmp_path):
+    """While one request waits out a stalled upstream listing, the others answer
+    at once from what the proxy already knows instead of queueing behind it."""
+    proxy, upstream = proxy_over_fault
+    pkg = "stallpkg"
+    upstream.register(pkg, make_wheel(pkg, "1.0", tmp_path))
+    url = f"{proxy['base_url']}/simple/{pkg}/"
+
+    upstream.set_index_fault(pkg, "error500")
+    code, _, _ = http_get(url, timeout=FAULT_GET_TIMEOUT)
+    assert code == 404
+    # Let the remembered failure expire, then make the next probe stall.
+    upstream.set_index_fault(pkg, "stall-error")
+    time.sleep(5.5)
+    hits = upstream.index_hits(pkg)
+    probe = threading.Thread(target=http_get, args=(url,), kwargs={"timeout": FAULT_GET_TIMEOUT})
+    probe.start()
+    deadline = time.monotonic() + 5
+    while upstream.index_hits(pkg) == hits:
+        assert time.monotonic() < deadline, "the probe never reached upstream"
+        time.sleep(0.05)
+
+    started = time.monotonic()
+    code, _, _ = http_get(url, timeout=FAULT_GET_TIMEOUT)
+    elapsed = time.monotonic() - started
+    probe.join()
+    assert code == 404
+    assert elapsed < INDEX_HANG_SECS / 2, f"waited {elapsed:.1f}s behind the stalled probe"
 
 
 def test_concurrent_listing_misses_share_one_fetch(proxy_over_fault, tmp_path):

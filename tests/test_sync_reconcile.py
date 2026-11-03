@@ -349,6 +349,29 @@ def test_full_sync_keeps_other_projects_cursors(source_dest, pypiron_bin, tmp_pa
     )
 
 
+def test_a_failed_full_sync_is_retried_by_the_next_run(source_dest, pypiron_bin, tmp_path):
+    """--full is the self-heal: a project it failed to repair must not be skipped
+    by the next run's 304 just because upstream did not change."""
+    source, dest = source_dest["source"], source_dest["dest"]
+    lists = _seeded(source, tmp_path, "memoh")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memoh"])
+    assert rc == 0, out + err
+    # The dest lost its copy, and the repair download fails (the source still
+    # lists the file, so its index and ETag are unchanged).
+    (filename,) = _dest_filenames(dest, "memoh")
+    code, _, _ = http_request_auth(
+        "DELETE", f"{dest['base_url']}/files/memoh/{filename}", **_admin(dest)
+    )
+    assert code == 204
+    (source["data_dir"] / "packages" / "memoh" / filename).unlink()
+
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memoh"], "--full")
+    assert rc != 0, out + err
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memoh"])
+    assert "upstream unchanged since last sync (304)" not in out + err
+    assert "Syncing memoh" in out + err
+
+
 def test_an_all_304_run_leaves_the_memo_alone(source_dest, pypiron_bin, tmp_path):
     source, dest = source_dest["source"], source_dest["dest"]
     lists = _seeded(source, tmp_path, "memog")

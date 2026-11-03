@@ -20,8 +20,8 @@ def test_reupload_same_filename_rejected(disk_server, tmp_path):
     upload_legacy(disk_server["legacy"], wheel_path, **creds)
     wait_for_file_in_index(disk_server["simple"], PACKAGE, wheel_path.name)
 
-    # Identical bytes, same filename: still rejected. Sync clients that predate
-    # the conflict header match on this text, so it is a wire contract.
+    # Identical bytes, same filename: still rejected. Sync clients match on this
+    # text, so it is a wire contract.
     _, body = upload_legacy(disk_server["legacy"], wheel_path, expect_status=409, **creds)
     assert body.startswith(b"File already exists"), body
 

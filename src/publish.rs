@@ -547,40 +547,32 @@ pub(crate) async fn legacy_upload(
     // Pin the storage context once for the whole upload (design §3): the origin
     // claim, artifact/sidecar writes, and commit marker all land on this handle.
     let pinned = state.pin();
-    match publish_record(&state, &pinned, req).await {
-        Ok(ok) => Ok(ok.into_response()),
-        Err((code, msg)) => match upload_conflict(code, &msg) {
-            Some(kind) => Ok((code, [(UPLOAD_CONFLICT_HEADER, kind)], msg).into_response()),
-            None => Err((code, msg)),
-        },
-    }
+    publish_record(&state, &pinned, req).await
 }
 
-/// Response header naming which 409 an upload got: [`CONFLICT_EXISTS`] (the
-/// filename already holds bytes — an idempotent re-offer) or
-/// [`CONFLICT_FENCED`] (deleted or frozen on purpose). Any other 409 is a write
-/// the server refused, and carries none. `sync` reads it to tell a skip from a
-/// failure without parsing the message.
-pub(crate) const UPLOAD_CONFLICT_HEADER: &str = "x-pypiron-upload-conflict";
-pub(crate) const CONFLICT_EXISTS: &str = "exists";
-pub(crate) const CONFLICT_FENCED: &str = "fenced";
+/// The two upload 409s a re-offer may hit without failing: the filename already
+/// holds bytes (an idempotent re-offer), or it was deleted or frozen on purpose.
+/// Any other 409 is a write the server refused.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum UploadConflict {
+    Exists,
+    Fenced,
+}
 
-/// Message starts of the two 409s [`UPLOAD_CONFLICT_HEADER`] names. Wire
-/// contract: sync clients from before the header match on this text, so
-/// rewording it breaks them against this server.
+/// Message starts of the two named 409s. Wire contract: `sync` (this build's and
+/// every older one) tells a skip from a failure by this text, so rewording it
+/// breaks them against this server.
 const FILE_EXISTS: &str = "File already exists";
 const FILENAME_FENCED: &str = "frozen or deleted";
 
-/// Which named upload conflict a `publish_record` refusal is, if any. Also
-/// sync's fallback for a server too old to send [`UPLOAD_CONFLICT_HEADER`]:
-/// those bodies are byte-identical.
-pub(crate) fn upload_conflict(code: StatusCode, msg: &str) -> Option<&'static str> {
+/// Which named upload conflict a 409 body is, if any.
+pub(crate) fn upload_conflict(code: StatusCode, msg: &str) -> Option<UploadConflict> {
     if code != StatusCode::CONFLICT {
         None
     } else if msg.starts_with(FILE_EXISTS) {
-        Some(CONFLICT_EXISTS)
+        Some(UploadConflict::Exists)
     } else if msg.contains(FILENAME_FENCED) {
-        Some(CONFLICT_FENCED)
+        Some(UploadConflict::Fenced)
     } else {
         None
     }
@@ -2129,16 +2121,16 @@ mod tests {
         let c = StatusCode::CONFLICT;
         assert_eq!(
             upload_conflict(c, &format!("{FILE_EXISTS}: a-1.0.tar.gz")),
-            Some(CONFLICT_EXISTS)
+            Some(UploadConflict::Exists)
         );
         assert_eq!(
             upload_conflict(
                 c,
                 &format!("File 'a' is {FILENAME_FENCED} and cannot be reused")
             ),
-            Some(CONFLICT_FENCED)
+            Some(UploadConflict::Fenced)
         );
-        // The text pre-header sync clients match on, verbatim.
+        // The text sync clients match on, verbatim.
         assert_eq!(FILE_EXISTS, "File already exists");
         assert_eq!(FILENAME_FENCED, "frozen or deleted");
         // A refused write (the file did not land) must stay a failure.

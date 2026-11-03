@@ -2372,7 +2372,7 @@ pub async fn run_sync(
                 async move { (job, run.await) }
             })
             .buffer_unordered(resolved.package_concurrency);
-        let mut finished = Vec::new();
+        let (mut finished, mut failed) = (Vec::new(), Vec::new());
         while let Some((job, result)) = packages.next().await {
             progress.package_done();
             match result {
@@ -2380,10 +2380,17 @@ pub async fn run_sync(
                 Err(e) => {
                     error!(package=%job.name, error=?e, "package sync failed");
                     failures += 1;
+                    failed.push(job.name.clone());
                 }
             }
         }
         drop(packages);
+        // `--full` fetched unconditionally, so it can fail while upstream is
+        // unchanged; keeping the stored cursor would let the next run's 304 skip
+        // the repair it failed to make.
+        if resolved.full {
+            refreshed.extend(failed.into_iter().map(|name| (name, None)));
+        }
         for (name, outcome) in finished {
             // `--full` replaces what it re-synced: no fresh entry means the
             // stored one (and its dependency memo) goes.
@@ -2397,7 +2404,7 @@ pub async fn run_sync(
 
     // Merge what this run re-fetched into the stored memo; projects it didn't
     // touch (or 304'd) keep their cursors. A failed project advances nothing —
-    // it re-fetches next run. Persisting is best-effort; the memo only ever
+    // it re-fetches next run (under `--full`, its stored cursor is dropped). Persisting is best-effort; the memo only ever
     // speeds things up.
     save_cursors(&client, &resolved, &refreshed).await;
 
@@ -3511,27 +3518,18 @@ async fn upload_via_http(
         let req = with_admin_auth(client.post(endpoint).multipart(form), resolved);
         let err = match req.send().await {
             Ok(resp) if resp.status() == reqwest::StatusCode::CONFLICT => {
-                let header = resp
-                    .headers()
-                    .get(crate::publish::UPLOAD_CONFLICT_HEADER)
-                    .map(|v| v.to_str().unwrap_or_default().to_owned());
                 let body = error_snippet(resp).await;
                 // Already present (or our own earlier attempt landed), or a
-                // filename the destination deleted on purpose. Any other 409 —
-                // or a kind this build doesn't know — is a write the server
-                // refused: the file did not land. A server too old to send the
-                // header says which in the message.
-                let kind = match &header {
-                    Some(h) => Some(h.as_str()),
-                    None => crate::publish::upload_conflict(reqwest::StatusCode::CONFLICT, &body),
-                };
-                match kind {
-                    Some(crate::publish::CONFLICT_EXISTS) => return Ok(false),
-                    Some(crate::publish::CONFLICT_FENCED) => {
+                // filename the destination deleted on purpose. Any other 409 is
+                // a write the server refused: the file did not land.
+                use crate::publish::UploadConflict;
+                match crate::publish::upload_conflict(reqwest::StatusCode::CONFLICT, &body) {
+                    Some(UploadConflict::Exists) => return Ok(false),
+                    Some(UploadConflict::Fenced) => {
                         info!("  - skipping {}: {body}", s.file.filename);
                         return Ok(false);
                     }
-                    _ => return Err(anyhow!("upload refused [409 Conflict]: {body}")),
+                    None => return Err(anyhow!("upload refused [409 Conflict]: {body}")),
                 }
             }
             Ok(resp) if resp.status().is_success() => return Ok(true),

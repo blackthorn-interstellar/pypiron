@@ -543,8 +543,8 @@ pending repairs, not bytes.
 | --- | --- | --- |
 | `/simple/` | read | Package index. |
 | `/files/<pkg>/<file>` | read | Artifact bytes. |
-| `/files/<pkg>/<filename>/upload-time` | admin | `POST` JSON with `sha256` and RFC 3339 `upload-time` to repair a private file's date. Refuses hash mismatches and deleted/quarantined files. |
-| `/legacy/` | uploader/admin | Upload API. `POST /simple/`, `POST /simple`, and `POST /` upload too, so publishers configured for pypicloud keep working. A `409` for a filename that already exists carries `x-pypiron-upload-conflict: exists`; one for a filename deleted or frozen on purpose carries `fenced`. |
+| `/files/<pkg>/<filename>/upload-time` | admin | `POST` JSON with `sha256` and RFC 3339 `upload-time` to repair a private file's date. Refuses hash mismatches and mirrored files. Otherwise answers `404`, `409`, and `503` as yank does. |
+| `/legacy/` | uploader/admin | Upload API. `POST /simple/`, `POST /simple`, and `POST /` upload too, so publishers configured for pypicloud keep working. |
 | `/health` | open | Liveness: the process is up. Always `200` while serving (a Kubernetes `livenessProbe`). |
 | `/ready` | open | Readiness: this node can serve reads. Point your load balancer and a Kubernetes `readinessProbe` here. |
 | `/metrics` | open | Prometheus metrics. |
@@ -554,7 +554,7 @@ pending repairs, not bytes.
 | `/audit.json` | admin | The same audit report as JSON. |
 | `/advisories/feed` | read (GET), admin (PUT) | Advisory snapshot: readers pull it (etag-conditioned); an admin pushes a delivered one. |
 | `/tokens` | read/uploader/admin, or open reader token | Mint install tokens. |
-| `/files/.../yank` | admin | Yank a file. `404` if the file is not in the index; `409` if it is deleted, frozen or quarantined. |
+| `/files/.../yank` | admin | Yank a file. `404` if there is no such file. `409` if the file exists but no index lists it: deleted, frozen, quarantined, or a cached upstream copy under a name that is now private. `409` also while a replication repair is rewriting the file's details, and `503` if storage could not be read; retry both. |
 | `DELETE /files/<pkg>/<file>` | admin | Delete a file. Refused for mirrored files — anything that came from an upstream, cached on demand or pulled by `sync` — when you run more than one bucket. |
 | `/project/<pkg>/status` | admin | Set project status. |
 

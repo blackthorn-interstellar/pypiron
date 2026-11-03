@@ -17,9 +17,9 @@ This drives the REAL binary against a real destination through a forwarder that
 mangles the header three ways, and asserts the migration still fails — via the
 server's own 403, which is the fail-closed backstop.
 
-The same forwarder rewrites upload 409s to show sync reads the
-`x-pypiron-upload-conflict` header, not the message, to tell a skip from a
-refused write — and still understands a server too old to send it.
+The same forwarder rewrites upload 409s to show sync tells a skip from a
+refused write by the server's message, and treats a 409 it can't name as a
+refusal.
 """
 
 from __future__ import annotations
@@ -294,36 +294,23 @@ def test_as_private_onto_mirror_fails_when_dest_reports_no_readable_origin(
 
 # ------------------------- upload conflicts (409) -----------------------------
 
-CONFLICT_HEADER = "x-pypiron-upload-conflict"
-
-
-def _without_conflict_header(out: Headers) -> Headers:
-    return [(k, v) for k, v in out if k.lower() != CONFLICT_HEADER]
-
-
 # How the forwarder rewrites each upload 409, and whether sync must still skip:
-#   reworded   - a newer server that changed the message but names the kind
-#   headerless - a server older than the header: the message is all it says
-#   unknown    - a kind this build doesn't know: the file did not land
+#   verbatim     - the server's own message: an existing or deleted file
+#   unrecognized - a 409 sync can't name: the file did not land
 CONFLICT_TREATMENTS = [
-    ("reworded", lambda out, _body: (out, b"Conflict"), True),
-    ("headerless", lambda out, body: (_without_conflict_header(out), body), True),
-    (
-        "unknown",
-        lambda out, body: (_without_conflict_header(out) + [(CONFLICT_HEADER, "banana")], body),
-        False,
-    ),
+    ("verbatim", lambda out, body: (out, body), True),
+    ("unrecognized", lambda out, _body: (out, b"Conflict"), False),
 ]
 
 
 @pytest.mark.parametrize(
     "label,rewrite,skips", CONFLICT_TREATMENTS, ids=[t[0] for t in CONFLICT_TREATMENTS]
 )
-def test_sync_tells_an_upload_skip_from_a_refusal_by_the_conflict_header(
+def test_sync_tells_an_upload_skip_from_a_refusal(
     label, rewrite, skips, disk_server, pypiron_bin, tmp_path
 ):
     """A re-offered file the destination already holds, or deleted on purpose,
-    is a skip; sync learns which from the 409's header, not its wording."""
+    is a skip; any other 409 is a refused write."""
     package = f"conflict{label}pkg"
     wheels = [make_wheel(package, v, tmp_path) for v in ("1.0", "2.0")]
     base_path = "/corp/dev/+simple"

@@ -1415,7 +1415,24 @@ pub async fn publish_quarantined(
                 (StoredQuarantined::default(), None)
             }
         };
-        let have: std::collections::BTreeSet<String> = stored.quarantined.iter().cloned().collect();
+        let mut have: std::collections::BTreeSet<String> =
+            stored.quarantined.iter().cloned().collect();
+        // A bucket behind this node (a failed write-through, then a failover
+        // onto it) holds an older set. An increment applied to it would be
+        // stamped above the node's epoch and adopted fleet-wide, dropping every
+        // freeze the bucket missed. The node's set at the higher epoch is the
+        // newer one, so the edit lands on that, and is written even when it
+        // changes nothing, which also catches the bucket up. A sweep derives the
+        // whole set from status and merges against its own base instead.
+        let behind = stored.epoch < AdvisoryState::read(slot).quarantined_epoch
+            && !matches!(edit, QuarantinedEdit::Sweep { .. });
+        if behind {
+            have = AdvisoryState::read(slot)
+                .quarantined
+                .iter()
+                .cloned()
+                .collect();
+        }
         let with = |name: &String, blocked: bool| {
             let mut next = have.clone();
             if blocked {
@@ -1469,7 +1486,7 @@ pub async fn publish_quarantined(
                 }
             }
         };
-        if next == have {
+        if next == have && !behind {
             // A confirmation is not a reason to drop a newer set. The recorded
             // listing etag stays: this read did not produce one (a different
             // token space), and keeping it costs the poll nothing — the worker
@@ -3135,5 +3152,20 @@ mod tests {
         assert_eq!(stored_names(&selected).await, ["a", "evil"]);
         assert_eq!(AdvisoryState::read(&slot).quarantined_epoch, 7);
         assert_eq!(live_names(&slot), ["a", "b", "evil"]);
+    }
+
+    #[tokio::test]
+    async fn an_edit_on_a_bucket_behind_the_node_keeps_the_freezes_it_missed() {
+        // Epoch 6 froze `evil` but its write-through to this bucket failed; a
+        // failover then selected it. An unrelated freeze must not republish the
+        // bucket's epoch-5 set at epoch 7 and un-block `evil` fleet-wide.
+        let behind = holding(&["a"], 5).await;
+        let slot = slot_with(&["a", "evil"], 6);
+        publish_quarantined(&behind, &[], &slot, &one("other", true))
+            .await
+            .unwrap();
+        assert_eq!(stored_names(&behind).await, ["a", "evil", "other"]);
+        assert_eq!(AdvisoryState::read(&slot).quarantined_epoch, 7);
+        assert_eq!(live_names(&slot), ["a", "evil", "other"]);
     }
 }

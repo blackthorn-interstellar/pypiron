@@ -1932,13 +1932,12 @@ async fn audit_shard(
     }
 
     let fp_key = format!("{STATE_PREFIX}fp-{shard}.json");
-    let stored: std::collections::HashMap<String, String> = if force_deep {
-        Default::default()
-    } else {
-        match storage.get_bytes(&fp_key).await {
-            Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
-            Err(_) => Default::default(),
-        }
+    // Read even under `force_deep`: it forces the rebuild, but the previous
+    // fingerprints still name committed states, and a deep pass whose
+    // checkpoint does not land must keep them rather than leave the shard empty.
+    let stored: std::collections::HashMap<String, String> = match storage.get_bytes(&fp_key).await {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => Default::default(),
     };
 
     let mut out = ShardAudit {
@@ -2090,7 +2089,8 @@ async fn audit_shard(
         let jobs = chunk
             .iter()
             .map(|(pkg, fp, truth_fp, has_artifacts, has_package_view, interrupted_deletes, orphan_companions)| {
-            let fingerprint_unchanged = stored.get(pkg.as_str()) == Some(fp)
+            let fingerprint_unchanged = !force_deep
+                && stored.get(pkg.as_str()) == Some(fp)
                 && interrupted_deletes.is_empty()
                 && orphan_companions.is_empty();
             let (pkg, fp, truth_fp, has_artifacts, has_package_view, interrupted_deletes, orphan_companions) = (
@@ -2619,9 +2619,12 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
         // Move an owned handle into the task — the tick's pin, so every rebuild
         // this tick spawns writes to the same bucket it captured at entry.
         let storage = pinned.storage.clone();
-        let index = pinned.index;
+        let (index, generation) = (pinned.index, pinned.generation);
         handles.push(tokio::spawn(async move {
             let _permit = semaphore.acquire().await;
+            // `(still_live, published)`: the views follow truth whatever the
+            // quarantined set does, so a failed set publish holds only the
+            // markers, never the package's place in the global index.
             let rebuilt = match rebuild_selected_package(
                 &state,
                 storage.as_ref(),
@@ -2632,15 +2635,22 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
             .await
             {
                 Ok(rebuilt) => {
-                    match republish_quarantine(&state, storage.as_ref(), index, &package, &rebuilt)
-                        .await
+                    let published = match republish_quarantine(
+                        &state,
+                        storage.as_ref(),
+                        (index, generation),
+                        &package,
+                        &rebuilt,
+                    )
+                    .await
                     {
-                        Ok(()) => Some(rebuilt.still_live),
+                        Ok(()) => true,
                         Err(e) => {
                             error!(package=%package, error=?e, "quarantine publish failed; markers retained for retry");
-                            None
+                            false
                         }
-                    }
+                    };
+                    Some((rebuilt.still_live, published))
                 }
                 Err(e) => {
                     error!(package=%package, error=?e, "rebuild failed; markers retained for retry");
@@ -2656,7 +2666,16 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
     let mut consumed: Vec<String> = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok((pkg, keys, stale_intents, Some(live_now))) => {
+            Ok((pkg, keys, stale_intents, Some((live_now, published)))) => {
+                if live_now {
+                    adds.push(pkg.clone());
+                } else {
+                    removes.push(pkg.clone());
+                }
+                if !published {
+                    failures += 1;
+                    continue;
+                }
                 // A stale unpaired intent is *presumed* crashed — but the
                 // writer may merely be paused past the grace and can still
                 // mutate truth between this rebuild's listing and the marker
@@ -2675,11 +2694,6 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
                 // Markers for this package are now consumed; the stale intents
                 // among them are healed crashed writers.
                 healed += stale_intents;
-                if live_now {
-                    adds.push(pkg);
-                } else {
-                    removes.push(pkg);
-                }
                 consumed.extend(keys);
             }
             _ => failures += 1,
@@ -2732,19 +2746,16 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
 /// the last word when two writers' increments landed out of order — on the
 /// marker drain, not a day later on the audit sweep. Only the selected-bucket
 /// tick does this: it is the bucket the fleet serves, the one the sweep derives
-/// the whole set from too. A package with no stored bytes at all is skipped —
-/// there is nothing for the gate to refuse, and the rebuild that lands its next
-/// bytes re-derives it — so deleting a project's last file costs no extra reads.
+/// the whole set from too. A package with no stored bytes is not skipped: a
+/// freeze on a name nothing has cached yet is exactly what the proxy byte gate
+/// must refuse fleet-wide, and the admin API's 200 promises this retry.
 async fn republish_quarantine(
     state: &AppState,
     storage: &dyn Storage,
-    index: usize,
+    (index, generation): (usize, u64),
     pkg: &str,
     rebuilt: &RebuiltPackage,
 ) -> Result<()> {
-    if rebuilt.raw_artifacts.is_empty() {
-        return Ok(());
-    }
     let blocked = match rebuilt.quarantined {
         Some(blocked) => blocked,
         None => crate::status::read_status(storage, pkg)
@@ -2759,6 +2770,13 @@ async fn republish_quarantine(
         name: pkg.to_string(),
         blocked,
     };
+    // The tick's tasks outlive a generation change that cancels the tick, and
+    // the set this publishes is the fleet's: never from a bucket no longer
+    // selected onto the one that is.
+    let current = state.pin().generation;
+    if current != generation {
+        bail!("bucket selection generation changed from {generation} to {current}");
+    }
     let replicas = state.singleton_replicas(index);
     crate::advisories::publish_quarantined(storage, &replicas, &state.advisories, &edit).await
 }
@@ -5039,7 +5057,12 @@ mod tests {
         );
         mark_dirty(first.as_ref(), pkg).await.unwrap();
 
-        tick(&state, &leased).await.unwrap();
+        // The views land on the leased bucket, but the fleet's quarantined set is
+        // never re-derived from a bucket no longer selected: that half fails and
+        // holds the marker for when the bucket is selected again.
+        let err = tick(&state, &leased).await.unwrap_err();
+        assert!(err.to_string().contains("failed this tick"), "{err:#}");
+        assert!(!first.list_all(DIRTY_PREFIX).await.unwrap().is_empty());
 
         let index = format!("{SIMPLE_PREFIX}{pkg}/index.json");
         assert!(first.head_exists(&index).await.unwrap());
@@ -5176,6 +5199,34 @@ mod tests {
             storage.head_exists(&marker).await.unwrap(),
             "the marker is the retry; consuming it would leave only the sweep"
         );
+        let global = storage
+            .get_bytes(&format!("{SIMPLE_PREFIX}index.json"))
+            .await
+            .unwrap();
+        assert!(
+            String::from_utf8_lossy(&global).contains(pkg),
+            "the global index follows truth whatever the quarantined set does"
+        );
+    }
+
+    #[tokio::test]
+    async fn tick_publishes_a_freeze_on_a_name_with_no_stored_bytes() {
+        // A proxy freezes a mirror name nothing has cached; the admin API's own
+        // publish failed and answered 200 on the strength of this marker. The
+        // byte gate on every other node needs the name in the shared set.
+        let storage = Arc::new(InMemStorage::default());
+        let pkg = "evilpkg";
+        crate::status::write_status(storage.as_ref(), pkg, &frozen())
+            .await
+            .unwrap();
+        let marker = format!("{DIRTY_PREFIX}{pkg}!n.commit");
+        storage.insert(&marker, Vec::new());
+        let state = Arc::new(AppState::headless(storage.clone()));
+
+        tick(&state, &state.pin()).await.unwrap();
+
+        assert_eq!(stored_set(storage.as_ref()).await, [pkg]);
+        assert!(!storage.head_exists(&marker).await.unwrap());
     }
 
     #[tokio::test]
@@ -6207,6 +6258,25 @@ mod tests {
             2,
             "both packages are provably unchanged once their checkpoint landed"
         );
+    }
+
+    /// `rebuild-index` forces every rebuild, but the fingerprints it found
+    /// still name committed states. A deep pass whose checkpoint defers must
+    /// keep them, or the next audit re-renders and re-commits the whole corpus.
+    #[tokio::test]
+    async fn a_deep_pass_whose_checkpoint_defers_keeps_the_stored_fingerprints() {
+        let storage = Arc::new(InMemStorage::default());
+        let state = test_app_state(storage.clone(), Duration::from_secs(3600));
+        let pinned = state.pin();
+        seed_private_artifact(&storage, "a", CHAIN_FILE);
+        audit(&state, &pinned, false).await.unwrap();
+        let before = stored_fingerprints(&storage, 'a').await;
+        assert!(before.contains_key("a"));
+
+        storage.fail_lists_of(crate::transparency::CHAIN_PREFIX);
+        audit(&state, &pinned, true).await.unwrap();
+        storage.heal_lists();
+        assert_eq!(stored_fingerprints(&storage, 'a').await, before);
     }
 
     /// The handoff case. One leader rebuilds the churn but cannot read the

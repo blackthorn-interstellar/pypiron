@@ -484,8 +484,12 @@ ENDPOINTS: list = [
         expect=(200, 204),
         mutates=True,
         target="probe",
-        cold_ops={"read": 6, "write": 6, "list": 3, "delete": 5},
-        warm_ops={"read": 6, "write": 6, "list": 3, "delete": 5},
+        # Two of the reads are the worker re-deriving the package's place in the
+        # quarantined set when it drains the delete's marker (its status, then
+        # the set): a package left with no files is not skipped, because a
+        # freeze on a name nothing has cached must still reach the fleet.
+        cold_ops={"read": 8, "write": 6, "list": 3, "delete": 5},
+        warm_ops={"read": 8, "write": 6, "list": 3, "delete": 5},
         bytes_range=(0, 100),
     ),
 ]

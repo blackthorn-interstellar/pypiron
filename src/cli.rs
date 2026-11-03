@@ -554,8 +554,11 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
     // inspect them. A note the sweep can never deliver (a damaged record) would
     // wedge this forever, so the refusal names it and `--force` proceeds: on a
     // surviving bucket the note stays and keeps being retried.
+    // Kept buckets this pre-check could not inspect: a note found on one later
+    // may be old, so the post-commit re-check cannot blame a running node for it.
+    let mut unchecked: Vec<usize> = Vec::new();
     if buckets.is_multi() {
-        for handle in buckets.handles() {
+        for (index, handle) in buckets.handles().iter().enumerate() {
             match replicate::first_undrained_repl_note(handle.storage.as_ref()).await {
                 Ok(None) => {}
                 Ok(Some(note)) if args.force => eprintln!(
@@ -576,6 +579,7 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
                         "migrate: bucket '{}' unreachable while checking for repair notes; skipping",
                         handle.name
                     );
+                    unchecked.push(index);
                 }
                 Err(error) => {
                     return Err(error).with_context(|| {
@@ -812,16 +816,22 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
     // list stays committed — undoing it would be the riskier move — but the
     // command fails so the operator sees it and acts.
     if !args.force {
-        let problems =
-            repl_notes_after_commit(buckets.handles(), &removed_buckets, &is_availability).await;
+        let problems = repl_notes_after_commit(
+            buckets.handles(),
+            &unchecked,
+            &removed_buckets,
+            &is_availability,
+        )
+        .await;
         if !problems.is_empty() {
             bail!(
                 "the new bucket list is committed (topology generation {generation}), but \
                  repair notes appeared while migrating, so a node is still running: {}. Stop \
                  every node. A note on a bucket that stays in the list is retried once nodes \
                  restart. A note on a removed bucket may be a record's only copy: run \
-                 `pypiron buckets migrate` with the previous list (the removed bucket back in), \
-                 let replication drain, then remove it again.",
+                 `pypiron buckets migrate --force` with the previous list (the removed bucket \
+                 back in; --force only gets past that bucket's own pending notes), restart the \
+                 fleet, let replication drain, then remove it again.",
                 problems.join("; ")
             );
         }
@@ -843,19 +853,23 @@ pub async fn run_buckets_migrate(args: BucketsMigrateArgs) -> Result<()> {
 /// Repair notes found after `buckets migrate` committed its new list, one line
 /// per problem. The pre-check refused any, so a hit means a node kept writing.
 /// A kept bucket that cannot be reached is only warned about, as the pre-check
-/// skipped it too; a removed bucket that cannot be re-checked is a problem,
-/// because a note there may be a record's only copy.
+/// skipped it too; so is a note on a kept bucket the pre-check could not reach
+/// (`unchecked`, indices into `kept`), since it may predate the migration. A
+/// removed bucket that cannot be re-checked is a problem, because a note there
+/// may be a record's only copy.
 async fn repl_notes_after_commit(
     kept: &[BucketHandle],
+    unchecked: &[usize],
     removed: &[BucketHandle],
     is_availability: &impl Fn(&anyhow::Error) -> bool,
 ) -> Vec<String> {
     let mut problems = Vec::new();
     let all = kept
         .iter()
-        .map(|h| (h, false))
-        .chain(removed.iter().map(|h| (h, true)));
-    for (handle, is_removed) in all {
+        .enumerate()
+        .map(|(index, h)| (h, false, unchecked.contains(&index)))
+        .chain(removed.iter().map(|h| (h, true, false)));
+    for (handle, is_removed, was_unchecked) in all {
         let role = if is_removed {
             "removed bucket"
         } else {
@@ -863,6 +877,11 @@ async fn repl_notes_after_commit(
         };
         match replicate::first_undrained_repl_note(handle.storage.as_ref()).await {
             Ok(None) => {}
+            Ok(Some(note)) if was_unchecked => eprintln!(
+                "migrate: bucket '{}' holds repair note '{note}'; it was unreachable before the \
+                 migration, so the note may be old. It is retried once nodes restart.",
+                handle.name
+            ),
             Ok(Some(note)) => {
                 problems.push(format!("{role} '{}' holds note '{note}'", handle.name))
             }
@@ -1705,15 +1724,17 @@ mod tests {
         let kept_list = [handle("a", &kept)];
         let removed_list = [handle("c", &gone)];
         let never = |_: &anyhow::Error| false;
-        assert!(repl_notes_after_commit(&kept_list, &removed_list, &never)
-            .await
-            .is_empty());
+        assert!(
+            repl_notes_after_commit(&kept_list, &[], &removed_list, &never)
+                .await
+                .is_empty()
+        );
 
         // A node still running under the old list writes a note on each side.
         let tag = crate::counters::bucket_tag("a");
         kept.insert(&format!("_repl/{tag}/p/p-1.whl!x"), Vec::new());
         gone.insert(&format!("_repl/{tag}/q/q-1.whl!y"), Vec::new());
-        let problems = repl_notes_after_commit(&kept_list, &removed_list, &never).await;
+        let problems = repl_notes_after_commit(&kept_list, &[], &removed_list, &never).await;
         assert_eq!(problems.len(), 2, "{problems:?}");
         assert!(
             problems[0].starts_with("bucket 'a' holds note"),
@@ -1727,12 +1748,18 @@ mod tests {
         // A removed bucket that cannot be re-checked is a problem, never a pass.
         gone.fail_lists_of("_repl/");
         let all_down = |_: &anyhow::Error| true;
-        let problems = repl_notes_after_commit(&[], &removed_list, &all_down).await;
+        let problems = repl_notes_after_commit(&[], &[], &removed_list, &all_down).await;
         assert_eq!(problems.len(), 1, "{problems:?}");
         assert!(
             problems[0].contains("could not re-check removed bucket 'c'"),
             "{problems:?}"
         );
+
+        // A kept bucket the pre-check could not reach may hold an old note: it
+        // is no evidence of a running node.
+        assert!(repl_notes_after_commit(&kept_list, &[0], &[], &never)
+            .await
+            .is_empty());
     }
 
     fn parse_serve(args: &[&str]) -> ServeArgs {

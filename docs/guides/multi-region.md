@@ -132,8 +132,10 @@ If a migration stops partway, run the same command again.
 If migration reports repairs that appeared while it ran, the new list is
 already in place and a node is still running. Stop it. A repair on a bucket you
 kept finishes once nodes restart. A repair on a bucket you removed may be the
-only copy of a file: migrate back to the previous list, let replication finish,
-then remove the bucket again.
+only copy of a file: migrate back to the previous list with `--force`, restart
+the fleet, let replication finish, then remove the bucket again. Here `--force`
+only gets past the pending repair on the bucket you are adding back, and the
+restarted fleet delivers it.
 
 To evacuate temporarily to one surviving bucket, stop the fleet and restart it
 with that single bucket. Returning to a multi-bucket list requires the migration

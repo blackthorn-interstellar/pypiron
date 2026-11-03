@@ -4,6 +4,7 @@
 //! helpers, the origin settle checks, and the `Pins` context stay in `app.rs`
 //! and are imported here.
 
+use std::ops::ControlFlow;
 use std::sync::Arc;
 
 use anyhow::{bail, Result};
@@ -398,18 +399,53 @@ async fn serve_pkg_index(
 
     // Upstream (proxy) path: eligibility, render, and the mid-serve coherence
     // recheck all run on the write pin inside `proxy_package_index`.
-    if let Some(resp) =
-        proxy_package_index(state, write_pinned.storage.as_ref(), &pkg, format, headers).await
+    let upstream_down = match proxy_package_index(
+        state,
+        write_pinned.storage.as_ref(),
+        &pkg,
+        format,
+        headers,
+    )
+    .await
     {
-        return resp;
+        ControlFlow::Break(resp) => return resp,
+        ControlFlow::Continue(down) => down,
+    };
+    let resp = serve_local_pkg_index(state, &pins, &pkg, key, ct, headers).await;
+    // Nothing local and upstream unreachable: "no such package" would be final
+    // to pip and uv, so answer the outage they retry.
+    if upstream_down && resp.status() == StatusCode::NOT_FOUND {
+        return upstream_unavailable();
     }
+    resp
+}
 
+/// 503 for a page only upstream can answer while upstream is failing.
+/// `Retry-After` is when the proxy asks upstream again.
+fn upstream_unavailable() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::RETRY_AFTER, proxy::LISTING_ERROR_TTL.as_secs())
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from("upstream index unavailable; retry shortly"))
+        .unwrap_or_else(not_found)
+}
+
+/// A package page from the local materialized index.
+async fn serve_local_pkg_index(
+    state: &AppState,
+    pins: &Pins<'_>,
+    pkg: &str,
+    key: String,
+    ct: &'static str,
+    headers: &HeaderMap,
+) -> Response<Body> {
     // Local index. In multi-bucket, an "unclaimed" read-pin observation is
     // confirmed on the write pin before denying the name; a write-owned claim the
     // region bucket has not seen yet is served through from the write home.
     if state.buckets.is_multi() {
         let read_claim =
-            match require_settled_package_read(state, read_pinned.storage.as_ref(), &pkg).await {
+            match require_settled_package_read(state, pins.read.storage.as_ref(), pkg).await {
                 Ok(claim) => claim,
                 Err(error) => return read_error(error),
             };
@@ -417,15 +453,15 @@ async fn serve_pkg_index(
             .as_ref()
             .is_none_or(|value| value.state == origin::OriginState::Unclaimed)
         {
-            match unclaimed_confirmed_absent(state, &pins, &pkg).await {
+            match unclaimed_confirmed_absent(state, pins, pkg).await {
                 Ok(true) => return not_found("no such package"),
                 Ok(false) => {}
                 Err(error) => return read_error(error),
             }
         }
-        return serve_local_index_fenced(state, &pins, &pkg, key, ct, headers, read_claim).await;
+        return serve_local_index_fenced(state, pins, pkg, key, ct, headers, read_claim).await;
     }
-    serve_local_index_fenced(state, &pins, &pkg, key, ct, headers, None).await
+    serve_local_index_fenced(state, pins, pkg, key, ct, headers, None).await
 }
 
 /// Serve a package index from the read pin, reading through to the write home on
@@ -546,17 +582,20 @@ async fn eligible_proxy<'a>(
     }
 }
 
-/// Proxy hook for package pages: `Some(response)` when the page is served
-/// from upstream metadata, `None` to fall through to the local materialized
-/// index (proxy off, package ineligible, or upstream unavailable).
+/// Proxy hook for package pages: `Break(response)` when the page is served
+/// from upstream metadata, `Continue(upstream_down)` to fall through to the
+/// local materialized index (proxy off, package ineligible, upstream 404, or
+/// upstream unreachable — the last with `upstream_down` set).
 async fn proxy_package_index(
     state: &AppState,
     storage: &dyn Storage,
     pkg: &str,
     format: IndexFormat,
     headers: &HeaderMap,
-) -> Option<Response<Body>> {
-    let proxy = state.proxy.as_ref()?;
+) -> ControlFlow<Response<Body>, bool> {
+    let Some(proxy) = state.proxy.as_ref() else {
+        return ControlFlow::Continue(false);
+    };
     // Coherence baseline on this (write) pin, taken before the eligibility read so
     // the fence covers the whole eligible→render span: serving an upstream index
     // for a name that gains a local claim mid-serve would be a dependency-confusion
@@ -564,22 +603,23 @@ async fn proxy_package_index(
     // Free in single-bucket mode (no I/O) and skipped by the recheck below.
     let before = match require_settled_package_read(state, storage, pkg).await {
         Ok(claim) => claim,
-        Err(e) => return Some(read_error(e)),
+        Err(e) => return ControlFlow::Break(read_error(e)),
     };
     match proxy::eligible(state, storage, pkg).await {
         Ok(true) => {}
-        Ok(false) => return None,
+        Ok(false) => return ControlFlow::Continue(false),
         // Origin unreadable is an outage: never answer "what owns this name"
         // questions optimistically (the dependency-confusion direction).
-        Err(e) => return Some(read_error(e)),
+        Err(e) => return ControlFlow::Break(read_error(e)),
     }
     let rendered = match proxy
         .package_index(state, storage, pkg, format.is_json())
         .await
     {
-        Ok(Some(rendered)) => rendered,
-        Ok(None) => return None,
-        Err(error) => return Some(read_error(error)),
+        Ok(proxy::Listing::Found(rendered)) => rendered,
+        Ok(proxy::Listing::Missing) => return ControlFlow::Continue(false),
+        Ok(proxy::Listing::Unreachable) => return ControlFlow::Continue(true),
+        Err(error) => return ControlFlow::Break(read_error(error)),
     };
     let revalidated = if_none_match(headers, &[&*rendered.etag]);
     let builder = Response::builder()
@@ -600,10 +640,10 @@ async fn proxy_package_index(
     if state.buckets.is_multi() {
         if let Some(resp) = recheck_settled(state, storage, pkg, &before, "serving its index").await
         {
-            return Some(resp);
+            return ControlFlow::Break(resp);
         }
     }
-    Some(response.unwrap_or_else(not_found))
+    ControlFlow::Break(response.unwrap_or_else(not_found))
 }
 
 /// Serve a materialized index file with a content-hash ETag; conditional GETs

@@ -35,6 +35,7 @@ import pytest
 
 from .conftest import _start_disk_server
 from .helpers import (
+    ACCEPT_PEP691,
     find_free_port,
     http_get,
     make_wheel,
@@ -772,16 +773,21 @@ def test_hanging_upstream_is_bounded_and_clean(proxy_over_fault, tmp_path):
 
 
 def test_listing_error_is_not_remembered_as_missing(proxy_over_fault, tmp_path):
-    """One failed upstream listing fetch must not read as "no such package" for
-    a full listing TTL (60s) after upstream recovers."""
+    """A failed upstream listing fetch for a never-cached package is a retryable
+    503 (pip and uv treat 404 as final), on every route that needs the listing,
+    and it does not read as "no such package" after upstream recovers."""
     proxy, upstream = proxy_over_fault
     pkg = "blippkg"
     filename = upstream.register(pkg, make_wheel(pkg, "1.0", tmp_path))
     url = f"{proxy['base_url']}/simple/{pkg}/"
 
     upstream.set_index_fault(pkg, "error500")
-    code, _, _ = http_get(url, timeout=FAULT_GET_TIMEOUT)
-    assert code == 404, "nothing cached yet, so the blip falls back to the local index"
+    for page in (url, f"{url}index.json", f"{proxy['base_url']}/files/{pkg}/{filename}"):
+        code, _, _ = http_get(page, timeout=FAULT_GET_TIMEOUT)
+        assert code == 503, f"{page}: nothing cached and upstream failing must be retryable"
+    code, _, headers = http_get(url, headers={"Accept": ACCEPT_PEP691}, timeout=FAULT_GET_TIMEOUT)
+    assert code == 503
+    assert {k.lower(): v for k, v in headers.items()}.get("retry-after") == "5"
 
     upstream.set_index_fault(pkg, None)
     deadline = time.monotonic() + 20
@@ -794,6 +800,16 @@ def test_listing_error_is_not_remembered_as_missing(proxy_over_fault, tmp_path):
     assert filename in body.decode()
 
 
+def test_upstream_404_is_still_404(proxy_over_fault, tmp_path):
+    """Only an upstream failure is retryable: a package upstream says does not
+    exist stays a final 404, for both index formats."""
+    proxy, _ = proxy_over_fault
+    url = f"{proxy['base_url']}/simple/no-such-pkg/"
+    for page in (url, f"{url}index.json"):
+        code, _, _ = http_get(page, timeout=FAULT_GET_TIMEOUT)
+        assert code == 404, page
+
+
 def test_a_stalled_listing_probe_does_not_hold_up_other_requests(proxy_over_fault, tmp_path):
     """While one request waits out a stalled upstream listing, the others answer
     at once from what the proxy already knows instead of queueing behind it."""
@@ -804,7 +820,7 @@ def test_a_stalled_listing_probe_does_not_hold_up_other_requests(proxy_over_faul
 
     upstream.set_index_fault(pkg, "error500")
     code, _, _ = http_get(url, timeout=FAULT_GET_TIMEOUT)
-    assert code == 404
+    assert code == 503
     # Let the remembered failure expire, then make the next probe stall.
     upstream.set_index_fault(pkg, "stall-error")
     time.sleep(5.5)
@@ -820,7 +836,7 @@ def test_a_stalled_listing_probe_does_not_hold_up_other_requests(proxy_over_faul
     code, _, _ = http_get(url, timeout=FAULT_GET_TIMEOUT)
     elapsed = time.monotonic() - started
     probe.join()
-    assert code == 404
+    assert code == 503
     assert elapsed < INDEX_HANG_SECS / 2, f"waited {elapsed:.1f}s behind the stalled probe"
 
 

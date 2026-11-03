@@ -26,8 +26,10 @@ a file hides it from normal resolution while keeping pinned installs working.
   a package when a client first asks for it, checks the upstream hash, stores
   it, and serves later installs from your storage. If the upstream stops
   answering, packages you already cached keep installing, and pypiron keeps
-  serving the last package list it saw for up to an hour. Once the upstream is
-  back, pypiron uses it again within a minute.
+  serving the last package list it saw for up to an hour. A package nobody has
+  cached yet gets a `503` meaning "try again shortly", not "no such package",
+  so pip and uv retry it. Once the upstream is back, pypiron uses it again
+  within a minute.
 - **Sync ahead of time.** `pypiron sync` copies an approved set of packages to
   your server, and with `--include-dependencies` everything they need. Use this
   for predictable builds and networks without internet access.

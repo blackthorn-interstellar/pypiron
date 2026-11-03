@@ -21,7 +21,8 @@
 //! passed through from upstream without writing anything — a resolver
 //! probing dozens of candidate wheels must not stampede gigabytes into
 //! storage. When upstream is down, callers fall back to the local
-//! materialized index: already-cached packages keep installing.
+//! materialized index: already-cached packages keep installing, and a package
+//! with nothing cached answers a retryable 503, never a final 404.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -57,7 +58,7 @@ const LISTING_TTL: Duration = Duration::from_secs(60);
 /// How long a failed upstream fetch is remembered when there is no usable last
 /// good listing. Long enough that a dead upstream isn't probed on every request,
 /// short enough that a recovered one is used again almost at once.
-const LISTING_ERROR_TTL: Duration = Duration::from_secs(5);
+pub(crate) const LISTING_ERROR_TTL: Duration = Duration::from_secs(5);
 /// The oldest last good listing still served while upstream keeps failing. Past
 /// it the package falls back to local-only, so an upstream yank or quarantine
 /// can't go unseen for longer than this.
@@ -157,19 +158,32 @@ struct Found {
     status: crate::status::ProjectStatusDoc,
 }
 
-enum Listing {
-    Found(Arc<Found>),
+/// What upstream said about a package: its listing (cached as `Arc<Found>`),
+/// or one of the two ways of having none, which callers must tell apart.
+#[derive(Clone)]
+pub enum Listing<T> {
+    Found(T),
     /// Upstream said 404 — cached as hard as a hit, or a stampede of typo'd
     /// installs becomes an upstream hammer.
     Missing,
-    /// Upstream failed and there was nothing fresh enough to reuse. Served like
-    /// `Missing` (local-only), but held for [`LISTING_ERROR_TTL`], never a full
-    /// TTL: an upstream blip must not read as "no such package" after recovery.
+    /// Upstream failed and there was nothing fresh enough to reuse. Served
+    /// local-only like `Missing`, but held for [`LISTING_ERROR_TTL`], never a
+    /// full TTL, and a page with no local copy is a retryable 503, not a 404:
+    /// an upstream blip must not read as "no such package".
     Unreachable,
 }
 
+impl<T> Listing<T> {
+    fn found(self) -> Option<T> {
+        match self {
+            Listing::Found(found) => Some(found),
+            Listing::Missing | Listing::Unreachable => None,
+        }
+    }
+}
+
 struct CacheEntry {
-    listing: Listing,
+    listing: Listing<Arc<Found>>,
     /// When upstream last really answered. Never moved by a failed refresh, so
     /// it is what [`LISTING_MAX_STALE`] measures.
     fetched: Instant,
@@ -178,11 +192,8 @@ struct CacheEntry {
 }
 
 impl CacheEntry {
-    fn served(&self) -> Option<Arc<Found>> {
-        match &self.listing {
-            Listing::Found(found) => Some(found.clone()),
-            Listing::Missing | Listing::Unreachable => None,
-        }
+    fn served(&self) -> Listing<Arc<Found>> {
+        self.listing.clone()
     }
 }
 
@@ -1010,20 +1021,23 @@ impl Proxy {
         self.presence.invalidate(key);
     }
 
-    /// The package page rendered from the upstream listing; `None` means
-    /// "serve the local index instead" (upstream 404 or unreachable).
+    /// The package page rendered from the upstream listing. `Missing` and
+    /// `Unreachable` both mean "serve the local index instead"; with no local
+    /// index, `Unreachable` is a retryable outage rather than a 404.
     pub async fn package_index(
         &self,
         state: &AppState,
         storage: &dyn Storage,
         pkg: &str,
         json: bool,
-    ) -> Result<Option<RenderedIndex>> {
-        let Some(found) = self.listing(state, pkg).await else {
-            return Ok(None);
+    ) -> Result<Listing<RenderedIndex>> {
+        let found = match self.listing(state, pkg).await {
+            Listing::Found(found) => found,
+            Listing::Missing => return Ok(Listing::Missing),
+            Listing::Unreachable => return Ok(Listing::Unreachable),
         };
         if !state.buckets.is_multi() {
-            return Ok(Some(if json {
+            return Ok(Listing::Found(if json {
                 found.json.clone()
             } else {
                 found.html.clone()
@@ -1058,7 +1072,7 @@ impl Proxy {
         } else {
             &visible
         };
-        Ok(Some(if json {
+        Ok(Listing::Found(if json {
             rendered(render::pep691_project_json(
                 pkg,
                 render_files,
@@ -1254,7 +1268,7 @@ impl Proxy {
     /// every path a real client takes.
     async fn tee_size(&self, state: &AppState, pkg: &str, filename: &str) -> Option<u64> {
         let threshold = state.proxy_stream_threshold?;
-        let found = self.listing(state, pkg).await?;
+        let found = self.listing(state, pkg).await.found()?;
         let file = found.files.iter().find(|f| f.filename == filename)?;
         // No declared size, no Content-Length, no tee: a body of unknown length
         // cannot be promised to the client up front.
@@ -1311,8 +1325,12 @@ impl Proxy {
         if storage.head_exists(key).await? {
             return Ok(false);
         }
-        let Some(found) = self.listing(state, pkg).await else {
-            return Ok(false);
+        // An unreachable upstream fails the fill rather than reading as "not
+        // upstream": the request answers a retryable 503, not a 404.
+        let found = match self.listing(state, pkg).await {
+            Listing::Found(found) => found,
+            Listing::Missing => return Ok(false),
+            Listing::Unreachable => bail!("upstream listing for '{pkg}' is unreachable"),
         };
         let Some(file) = found.files.iter().find(|f| f.filename == filename) else {
             return Ok(false); // not upstream, or filtered out
@@ -1606,7 +1624,7 @@ impl Proxy {
         metadata_filename: &str,
     ) -> Option<bytes::Bytes> {
         let base = metadata_filename.strip_suffix(METADATA_SUFFIX)?;
-        let found = self.listing(state, pkg).await?;
+        let found = self.listing(state, pkg).await.found()?;
         let file = found.files.iter().find(|f| f.filename == base)?;
         if self.fill_refused_by_yank(file) {
             debug!(%pkg, %base, "proxy: refusing the companion of a file yanked upstream");
@@ -1671,7 +1689,7 @@ impl Proxy {
         provenance_filename: &str,
     ) -> Option<bytes::Bytes> {
         let base = provenance_filename.strip_suffix(PROVENANCE_SUFFIX)?;
-        let found = self.listing(state, pkg).await?;
+        let found = self.listing(state, pkg).await.found()?;
         let file = found.files.iter().find(|f| f.filename == base)?;
         if self.fill_refused_by_yank(file) {
             debug!(%pkg, %base, "proxy: refusing the companion of a file yanked upstream");
@@ -1718,7 +1736,7 @@ impl Proxy {
     /// reuse the package is served local-only for [`LISTING_ERROR_TTL`], so a
     /// dead upstream isn't a per-request timeout and a recovered one is used
     /// again within seconds.
-    async fn listing(&self, state: &AppState, pkg: &str) -> Option<Arc<Found>> {
+    async fn listing(&self, state: &AppState, pkg: &str) -> Listing<Arc<Found>> {
         if let Some(cached) = self.cached_listing(pkg) {
             return cached;
         }
@@ -1782,7 +1800,7 @@ impl Proxy {
     }
 
     /// Cached listing lookup: `None` when absent or expired.
-    fn cached_listing(&self, pkg: &str) -> Option<Option<Arc<Found>>> {
+    fn cached_listing(&self, pkg: &str) -> Option<Listing<Arc<Found>>> {
         let map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get(pkg)?;
         (Instant::now() < entry.expires).then(|| entry.served())
@@ -1791,7 +1809,7 @@ impl Proxy {
     /// What a waiter may serve while another task refreshes `pkg`: any entry,
     /// expired or not, except a listing past [`LISTING_MAX_STALE`]. `None` when
     /// there is nothing to serve, so the caller waits for the refresh.
-    fn stale_listing(&self, pkg: &str) -> Option<Option<Arc<Found>>> {
+    fn stale_listing(&self, pkg: &str) -> Option<Listing<Arc<Found>>> {
         let map = self.listings.lock().unwrap_or_else(|e| e.into_inner());
         let entry = map.get(pkg)?;
         let too_old = matches!(entry.listing, Listing::Found(_))
@@ -1949,7 +1967,7 @@ impl Proxy {
                 return;
             }
         }
-        let Some(found) = self.listing(state, pkg).await else {
+        let Some(found) = self.listing(state, pkg).await.found() else {
             debug!(%pkg, "proxy: a dependency has no upstream listing");
             return;
         };
@@ -2116,7 +2134,7 @@ impl Proxy {
         }
     }
 
-    async fn fetch_listing(&self, state: &AppState, pkg: &str) -> Result<Listing> {
+    async fn fetch_listing(&self, state: &AppState, pkg: &str) -> Result<Listing<Arc<Found>>> {
         let Some(index) =
             simple::fetch_index(&self.client, &self.upstream, pkg, Some(SMALL_FETCH_TIMEOUT))
                 .await?
@@ -2517,7 +2535,7 @@ mod tests {
         let t0 = Instant::now();
         let now = t0 + Duration::from_secs(600);
         let kept = after_error(Some(found_entry(t0)), now, Duration::ZERO);
-        assert!(kept.served().is_some());
+        assert!(kept.served().found().is_some());
         assert_eq!(kept.fetched, t0);
         assert_eq!(kept.expires, now + LISTING_TTL);
         // A second error later still measures from the real fetch.
@@ -2533,7 +2551,7 @@ mod tests {
         // Revived just before the cap: the expiry is clamped to the cap.
         let edge = t0 + LISTING_MAX_STALE - Duration::from_secs(1);
         let kept = after_error(Some(found_entry(t0)), edge, Duration::ZERO);
-        assert!(kept.served().is_some());
+        assert!(kept.served().found().is_some());
         assert_eq!(kept.expires, t0 + LISTING_MAX_STALE);
         // Past the cap: dropped.
         let past = t0 + LISTING_MAX_STALE + Duration::from_secs(1);

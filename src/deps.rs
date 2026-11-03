@@ -50,10 +50,10 @@ fn widen(want: &mut Want, specifiers: Option<&VersionSpecifiers>) {
 
 /// One `Requires-Dist` entry, as far as following it needs.
 #[derive(Debug, PartialEq)]
-struct Requirement {
-    name: String,
+pub(crate) struct Requirement {
+    pub(crate) name: String,
     /// `None` admits every version, as does a range that doesn't parse.
-    specifiers: Option<VersionSpecifiers>,
+    pub(crate) specifiers: Option<VersionSpecifiers>,
     /// Extras this requirement asks of `name` (`urllib3[socks]`).
     extras: Vec<String>,
     /// The requirer's extras it belongs to (`; extra == "x"`); empty = always.
@@ -63,7 +63,7 @@ struct Requirement {
 /// Parse a `Requires-Dist` entry. Platform and Python markers are ignored, so
 /// every platform is followed; only the `extra` ones matter. `None` for a
 /// direct URL reference, which no index can serve.
-fn parse_requirement(req: &str) -> Option<Requirement> {
+pub(crate) fn parse_requirement(req: &str) -> Option<Requirement> {
     let (req, marker) = req.split_once(';').unwrap_or((req, ""));
     let req = req.trim();
     if req.contains('@') {

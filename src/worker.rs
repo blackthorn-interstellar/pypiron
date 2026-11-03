@@ -1326,6 +1326,7 @@ pub async fn audit(
     // Advisory-report inventory: `(package, filenames)` for advisory-matched names,
     // accumulated across shards and joined against the audit index in the tail.
     let mut inventory: Vec<(String, Vec<String>)> = Vec::new();
+    let mut newest: Vec<(String, Option<String>)> = Vec::new();
     // Capture the advisory snapshot once, so the shard walk's inventory filter and
     // the report tail's join both use the same db and stamp the same feed sha —
     // the materialized report is then consistent with what the walk gathered.
@@ -1395,6 +1396,7 @@ pub async fn audit(
                     deltas.extend(result.deltas);
                     pending_fps.extend(result.pending_fps);
                     inventory.extend(result.inventory);
+                    newest.extend(result.newest);
                 }
                 Err(e) => {
                     error!(shard=%shard, error=?e, "audit: shard failed");
@@ -1516,6 +1518,14 @@ pub async fn audit(
         inv.totals()
     };
     publish_inventory(state, storage, totals).await;
+    let scope = if force_deep {
+        crate::used_by::Scope::Regenerate
+    } else {
+        crate::used_by::Scope::All
+    };
+    if let Err(e) = crate::used_by::refresh(state, storage, newest, scope).await {
+        warn!(error=?e, "used-by: refresh failed; the next audit retries");
+    }
     // Append the tamper-evident checkpoint last, once views and inventory are
     // settled. Never fails the audit itself: a checkpoint that cannot be landed
     // warns, counts `pypiron_chain_checkpoint_deferrals_total`, and leaves its
@@ -1885,6 +1895,9 @@ struct ShardAudit {
     /// names, so it stays proportional to the corpus ∩ OSV, not corpus size. The
     /// sweep tail resolves versions and joins downloads to materialize the report.
     inventory: Vec<(String, Vec<String>)>,
+    /// Every package and the artifact standing for its newest release, for the
+    /// used-by views. Off the listing, so free.
+    newest: Vec<(String, Option<String>)>,
 }
 
 /// One package's audit inputs, derived from the flat listing in a single pass:
@@ -1951,6 +1964,7 @@ async fn audit_shard(
         deltas: Vec::new(),
         pending_fps: Vec::new(),
         inventory: Vec::new(),
+        newest: Vec::new(),
     };
     let mut fresh: std::collections::HashMap<String, String> = Default::default();
     // Packages whose listing shows the PEP 792 sidecar: the rare set that pays a
@@ -1973,6 +1987,10 @@ async fn audit_shard(
         if members.contains(PROJECT_STATUS_FILE) {
             status_pkgs.push(pkg.clone());
         }
+        out.newest.push((
+            pkg.clone(),
+            crate::used_by::newest_listed(state, &pkg, &members),
+        ));
         let mut versions: HashSet<String> = HashSet::new();
         let mut file_count = 0u32;
         let mut pkg_bytes = 0u64;
@@ -2650,7 +2668,7 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
                             false
                         }
                     };
-                    Some((rebuilt.still_live, published))
+                    Some((rebuilt.still_live, published, rebuilt.newest))
                 }
                 Err(e) => {
                     error!(package=%package, error=?e, "rebuild failed; markers retained for retry");
@@ -2664,9 +2682,11 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
     let mut healed = 0u64;
     let (mut adds, mut removes) = (Vec::new(), Vec::new());
     let mut consumed: Vec<String> = Vec::new();
+    let mut newest = Vec::new();
     for handle in handles {
         match handle.await {
-            Ok((pkg, keys, stale_intents, Some((live_now, published)))) => {
+            Ok((pkg, keys, stale_intents, Some((live_now, published, newest_file)))) => {
+                newest.push((pkg.clone(), newest_file));
                 if live_now {
                     adds.push(pkg.clone());
                 } else {
@@ -2703,6 +2723,12 @@ pub async fn tick(state: &Arc<AppState>, pinned: &crate::buckets::Pinned) -> Res
     // One batched global-index pass per tick: mass ingest of N new packages
     // rewrites the (corpus-sized) global views once, not N times.
     update_global_index(state, storage, &adds, &removes).await?;
+    // Best-effort: whatever this misses, the next audit refreshes.
+    if let Err(e) =
+        crate::used_by::refresh(state, storage, newest, crate::used_by::Scope::Some).await
+    {
+        warn!(error=?e, "used-by: refresh failed; the next audit retries");
+    }
     // Flush the inventory once per tick if this tick's rebuilds changed it
     // (and a sweep has set the full baseline — before that the map is partial,
     // so we let the audit publish). Batched like the global index: one write
@@ -2858,6 +2884,8 @@ pub(crate) struct RebuiltPackage {
     /// when the package had nothing to render (all delisted, or no bytes at all),
     /// so no status was read.
     quarantined: Option<bool>,
+    /// The artifact standing for the newest release, for the used-by views.
+    newest: Option<String>,
 }
 
 /// Rebuild only a package's index views from `storage`'s own truth, touching no
@@ -2943,6 +2971,12 @@ async fn rebuild_package_indexes_inner(
         .iter()
         .map(|f| (f.filename.clone(), f.sha256.clone()))
         .collect();
+    let newest = crate::used_by::newest(
+        files
+            .iter()
+            .filter(|f| f.core_metadata)
+            .map(|f| f.filename.as_str()),
+    );
     // Index membership keys on the *renderable* files; inventory keys on the
     // *stored* files (raw). They differ only for a corrupt-sidecar file, which
     // is dropped from the index but still counted as stored — matching the
@@ -2975,6 +3009,7 @@ async fn rebuild_package_indexes_inner(
         file_shas: shas,
         views,
         quarantined,
+        newest,
     })
 }
 

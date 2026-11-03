@@ -352,6 +352,12 @@ async fn render_project(
         Some(f) => load_provenance(storage.as_ref(), &pkg, f).await,
         None => None,
     };
+    // Hosted projects whose newest release requires this one, narrowed to those
+    // whose requirement admits the version shown.
+    let used_by = crate::used_by::admitting(
+        crate::used_by::read(storage.as_ref(), &pkg).await,
+        &selected,
+    );
 
     let downloads = download_summary(state, &pkg).await;
     if state.buckets.is_multi() {
@@ -393,6 +399,7 @@ async fn render_project(
         provenance.as_ref(),
         &downloads,
         &advisory_panel,
+        &used_by,
     );
     let body = bytes::Bytes::from(html);
     state.project_cache.put(body.clone(), render_claim);

@@ -670,6 +670,7 @@ pub fn project_html(
     prov: Option<&Provenance>,
     downloads: &[(String, u64)],
     advisories: &[AdvisoryPanelRow],
+    used_by: &crate::used_by::Lines,
 ) -> String {
     let index_url = format!("{}/simple/", ctx.base_url);
     // The one index URL, top-right, in a copy field (same style as the landing
@@ -750,7 +751,7 @@ pub fn project_html(
     // attestation + the package's self-declared details) with the tab panels on
     // the right.
     let body = format!(
-        "<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{advisories}{downloads}{verified}{details}</aside>\
+        "<div class=\"pcols ptabs\"><aside class=\"pmeta\">{nav}{advisories}{downloads}{used_by}{verified}{details}</aside>\
 <div class=\"pcontent\">{desc}{history}{dl}</div></div>\
 <nav class=\"links\"><a href=\"/\">← Home</a> · <a href=\"/projects/\">All packages</a> · \
 <a href=\"/simple/{name}/\">Simple index</a></nav>\
@@ -759,6 +760,7 @@ pub fn project_html(
         nav = nav_section(),
         advisories = advisory_panel_section(advisories),
         downloads = downloads_section(downloads),
+        used_by = used_by_section(used_by),
         verified = provenance_section(prov),
         details = meta_sections(meta),
         desc = description_panel(meta),
@@ -978,6 +980,35 @@ fn downloads_section(downloads: &[(String, u64)]) -> String {
 <dl class=\"sb-dl\">{rows}</dl></section>",
         total = group_thousands(total),
     )
+}
+
+/// The "Used by" sidebar section: hosted projects whose newest release
+/// requires this one at the version shown, each requirement on hover. Long
+/// lists are cut short; the rest is counted.
+fn used_by_section(used_by: &crate::used_by::Lines) -> String {
+    const SHOWN: usize = 50;
+    if used_by.is_empty() {
+        return String::new();
+    }
+    let items: String = used_by
+        .iter()
+        .take(SHOWN)
+        .map(|(pkg, lines)| {
+            format!(
+                "<li><a href=\"/project/{pkg}/\" title=\"{lines}\">{pkg}</a></li>",
+                pkg = encode_text(pkg),
+                lines = encode_double_quoted_attribute(&lines.join(", ")),
+            )
+        })
+        .collect();
+    let more = match used_by.len().saturating_sub(SHOWN) {
+        0 => String::new(),
+        n => format!(
+            "<p class=\"sb-note\">and {} more</p>",
+            group_thousands(n as u64)
+        ),
+    };
+    format!("<section class=\"sb sb-used-by\"><h2>Used by</h2><ul class=\"vals pill\">{items}</ul>{more}</section>")
 }
 
 /// The publisher-attestation sidebar section: the publishing identity recorded
@@ -1451,6 +1482,7 @@ mod tests {
             None,
             &[],
             &[],
+            &Default::default(),
         );
 
         // Slim brand strip (home link + index URL field), then a package banner.
@@ -1527,6 +1559,7 @@ mod tests {
             None,
             &[],
             &[],
+            &Default::default(),
         );
         // The banner and install snippet pin the selected version.
         assert!(html.contains("<span class=\"pver\">14.3.0</span>"));
@@ -1552,7 +1585,18 @@ mod tests {
             evil,
             "2026-01-01T00:00:00Z",
         )];
-        let html = project_html(&ctx(), "x", &files, evil, true, None, None, &[], &[]);
+        let html = project_html(
+            &ctx(),
+            "x",
+            &files,
+            evil,
+            true,
+            None,
+            None,
+            &[],
+            &[],
+            &Default::default(),
+        );
 
         // Isolate the install command box (the index-URL field is `install idxbox`).
         let start = html.find("<div class=\"install\"><code>").unwrap();
@@ -1579,7 +1623,18 @@ mod tests {
             "1.0.0",
             "2026-01-01T00:00:00Z",
         )];
-        let ok = project_html(&ctx(), "x", &good, "1.0.0", true, None, None, &[], &[]);
+        let ok = project_html(
+            &ctx(),
+            "x",
+            &good,
+            "1.0.0",
+            true,
+            None,
+            None,
+            &[],
+            &[],
+            &Default::default(),
+        );
         assert!(ok.contains("uv add --index https://pkgs.example.com/simple/ x==1.0.0"));
     }
 
@@ -1615,6 +1670,7 @@ mod tests {
             Some(&prov),
             &[],
             &[],
+            &Default::default(),
         );
         // The bare "Verified details" overclaim is gone; the section is attributed.
         assert!(!html.contains("Verified details"));
@@ -1653,6 +1709,7 @@ mod tests {
             Some(&prov),
             &[],
             &[],
+            &Default::default(),
         );
         assert!(html.contains("<h2>Publisher attestation</h2>"));
         assert!(html.contains("class=\"sb-bound\""));
@@ -1698,6 +1755,7 @@ mod tests {
             Some(&prov),
             &[],
             &[],
+            &Default::default(),
         );
         // Isolate the attestation section — the author metadata section is separate.
         let start = html.find("<section class=\"sb sb-prov\">").unwrap();
@@ -1732,7 +1790,18 @@ mod tests {
             "1.0",
             "2026-01-01T00:00:00Z",
         )];
-        let html = project_html(&ctx(), "x", &files, "1.0", false, Some(&m), None, &[], &[]);
+        let html = project_html(
+            &ctx(),
+            "x",
+            &files,
+            "1.0",
+            false,
+            Some(&m),
+            None,
+            &[],
+            &[],
+            &Default::default(),
+        );
         assert!(html.contains("<pre class=\"readme\">"));
         assert!(html.contains("shown unrendered"));
         assert!(html.contains("Plain * text &amp; &lt;not&gt; markdown"));
@@ -1746,7 +1815,18 @@ mod tests {
             "1.0",
             "2026-01-01T00:00:00Z",
         )];
-        let html = project_html(&ctx(), "x", &files, "1.0", false, None, None, &[], &[]);
+        let html = project_html(
+            &ctx(),
+            "x",
+            &files,
+            "1.0",
+            false,
+            None,
+            None,
+            &[],
+            &[],
+            &Default::default(),
+        );
         // Tabs always present; description falls back to a placeholder.
         assert!(html.contains("data-tab=\"description\""));
         assert!(html.contains("This release has no project description."));

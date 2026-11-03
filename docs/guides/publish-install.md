@@ -63,6 +63,10 @@ uv publish --publish-url http://localhost:8080/legacy/ dist/*
 Open [http://localhost:8080/project/hello-pypiron](http://localhost:8080/project/hello-pypiron)
 to see the release.
 
+Each project page also lists **Used by**: the packages on this server whose
+newest release requires that project, narrowed to those whose requirement
+allows the version shown. A new upload shows up there within a few seconds.
+
 Moving from pypicloud? Its upload URL keeps working: pypiron also accepts
 uploads on `/simple/` and on `/`, so existing publishers need no change.
 

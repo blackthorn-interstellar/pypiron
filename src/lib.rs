@@ -60,6 +60,7 @@ pub mod tombstone;
 pub mod transparency;
 pub mod upload;
 pub mod upstream_tls;
+pub mod used_by;
 pub mod verify;
 pub mod wheel;
 pub mod worker;

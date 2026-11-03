@@ -89,7 +89,8 @@ ENDPOINTS: list = [
         method="GET",
         path="/project/{pkg}/",
         routes=(("GET", "/project/:package"), ("GET", "/project/:package/")),
-        cold_ops={"read": 32, "list": 31},
+        # +1 read: the used-by list (src/used_by.rs).
+        cold_ops={"read": 33, "list": 31},
         warm_ops={},
         bytes_range=(500, 500000),
     ),
@@ -98,7 +99,8 @@ ENDPOINTS: list = [
         method="GET",
         path="/project/{pkg}/{version}/",
         routes=(("GET", "/project/:package/:version"), ("GET", "/project/:package/:version/")),
-        cold_ops={"read": 33, "list": 31},
+        # +1 read: the used-by list (src/used_by.rs).
+        cold_ops={"read": 34, "list": 31},
         warm_ops={},
         bytes_range=(500, 500000),
     ),
@@ -315,8 +317,10 @@ ENDPOINTS: list = [
         # +1 read: the worker re-derives the package's quarantined-set membership
         # when it drains the marker (one get_with_etag of the set; no write when
         # it already matches) — the retry for a status write whose publish failed.
-        cold_ops={"read": 14, "write": 11, "list": 2, "delete": 1},
-        warm_ops={"read": 14, "write": 11, "list": 2, "delete": 1},
+        # +2 reads, +1 write: the tick's used-by refresh reads the requires shard and
+        # the new release's .metadata, then records it.
+        cold_ops={"read": 16, "write": 12, "list": 2, "delete": 1},
+        warm_ops={"read": 16, "write": 12, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -345,8 +349,9 @@ ENDPOINTS: list = [
         # +12 reads: the record (five fence/body HEADs and the claim) is
         # checked before the sidecar CAS and again after it.
         # +1 read: the marker drain's quarantined-set re-derive (see upload-legacy).
-        cold_ops={"read": 19, "write": 5, "list": 2, "delete": 1},
-        warm_ops={"read": 19, "write": 5, "list": 2, "delete": 1},
+        # +1 read: the tick's used-by refresh reads the requires shard.
+        cold_ops={"read": 20, "write": 5, "list": 2, "delete": 1},
+        warm_ops={"read": 20, "write": 5, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -361,8 +366,9 @@ ENDPOINTS: list = [
         # +12 reads: the record (five fence/body HEADs and the claim) is
         # checked before the sidecar CAS and again after it.
         # +1 read: the marker drain's quarantined-set re-derive (see upload-legacy).
-        cold_ops={"read": 19, "write": 5, "list": 2, "delete": 1},
-        warm_ops={"read": 19, "write": 5, "list": 2, "delete": 1},
+        # +1 read: the tick's used-by refresh reads the requires shard.
+        cold_ops={"read": 20, "write": 5, "list": 2, "delete": 1},
+        warm_ops={"read": 20, "write": 5, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -377,8 +383,9 @@ ENDPOINTS: list = [
         # Sidecar CAS/indexing like yank, record checks included. The HTML
         # Simple index contains no dates, so only the JSON index is rewritten.
         # +1 read: the marker drain's quarantined-set re-derive (see upload-legacy).
-        cold_ops={"read": 19, "write": 4, "list": 2, "delete": 1},
-        warm_ops={"read": 19, "write": 4, "list": 2, "delete": 1},
+        # +1 read: the tick's used-by refresh reads the requires shard.
+        cold_ops={"read": 20, "write": 4, "list": 2, "delete": 1},
+        warm_ops={"read": 20, "write": 4, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -404,8 +411,9 @@ ENDPOINTS: list = [
         # poll no-op past a freeze it never saw. The next poll re-reads instead.
         # +1 read: the worker's re-derive when it drains this write's marker
         # confirms the set (a GET, no write) — the retry had the publish failed.
-        cold_ops={"read": 6, "write": 6, "list": 2, "delete": 1},
-        warm_ops={"read": 6, "write": 6, "list": 2, "delete": 1},
+        # +1 read: the tick's used-by refresh reads the requires shard.
+        cold_ops={"read": 7, "write": 6, "list": 2, "delete": 1},
+        warm_ops={"read": 7, "write": 6, "list": 2, "delete": 1},
         bytes_range=(0, 100),
     ),
     _e(
@@ -422,8 +430,9 @@ ENDPOINTS: list = [
         # name that endpoint quarantined at this same iteration index. A real
         # change again, so the same read/write pair and, for the same reason, no
         # etag-adopting LIST. +1 read for the worker's confirming re-derive.
-        cold_ops={"read": 6, "write": 5, "list": 2, "delete": 2},
-        warm_ops={"read": 6, "write": 5, "list": 2, "delete": 2},
+        # +1 read: the tick's used-by refresh reads the requires shard.
+        cold_ops={"read": 7, "write": 5, "list": 2, "delete": 2},
+        warm_ops={"read": 7, "write": 5, "list": 2, "delete": 2},
         bytes_range=(0, 100),
     ),
     _e(
@@ -488,8 +497,9 @@ ENDPOINTS: list = [
         # quarantined set when it drains the delete's marker (its status, then
         # the set): a package left with no files is not skipped, because a
         # freeze on a name nothing has cached must still reach the fleet.
-        cold_ops={"read": 8, "write": 6, "list": 3, "delete": 5},
-        warm_ops={"read": 8, "write": 6, "list": 3, "delete": 5},
+        # +1 read, +1 write: the tick's used-by refresh (shard read, record update).
+        cold_ops={"read": 9, "write": 7, "list": 3, "delete": 5},
+        warm_ops={"read": 9, "write": 7, "list": 3, "delete": 5},
         bytes_range=(0, 100),
     ),
 ]

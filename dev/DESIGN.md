@@ -884,6 +884,16 @@ _dirty/<pkg>!<root>[~<seq>].intent       # empty marker: a writer is touching th
 _dirty/<pkg>!<root>[~<seq>].commit       # empty marker: truth changed, rebuild now
 _state/fp-<shard>.json                   # audit fingerprints: pkg -> listing hash at last rebuild
 _state/inventory.json                    # regenerable aggregate (pkg/file counts); nodes read it for `/`
+_state/requires-<shard>.json             # used-by memo: per package, the artifact whose `.metadata`
+                                         #   stood for its newest release and that release's
+                                         #   Requires-Dist, grouped by named project. Written after
+                                         #   the used-by files it touched, so a crash leaves it stale
+                                         #   and the next pass redoes the work.
+_state/used-by/<pkg>.json                # the inverse: each package whose newest release requires
+                                         #   <pkg>, with its lines. Read by the project page. The tick
+                                         #   refreshes what it rebuilt, the audit everything (a
+                                         #   `.metadata` read only when a newest release moved), and
+                                         #   `rebuild-index` regenerates both from scratch.
 _state/proxy-dependencies.json           # proxy `include-dependencies` memo: per project, each
                                          #   served release's Requires-Dist, read from upstream
                                          #   PEP 658 files. Pure cache (keyed by upstream URL):

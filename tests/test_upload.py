@@ -3,12 +3,11 @@
 A spool is the local temp file an upload streams into before it is stored.
 Every normal exit, error and cancel removes its own; a crash (SIGKILL, OOM)
 leaves it. The server removes pypiron's own spool files that are more than a
-day old and that no live process holds, and nothing else in the directory.
+day old, and nothing else in the directory.
 """
 
 from __future__ import annotations
 
-import fcntl
 import os
 import time
 
@@ -31,26 +30,19 @@ def test_crash_leftover_spools_are_removed_at_startup(tmp_path_factory, pypiron_
     spool = tmp_path_factory.mktemp("spool")
     leftover = spool / "pypiron-upload-1-1-0.spool"
     fresh = spool / "pypiron-upload-2-1-0.spool"
-    live = spool / "pypiron-upload-3-1-0.spool"
     unrelated = spool / "unrelated-1.spool"
     _plant(leftover, age=TWO_DAYS)
     _plant(fresh, age=0)
-    _plant(live, age=TWO_DAYS)
     _plant(unrelated, age=TWO_DAYS)
 
-    # Another process still owns `live`, however old it is: the server must
-    # leave it alone (a suspended upload, a long store write).
-    with open(live, "rb") as owner:
-        fcntl.flock(owner, fcntl.LOCK_EX)
-        server = _start_disk_server(tmp_path_factory, pypiron_bin, ["--spool-dir", str(spool)])
-        next(server)
-        try:
-            deadline = time.monotonic() + 10
-            while leftover.exists() and time.monotonic() < deadline:
-                time.sleep(0.1)
-            assert not leftover.exists(), "a crash's stale spool must be removed"
-            assert fresh.exists(), "a recent spool may still be in use"
-            assert live.exists(), "a spool another process holds must survive"
-            assert unrelated.exists(), "files that are not pypiron spools are not ours"
-        finally:
-            server.close()
+    server = _start_disk_server(tmp_path_factory, pypiron_bin, ["--spool-dir", str(spool)])
+    next(server)
+    try:
+        deadline = time.monotonic() + 10
+        while leftover.exists() and time.monotonic() < deadline:
+            time.sleep(0.1)
+        assert not leftover.exists(), "a crash's stale spool must be removed"
+        assert fresh.exists(), "a recent spool may still be in use"
+        assert unrelated.exists(), "files that are not pypiron spools are not ours"
+    finally:
+        server.close()

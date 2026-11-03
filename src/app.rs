@@ -1486,8 +1486,10 @@ async fn run_serve(
                 let reachable = !topology.unreachable_indices.contains(&region);
                 let converged =
                     reachable && replicate::region_owed_no_notes(buckets.handles(), region).await;
-                health.configure_read_affinity(region, converged)?;
-                if converged {
+                // The controller has the last word: a converged bucket that is
+                // not usable (unverified after a flap, or format-gated) keeps
+                // reads on the write pin.
+                if health.configure_read_affinity(region, converged)? {
                     buckets.seed_read_pin(region);
                     info!(
                         region = %node.region,
@@ -1502,7 +1504,7 @@ async fn run_serve(
                         region = %node.region,
                         bucket = %buckets.handles()[region].name,
                         write_bucket = %buckets.handles()[buckets.pin().index].name,
-                        "read affinity: region bucket still converging (peer unreachable, backfill, or repair notes outstanding); reads follow the write bucket until it catches up"
+                        "read affinity: region bucket still converging (peer unreachable, backfill, repair notes outstanding, or its checks not yet passed); reads follow the write bucket until it catches up"
                     );
                 } else {
                     warn!(

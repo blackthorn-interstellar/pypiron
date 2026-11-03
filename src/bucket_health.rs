@@ -391,22 +391,28 @@ impl HealthController {
     /// pins reads to the region bucket: a node that booted with its write home
     /// down may already be reading from the region bucket, but only because the
     /// write pin is there, and those reads leave with it.
+    ///
+    /// Returns whether the pin ended up earned: an earned verdict on a bucket
+    /// that is not usable (unverified, or failed its format check) still leaves
+    /// reads following the write pin, and startup seeds the read pin only on
+    /// `true`.
     pub fn configure_read_affinity(
         &self,
         preference: usize,
         earned: bool,
-    ) -> Result<(), InvalidBucket> {
+    ) -> Result<bool, InvalidBucket> {
         self.validate_bucket(preference)?;
         let mut state = self.lock();
         state.health.set_read_affinity(preference, earned);
+        let pinned = state.health.read_pin == ReadPin::Earned;
         // What startup publishes: `seed_read_pin` only for an earned pin;
         // otherwise reads alias the write pin.
-        state.applied_read_selected = if earned {
+        state.applied_read_selected = if pinned {
             preference
         } else {
             state.applied_selected
         };
-        Ok(())
+        Ok(pinned)
     }
 
     /// The region bucket when checking whether reads may return to it is
@@ -616,23 +622,29 @@ impl BucketHealth {
             SignalClass::Ignored => {}
         }
 
-        Ok(self.evaluate(now, false))
+        Ok(self.evaluate(now, false, false))
     }
 
     /// Re-evaluate a time-based return without manufacturing a health signal.
     /// `region_caught_up` is the worker's caught-up check for this tick only.
     pub fn tick(&mut self, now: Instant, region_caught_up: bool) -> HealthUpdate {
-        self.evaluate(now, region_caught_up)
+        self.evaluate(now, region_caught_up, true)
     }
 
-    fn evaluate(&mut self, now: Instant, region_caught_up: bool) -> HealthUpdate {
+    fn evaluate(&mut self, now: Instant, region_caught_up: bool, from_tick: bool) -> HealthUpdate {
         let (previous, previous_read) = (self.selected, self.read_index());
         let window = self.policy.return_after_healthy;
 
-        if !self.buckets[self.selected].usable() {
-            // Availability wins over return hysteresis when the current bucket is
-            // gone or unverified. Pick the most-preferred usable bucket, on
-            // either side of the current index; with none, stay.
+        let current = &self.buckets[self.selected];
+        // Availability wins over return hysteresis when the current bucket is
+        // gone, or, at a worker tick, unverified. Only the tick may leave a
+        // healthy-but-unverified bucket: the worker checks buckets one at a
+        // time, so between two acks a request-path observation would see the
+        // current bucket merely awaiting its turn and jump to a more-preferred
+        // one that healed seconds ago, skipping the return window.
+        if current.state == HealthState::Unhealthy || (from_tick && !current.usable()) {
+            // Pick the most-preferred usable bucket, on either side of the
+            // current index; with none, stay.
             if let Some(index) = self.buckets.iter().position(BucketStatus::usable) {
                 self.selected = index;
             }
@@ -1248,6 +1260,52 @@ mod tests {
     }
 
     #[test]
+    fn a_simultaneous_recovery_keeps_the_write_pin_until_the_return_window() {
+        let base = Instant::now();
+        let controller = HealthController::new(2, policy(1, 300)).unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, base)
+            .unwrap();
+        controller.topology_revalidated(1).unwrap();
+        controller
+            .observe_at(0, BucketSignal::Timeout, at(base, 1))
+            .unwrap();
+        let failover = controller.worker_tick_at(at(base, 2), false);
+        assert_eq!(
+            failover.selection_change,
+            Some(SelectionChange { from: 0, to: 1 })
+        );
+        controller.apply_selection(1, || ()).unwrap();
+
+        // The node loses both buckets, and both recover in one probe round.
+        controller
+            .observe_at(1, BucketSignal::Timeout, at(base, 3))
+            .unwrap();
+        controller
+            .observe_at(0, BucketSignal::Success, at(base, 4))
+            .unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, at(base, 4))
+            .unwrap();
+        let checking = controller.worker_tick_at(at(base, 5), false);
+        assert_eq!(checking.topology_revalidation, [0, 1]);
+        assert_eq!(checking.selection_change, None);
+
+        // The worker acks bucket 0 first; a request lands before bucket 1's ack.
+        controller.topology_check_passed(0).unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, at(base, 6))
+            .unwrap();
+        controller.topology_check_passed(1).unwrap();
+        let after = controller.worker_tick_at(at(base, 7), false);
+        assert_eq!(after.selected_index, 1);
+        assert_eq!(
+            after.selection_change, None,
+            "a bucket healed seconds ago must still wait out the return window"
+        );
+    }
+
+    #[test]
     fn a_topology_blocked_region_bucket_cannot_hold_the_read_pin() {
         let base = Instant::now();
         let controller = HealthController::new(2, policy(1, 10)).unwrap();
@@ -1268,16 +1326,13 @@ mod tests {
         assert!(!controller.bucket_eligible(1).unwrap());
 
         // Startup's convergence check ran before the flap and says earned. The
-        // pin still may not land on a bucket that can be accruing repair notes.
-        controller.configure_read_affinity(1, true).unwrap();
+        // pin still may not land on a bucket that can be accruing repair notes,
+        // so startup is told not to seed it and reads never go there.
+        assert!(!controller.configure_read_affinity(1, true).unwrap());
         assert_eq!(controller.lock().health.read_pin, ReadPin::FollowWrite);
         let blocked = controller.worker_tick_at(at(base, 3), false);
-        assert_eq!(
-            blocked.read_selection_change,
-            Some(SelectionChange { from: 1, to: 0 }),
-            "reads seeded onto the region bucket move off it"
-        );
-        controller.apply_read_selection(0, || ()).unwrap();
+        assert_eq!(blocked.read_selected_index, 0);
+        assert_eq!(blocked.read_selection_change, None);
 
         // On acknowledgement it re-earns the pin through the gate.
         controller.topology_check_passed(1).unwrap();
@@ -1998,14 +2053,15 @@ mod conformance_walk {
             let every_peer_answered =
                 (0..bucket_count).all(|index| index == region || walk.up_at_boot(index));
             let converged = reachable && every_peer_answered && walk.notes.is_empty();
-            let read_index = if converged { region } else { write_index };
-            walk.controller
+            let pinned = walk
+                .controller
                 .configure_read_affinity(region, converged)
                 .unwrap();
-            // Only a converged region bucket gets the distinct read pin turned
-            // on (`seed_read_pin`, src/app.rs). Anything else leaves reads
-            // aliased to the write pin.
-            if converged {
+            let read_index = if pinned { region } else { write_index };
+            // Only a pin the controller kept earned gets the distinct read pin
+            // turned on (`seed_read_pin`, src/app.rs). Anything else leaves
+            // reads aliased to the write pin.
+            if pinned {
                 walk.read_active = true;
             }
             if read_index == region {

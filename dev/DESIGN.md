@@ -34,7 +34,9 @@ architectural work:
   event-protocol model, tests/model_event_protocol.rs): rebuilds from
   *identical* truth snapshots converge outright, while *staggered* concurrent
   rebuilds of one package can leave a stale view standing until the periodic
-  audit's fingerprint diff repairs it. So leader election can be *sloppy* — a
+  audit's fingerprint diff repairs it (one narrower dual-leader interleaving
+  can still leave the audit vouching for a stale view on content-ETag object
+  stores; tests/model_audit_fingerprint.rs). So leader election can be *sloppy* — a
   brief dual-leader window costs at worst duplicate work plus an
   audit-healed view, never lost truth — and remains a cost optimization
   (avoid duplicate LISTs/PUTs), not a correctness requirement.

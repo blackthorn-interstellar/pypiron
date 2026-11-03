@@ -53,7 +53,7 @@ assumptions about clients instead of the clients.
 | Layer | What | How it runs |
 |---|---|---|
 | Rust unit | Pure functions: rendering, parsing, normalization | `cargo test`, fast, no I/O |
-| Model checking | Every interleaving of the event protocol + replication merge, bounded | `cargo test` (`tests/model_*.rs`), deep configs nightly |
+| Model checking | Every interleaving of the event protocol, replication merge and the audit's fingerprint gate, bounded | `cargo test` (`tests/model_*.rs`), deep configs nightly |
 | Deterministic simulation | Seeded multi-node fault schedules against the real code | `cargo run --example vopr`, smoke on PR, volume nightly |
 | Blackbox integration | Real binary + real clients + real packages, disk / S3 / Azure | pytest, `integration` marker |
 | Standards conformance | PEP 503/629/691/700 behavior asserted over HTTP | pytest, part of integration |
@@ -198,6 +198,18 @@ all inside the enumerating tier's nominal scope.
   authorized delete destroys); deletes settle dead everywhere; and no record is
   left torn at a fixpoint (`quiescent_records_untorn`: no unsettled freeze,
   delete or demotion, as `classify_record` reads the cell).
+- **Audit fingerprint** (`tests/model_audit_fingerprint.rs`): the leader's
+  audit racing its own tick, which nothing mutexes. Writers land truth then a
+  commit marker (or crash between); the tick lists markers, renders, consumes;
+  the audit walks, skips on a stored fingerprint, else rebuilds with an
+  unconditional view PUT, re-lists, reads back, certifies, and re-arms what it
+  could not certify. Checked invariant: at quiescence, the view one more audit
+  leaves equals a fresh render of truth — a stored fingerprint never vouches
+  for a stale view. The pre-4b56403 audit (fingerprint whatever the post-write
+  listing shows) is the kill-proof (`old_audit_blesses_a_stale_view`, 18
+  steps); the shipped one passes with one tick. With two ticks (a dual-leader
+  window) it does not: `dual_leader_ticks_aba_the_certificate` documents a
+  residual hole, below.
 
 ### What the bounds actually are
 
@@ -207,7 +219,11 @@ comment. Replication merge: one package, two filenames, exactly two buckets,
 *truth projection* — two buckets agree on what they serve, while their
 `_quarantine/` sets may legitimately differ. Event protocol: one package, two
 files, two lease-serialized workers, and a global name index collapsed to a
-single membership bit.
+single membership bit. Audit fingerprint: one package, three writers (upload
+f0, upload f1, delete f0), one tick and three audit passes, commit markers
+only (pairing is the event model's job), the `index.html`/`index.json` pair
+written as one object, view ETags content-derived (S3/GCS: equal bytes list
+equal, the adversarial choice), transparency off, global index not modeled.
 
 Not modeled: counter rollups, the transparency chain, project status, read
 locality, concurrent mergers, and the N-bucket star composition. What backs up
@@ -217,7 +233,7 @@ conformance walk below — rather than nothing.
 
 ### The read-pin conformance walk
 
-Both models stop at the write pin and `examples/vopr.rs` has no read-affinity
+The replication and event models stop at the write pin and `examples/vopr.rs` has no read-affinity
 op, so the read pin had no mechanized adversary at all until `cc9627d` shipped
 two defects in the read-pin evaluation and both tiers missed them. The walk
 (`src/bucket_health.rs`, `mod conformance_walk`) covers that class: seeded
@@ -344,7 +360,8 @@ VOPR op exists for a subsystem on this list, treat it as uncovered — a stated
 compensating control that nothing executes is worse than a blank.
 
 The models don't get to invent the semantics they check: transitions call the
-real `worker::consumable_dirty_work` and `replicate::decide`, and two
+real `worker::consumable_dirty_work`, `replicate::decide` and
+`worker::audit_certificate` (over real `ObjectMeta` listings), and two
 conformance suites keep the rest honest — `tests/conformance_tick.rs` drives
 the real `worker::tick` against marker fixtures and asserts it consumes exactly
 what the selection rule licenses, and `conformance_execute_matches_model`
@@ -1942,8 +1959,18 @@ in-crate tests (`an_audit_*` in src/worker.rs). Re-running the row-3 harness on
 that tree, `--rotate --start-seed 770000000 --seeds 30000` with `op_tick`
 running `tokio::join!(tick, audit)` inside the lease, is green both with and
 without the fix, `--seed 770000370` included: the 27-seed census no longer
-reproduces, so the VOPR neither corroborates nor refutes the fix. The
-concurrent-audit op is still not landed (roadmap).
+reproduces, so the VOPR neither corroborates nor refutes the fix. The model
+checker now does both: `tests/model_audit_fingerprint.rs` finds the race in
+the old audit and proves the shipped one over every single-leader
+interleaving. The concurrent-audit VOPR op is therefore still not landed — it
+would shift every pinned seed and need a fresh census to add coverage the
+model already gives exhaustively (roadmap). The same model found what the fix
+leaves open, and the VOPR cannot stage it either (`tick_lock` serializes
+ticks): with two ticks in flight, the certificate's relist can list one stale
+tick's view, a fresh tick then lands the right bytes for the read-back, and the
+second stale tick re-lands the stale bytes last. On content-digest ETags the
+certified fingerprint matches that stale view, and the audit skips it until the
+package next changes (`dual_leader_ticks_aba_the_certificate`, roadmap).
 
 So class 3 **stays**, and stays honestly labelled: `--break race` closes the
 *soundness* question — the arm evaluates and prints its finding, on both

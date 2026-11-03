@@ -2456,7 +2456,8 @@ fn key_package<'a>(key: &'a str, prefix: &str) -> Option<&'a str> {
 /// carry yank/metadata changes) plus the view objects themselves (so
 /// out-of-band view deletion or tampering is also caught). Salted with the
 /// render version: a binary that renders differently must not trust another's.
-fn fingerprint(truth: &[&ObjectMeta], views: &[&ObjectMeta]) -> String {
+/// `pub` only so tests/model_audit_fingerprint.rs checks the real function.
+pub fn fingerprint(truth: &[&ObjectMeta], views: &[&ObjectMeta]) -> String {
     let mut hasher = Sha256::new();
     hasher.update(crate::render::RENDER_VERSION.to_le_bytes());
     for obj in truth.iter().chain(views.iter()) {
@@ -2512,7 +2513,16 @@ async fn certify_audit_rebuild(
 /// inside the window is the residual ABA; it renders nothing). And each
 /// package view must be present exactly when rendered, holding the rendered
 /// bytes (`read_back`, aligned with `rendered`).
-fn audit_certificate(
+///
+/// Known gap: `views` (listed) and `read_back` are taken at different instants.
+/// Under two concurrent ticks (a dual-leader window) the listing can show one
+/// tick's stale bytes, the read-back a fresh tick's, and a second stale tick can
+/// re-land the stale bytes after; with content-digest ETags the certificate
+/// then names that stale view (`dual_leader_ticks_aba_the_certificate`).
+///
+/// `pub` only so tests/model_audit_fingerprint.rs model-checks this exact
+/// decision against every interleaving with the tick.
+pub fn audit_certificate(
     pkg: &str,
     walk_truth: &str,
     truth: &[ObjectMeta],

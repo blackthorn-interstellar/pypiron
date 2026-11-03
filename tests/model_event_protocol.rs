@@ -76,7 +76,8 @@
 //! staggered list/write let a stale in-flight rebuild clobber a newer correct
 //! one, and the view permanently disagrees with truth. That is the `sloppy
 //! leader` window dev/DESIGN.md budgets for by name and leans on the periodic
-//! audit to heal; the audit is out of scope for this event-protocol model. The
+//! audit to heal; the audit is out of scope here (tests/model_audit_fingerprint.rs
+//! models it). The
 //! test `concurrent_rebuild_without_lease_diverges` reproduces and
 //! regression-guards that violation so the finding is documented, not lost —
 //! and it is the exhaustive coverage the VOPR's class-3 classifier arm rests

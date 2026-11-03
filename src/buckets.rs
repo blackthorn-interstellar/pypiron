@@ -381,9 +381,11 @@ impl BucketSet {
             index,
         });
         *self.current.write().unwrap_or_else(PoisonError::into_inner) = next.clone();
-        // Lift the read pin to the same generation (its bucket unchanged) so the
-        // two pins never diverge; harmless when the read pin will itself switch
-        // this tick. A no-op in the common mode where no read pin is active.
+        // Lift the read pin to the same generation (its bucket unchanged). The
+        // two pins are separate locks, so a reader can see them one generation
+        // apart for an instant; each `Pinned` still pairs one bucket with one
+        // generation, so that costs at most one extra cache clear, never a
+        // cross-bucket entry. A no-op when no read pin is active.
         if self.read_active.load(Ordering::Acquire) {
             Self::republish_generation(&self.read_current, generation);
         }

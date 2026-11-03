@@ -829,7 +829,7 @@ mod tests {
 
         let cas_false: Result<bool> = Ok(false);
         record_result(&controller, 1, &cas_false);
-        let first = controller.worker_tick();
+        let first = controller.worker_tick(false);
         assert_eq!(first.states[1], HealthState::Healthy);
 
         let unavailable = object_error(ObjectStoreError::Generic {
@@ -838,11 +838,17 @@ mod tests {
         });
         let failed: Result<()> = Err(unavailable);
         record_result(&controller, 1, &failed);
-        assert_eq!(controller.worker_tick().states[1], HealthState::Unhealthy);
+        assert_eq!(
+            controller.worker_tick(false).states[1],
+            HealthState::Unhealthy
+        );
 
         let cas_none: Result<Option<String>> = Ok(None);
         record_result(&controller, 1, &cas_none);
-        assert_eq!(controller.worker_tick().states[1], HealthState::Healthy);
+        assert_eq!(
+            controller.worker_tick(false).states[1],
+            HealthState::Healthy
+        );
     }
 
     #[tokio::test]
@@ -858,7 +864,7 @@ mod tests {
             .presign_get("packages/example/example.whl", Duration::from_secs(60))
             .await
             .is_err());
-        let snapshot = controller.worker_tick();
+        let snapshot = controller.worker_tick(false);
         assert_eq!(snapshot.states[1], HealthState::Unknown);
         assert_eq!(snapshot.alarms, vec![0, 0]);
         assert!(snapshot.topology_revalidation.is_empty());

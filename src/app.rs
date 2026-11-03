@@ -1413,10 +1413,12 @@ async fn run_serve(
                 health.observe(*index, bucket_health::BucketSignal::ConnectionFailure)?;
             }
         }
-        let initial = health.worker_tick();
-        if let Some(change) = initial.selection_change {
-            buckets.switch(change.to);
-            health.selection_applied(change.to)?;
+        let initial = health.worker_tick(false);
+        if let Some(change) = initial.selection_change.filter(|change| {
+            health
+                .apply_selection(change.to, || buckets.switch(change.to))
+                .is_some()
+        }) {
             warn!(
                 from = change.from,
                 to = change.to,
@@ -1481,12 +1483,10 @@ async fn run_serve(
                 // there; until they drain the region bucket is missing content,
                 // so reads follow the write pin and the worker returns them once
                 // it confirms the region caught up.
-                let write_index = buckets.pin().index;
                 let reachable = !topology.unreachable_indices.contains(&region);
                 let converged =
                     reachable && replicate::region_owed_no_notes(buckets.handles(), region).await;
-                let read_index = if converged { region } else { write_index };
-                health.configure_read_affinity(region, read_index, converged)?;
+                health.configure_read_affinity(region, converged)?;
                 if converged {
                     buckets.seed_read_pin(region);
                     info!(
@@ -1495,11 +1495,9 @@ async fn run_serve(
                         "read affinity: serving reads from region bucket"
                     );
                 } else if reachable {
-                    // `read_index` is the write pin here, which may itself BE the
-                    // region bucket when the write home was down at boot. Reads
-                    // are on it either way only as the write pin's loan, so the
-                    // sentence holds in both shapes: nothing is pinned to the
-                    // region bucket on its own account until the gate says so.
+                    // Reads follow the write pin, which may itself be the region
+                    // bucket when the write home was down at boot. Either way
+                    // nothing is pinned there until the gate says so.
                     info!(
                         region = %node.region,
                         bucket = %buckets.handles()[region].name,

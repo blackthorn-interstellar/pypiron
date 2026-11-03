@@ -299,20 +299,16 @@ async fn maintain_bucket_selection(state: &AppState) -> bool {
     let Some(health) = &state.bucket_health else {
         return false;
     };
-    // Read affinity only: when the region bucket is healthy but not yet the read
+    // Read affinity only: when the region bucket is usable but not yet the read
     // pin, a return is pending — confirm it holds no undrained repair notes
     // before the tick may move reads back to it. Never runs on the request path,
-    // and only while a return is actually pending.
-    if health.has_read_preference() {
-        match health.read_return_pending() {
-            Some(region) => {
-                let caught_up = region_bucket_caught_up(state, region).await;
-                health.set_region_caught_up(caught_up);
-            }
-            None => health.set_region_caught_up(false),
-        }
-    }
-    let mut snapshot = health.worker_tick();
+    // and only while a return is actually pending. The verdict feeds this one
+    // tick and is never stored.
+    let caught_up = match health.read_return_pending() {
+        Some(region) => region_bucket_caught_up(state, region).await,
+        None => false,
+    };
+    let mut snapshot = health.worker_tick(caught_up);
     for (index, alarms) in snapshot.alarms.iter().copied().enumerate() {
         if alarms > 0 {
             error!(bucket=%state.buckets.handles()[index].name, alarms, "bucket configuration/auth alarms (selection unchanged)");
@@ -366,7 +362,7 @@ async fn maintain_bucket_selection(state: &AppState) -> bool {
                 if !format_ok {
                     selection_blocked.insert(*index);
                     warn!(bucket=*index, "bucket storage-format not verified on recovery; selection blocked this tick");
-                } else if let Err(error) = health.topology_revalidated(*index) {
+                } else if let Err(error) = health.topology_check_passed(*index) {
                     error!(bucket=*index, error=%error, "could not acknowledge topology validation");
                 } else {
                     // A bucket just crossed unhealthy→healthy. Fire the `_repl/`
@@ -392,13 +388,15 @@ async fn maintain_bucket_selection(state: &AppState) -> bool {
         }
     }
 
+    // Each switch is published only if no observation since the snapshot has
+    // made it stale (the target failed, or recovered with an unverified stamp);
+    // a stale one is dropped and the next tick proposes afresh.
     let mut changed = false;
     if let Some(change) = snapshot.selection_change {
         if !selection_blocked.contains(&change.to) {
-            let next = state.buckets.switch(change.to);
-            if let Err(error) = health.selection_applied(change.to) {
-                error!(bucket=change.to, error=%error, "could not acknowledge bucket selection");
-            } else {
+            if let Some(next) =
+                health.apply_selection(change.to, || state.buckets.switch(change.to))
+            {
                 // These caches describe the selected bucket, not the process.
                 // Index and presign caches clear through their generation tags;
                 // reset the remaining selected-bucket views explicitly.
@@ -421,10 +419,9 @@ async fn maintain_bucket_selection(state: &AppState) -> bool {
     // presign caches); the write-scoped views cleared above are untouched.
     if let Some(read_change) = snapshot.read_selection_change {
         if !selection_blocked.contains(&read_change.to) {
-            let next = state.buckets.switch_read(read_change.to);
-            if let Err(error) = health.read_selection_applied(read_change.to) {
-                error!(bucket=read_change.to, error=%error, "could not acknowledge read bucket selection");
-            } else {
+            if let Some(next) = health
+                .apply_read_selection(read_change.to, || state.buckets.switch_read(read_change.to))
+            {
                 info!(
                     from = %state.buckets.handles()[read_change.from].name,
                     to = %state.buckets.handles()[read_change.to].name,

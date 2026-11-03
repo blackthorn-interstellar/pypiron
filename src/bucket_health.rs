@@ -6,7 +6,6 @@
 //! hysteresis, and preference policy deterministic and unit-testable without a
 //! mock runtime.
 
-use std::collections::BTreeSet;
 use std::error::Error;
 use std::fmt;
 use std::sync::{Mutex, PoisonError};
@@ -138,7 +137,38 @@ pub struct SelectionChange {
     pub to: usize,
 }
 
-/// Effects for the async caller to apply after an observation or timer tick.
+/// Where a node with a region read preference serves reads from.
+///
+/// Two states, not three. Reads that sit on the region bucket because the write
+/// pin failed over onto it are not a mode of their own: that is `FollowWrite`
+/// while the write pin happens to be there, and it ends when the write pin
+/// leaves, with nothing to remember or expire. Recording that "loan" as a flag
+/// is what let one outlive the pin twice (`cc9627d`, and a boot that recorded
+/// one as earned).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReadPin {
+    /// Reads go wherever the write pin is.
+    FollowWrite,
+    /// Reads are pinned to the region bucket, whatever the write pin does. The
+    /// bucket served the full return window and a worker caught-up check passed,
+    /// and it has stayed usable ever since.
+    Earned,
+}
+
+/// The read pin's whole transition function, over the region bucket as it is
+/// now. The pin leaves the instant the bucket stops being usable (Unhealthy, or
+/// recovered with its topology stamp unverified, which makes it ineligible for
+/// replication and so possibly owed repair notes). It enters only through the
+/// gate. Nothing else moves it.
+fn next_read_pin(pin: ReadPin, usable: bool, served_window: bool, caught_up: bool) -> ReadPin {
+    match pin {
+        ReadPin::Earned if !usable => ReadPin::FollowWrite,
+        ReadPin::FollowWrite if usable && served_window && caught_up => ReadPin::Earned,
+        pin => pin,
+    }
+}
+
+/// Effects of one observation or timer tick, for tests to assert on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct HealthUpdate {
     /// The selected *write* bucket after applying this update, changed or not.
@@ -146,21 +176,24 @@ pub(crate) struct HealthUpdate {
     /// Present only when the write selection changed.
     pub selection_change: Option<SelectionChange>,
     /// The selected *read* bucket after applying this update (equals
-    /// `selected_index` when the node has no region read preference).
+    /// `selected_index` unless the read pin is earned).
     pub read_selected_index: usize,
     /// Present only when the read selection changed.
     pub read_selection_change: Option<SelectionChange>,
-    /// Buckets that became reachable and must have their topology stamp checked
-    /// before writes rely on them. One observation produces at most one entry;
-    /// a vector keeps the wiring ready for batched probes without changing API.
-    pub topology_revalidation: Vec<usize>,
 }
 
-impl HealthUpdate {
-    #[cfg(test)]
-    pub(crate) fn has_transition(&self) -> bool {
-        self.selection_change.is_some() || !self.topology_revalidation.is_empty()
-    }
+/// Whether a bucket's topology stamp is trusted.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Topology {
+    Verified,
+    /// The bucket just became reachable: any first success while not Healthy,
+    /// `Unknown` included. Its stamp must be checked before anything relies on
+    /// it.
+    Pending,
+    /// Pending, and handed to the worker in a snapshot. Only the worker's check
+    /// of this recovery clears it; a newer recovery while the check is in flight
+    /// sets it back to `Pending`.
+    Checking,
 }
 
 #[derive(Clone, Debug)]
@@ -168,23 +201,31 @@ struct BucketStatus {
     state: HealthState,
     consecutive_failures: u32,
     healthy_since: Option<Instant>,
+    topology: Topology,
 }
 
 impl BucketStatus {
-    fn unknown() -> Self {
+    fn new(state: HealthState) -> Self {
         Self {
-            state: HealthState::Unknown,
+            state,
             consecutive_failures: 0,
             healthy_since: None,
+            topology: Topology::Verified,
         }
     }
 
-    fn selected() -> Self {
-        Self {
-            state: HealthState::Healthy,
-            consecutive_failures: 0,
-            healthy_since: None,
-        }
+    /// Healthy with a verified topology stamp: the only buckets either pin may
+    /// move onto.
+    fn usable(&self) -> bool {
+        self.state == HealthState::Healthy && self.topology == Topology::Verified
+    }
+
+    /// Usable and continuously healthy for the whole return window.
+    fn served(&self, window: Duration, now: Instant) -> bool {
+        self.usable()
+            && self
+                .healthy_since
+                .is_some_and(|since| now.saturating_duration_since(since) >= window)
     }
 }
 
@@ -201,26 +242,9 @@ pub(crate) struct BucketHealth {
     selected: usize,
     /// This node's region bucket, when one was matched at startup. `None` (no
     /// region, unlabelled buckets, or single-bucket) means reads always follow
-    /// the write selection — behaviorally identical to a node with no affinity.
+    /// the write selection, behaviorally identical to a node with no affinity.
     read_preference: Option<usize>,
-    /// The bucket reads should be served from: the region bucket while it is
-    /// usable, otherwise the write selection.
-    read_selected: usize,
-    /// Worker-supplied: whether the region bucket currently holds no undrained
-    /// replication notes. Gates *return* of reads to the region bucket; a stale
-    /// value can only keep reads on the write bucket, never send them to a
-    /// lagging one. The request path never sets this.
-    region_caught_up: bool,
-    /// Whether the read pin sits on the region bucket only because the write
-    /// selection failed over onto it, rather than by passing the health and
-    /// caught-up gate. Such a grant lasts exactly as long as the write pin does.
-    read_granted_by_failover: bool,
-    /// Controller-supplied: whether the region bucket is currently awaiting
-    /// topology re-verification. Kept beside the pure machine rather than read
-    /// across from [`ControllerState`] so `evaluate_read` stays synchronous and
-    /// unit-testable; [`ControllerState::sync_region_topology_blocked`] is the
-    /// single writer.
-    region_topology_blocked: bool,
+    read_pin: ReadPin,
 }
 
 /// One worker-cycle view of health observed by request and worker threads.
@@ -228,18 +252,18 @@ pub(crate) struct BucketHealth {
 pub struct WorkerHealthSnapshot {
     pub selected_index: usize,
     /// Coalesces observations into the one switch the worker needs to apply.
-    /// Repeated until [`HealthController::selection_applied`] acknowledges it.
+    /// Repeated until [`HealthController::apply_selection`] publishes it.
     pub selection_change: Option<SelectionChange>,
     /// The read bucket this node should serve reads from (equals
     /// `selected_index` when the node has no region read preference).
     pub read_selected_index: usize,
     /// The one read-pin switch the worker needs to apply, repeated until
-    /// [`HealthController::read_selection_applied`] acknowledges it.
+    /// [`HealthController::apply_read_selection`] publishes it.
     pub read_selection_change: Option<SelectionChange>,
     pub states: Vec<HealthState>,
-    /// Sorted, deduplicated, and repeated until acknowledged. The worker must
-    /// validate these topology stamps before it applies a selection that depends
-    /// on a recovered bucket.
+    /// Sorted and repeated until acknowledged by
+    /// [`HealthController::topology_check_passed`]. No pin moves onto one of
+    /// these buckets until its stamp is checked.
     pub topology_revalidation: Vec<usize>,
     /// Ignored/alarm observations since the previous worker tick, per bucket.
     /// These never affect selection; they exist for logs and metrics.
@@ -249,32 +273,11 @@ pub struct WorkerHealthSnapshot {
 struct ControllerState {
     health: BucketHealth,
     applied_selected: usize,
-    /// The read bucket the worker has actually applied to the [`BucketSet`]. Like
-    /// `applied_selected`, a read selection is repeated in every snapshot until
-    /// [`HealthController::read_selection_applied`] acknowledges it.
+    /// The read bucket actually published to the [`BucketSet`]. Like
+    /// `applied_selected`, a read switch is repeated in every snapshot until
+    /// [`HealthController::apply_read_selection`] publishes it.
     applied_read_selected: usize,
-    topology_revalidation: BTreeSet<usize>,
-    /// Recovered buckets remain ineligible until their topology stamp passes.
-    /// This must live beside the selector: a worker-local skip leaves the pure
-    /// state machine pointed at the rejected candidate and strands later
-    /// failover when the actually selected bucket dies.
-    topology_blocked: BTreeSet<usize>,
     alarms: Vec<u64>,
-}
-
-impl ControllerState {
-    /// Publish the region bucket's topology-block state into the pure machine
-    /// before it re-evaluates. The two live in different structs because
-    /// `BucketHealth` deliberately knows nothing about topology I/O; this is the
-    /// one bit of it the read pin has to respect, so it is copied rather than
-    /// reached for.
-    fn sync_region_topology_blocked(&mut self) {
-        let blocked = self
-            .health
-            .read_preference
-            .is_some_and(|region| self.topology_blocked.contains(&region));
-        self.health.region_topology_blocked = blocked;
-    }
 }
 
 /// Thread-safe bridge between real storage traffic and the async worker.
@@ -294,8 +297,6 @@ impl HealthController {
                 health: BucketHealth::new(bucket_count, policy)?,
                 applied_selected: 0,
                 applied_read_selected: 0,
-                topology_revalidation: BTreeSet::new(),
-                topology_blocked: BTreeSet::new(),
                 alarms: vec![0; bucket_count],
             }),
         })
@@ -322,11 +323,13 @@ impl HealthController {
         self.observe_at(index, signal, Instant::now())
     }
 
-    /// Advance return hysteresis and snapshot pending work. Storage switching
-    /// and topology validation happen after this returns and remain pending until
-    /// their acknowledgement methods succeed.
-    pub fn worker_tick(&self) -> WorkerHealthSnapshot {
-        self.worker_tick_at(Instant::now())
+    /// Advance return hysteresis and snapshot pending work. `region_caught_up`
+    /// is the worker's fresh caught-up check of [`Self::read_return_pending`]'s
+    /// bucket, and is consumed by this tick alone. Storage switching and
+    /// topology validation happen after this returns and stay pending until
+    /// they are published or acknowledged.
+    pub fn worker_tick(&self, region_caught_up: bool) -> WorkerHealthSnapshot {
+        self.worker_tick_at(Instant::now(), region_caught_up)
     }
 
     #[cfg(test)]
@@ -341,97 +344,113 @@ impl HealthController {
 
     /// Whether background data-plane maintenance may touch this bucket.
     ///
-    /// `Unknown` is eligible when no topology validation is pending: startup
-    /// verifies the configured topology before the worker starts, and an idle
-    /// member may not yet have produced an ordinary health observation. A bucket
-    /// that crossed through `Unhealthy`, however, is blocked on its first success
-    /// until the recovered topology stamp is explicitly acknowledged.
+    /// `Unknown` is eligible: startup verifies the configured topology before
+    /// the worker starts, and an idle member may not yet have produced an
+    /// ordinary health observation. Any first success while not Healthy
+    /// (`Unknown` included) blocks the bucket until its topology stamp is
+    /// acknowledged; startup acknowledges the ones its own verification raises.
     pub fn bucket_eligible(&self, index: usize) -> Result<bool, InvalidBucket> {
         let state = self.lock();
         let bucket = state.health.buckets.get(index).ok_or(InvalidBucket {
             index,
             bucket_count: state.health.buckets.len(),
         })?;
-        Ok(bucket.state != HealthState::Unhealthy && !state.topology_blocked.contains(&index))
+        Ok(bucket.state != HealthState::Unhealthy && bucket.topology == Topology::Verified)
     }
 
-    /// Confirm that the worker applied the desired selection. Until this ack,
-    /// every snapshot repeats the transition so a failed topology check or
-    /// storage switch cannot lose it.
-    pub fn selection_applied(&self, index: usize) -> Result<(), InvalidBucket> {
-        self.validate_bucket(index)?;
-        self.lock().applied_selected = index;
-        Ok(())
+    /// Publish the write switch a snapshot proposed. The check and `publish` run
+    /// under the lock every observation takes, so an observation that lands
+    /// between snapshot and publication (the target failed, or recovered with an
+    /// unverified stamp, or the selection moved on) cannot be overwritten by the
+    /// stale proposal: nothing is published, and the next snapshot proposes
+    /// afresh. Returns `publish`'s result, or `None` when the proposal was stale.
+    pub fn apply_selection<T>(&self, to: usize, publish: impl FnOnce() -> T) -> Option<T> {
+        let mut state = self.lock();
+        let wanted = state.health.selected == to && state.health.usable(to);
+        wanted.then(|| {
+            state.applied_selected = to;
+            publish()
+        })
     }
 
-    /// Seed this node's region read preference and where its read pin starts.
-    /// Called once at startup; a node with no region match never calls this and
-    /// its read selection stays equal to the write selection forever.
+    /// [`Self::apply_selection`] for the read switch.
+    pub fn apply_read_selection<T>(&self, to: usize, publish: impl FnOnce() -> T) -> Option<T> {
+        let mut state = self.lock();
+        let wanted = state.health.read_index() == to && state.health.usable(to);
+        wanted.then(|| {
+            state.applied_read_selected = to;
+            publish()
+        })
+    }
+
+    /// Seed this node's region read preference. Called once at startup; a node
+    /// with no region match never calls this and its reads follow the write
+    /// selection forever.
     ///
-    /// `earned` is startup's convergence verdict — whether the region bucket
-    /// proved it holds the whole corpus. It is not decoration: when the write
-    /// pin has failed over ONTO the region bucket, `read_selected` lands on the
-    /// region bucket whatever that verdict says, and only `earned` distinguishes
-    /// a pin that passed the drain gate from one that is simply riding the write
-    /// pin. See [`BucketHealth::set_read_affinity`].
+    /// `earned` is startup's convergence verdict, and it is the only thing that
+    /// pins reads to the region bucket: a node that booted with its write home
+    /// down may already be reading from the region bucket, but only because the
+    /// write pin is there, and those reads leave with it.
     pub fn configure_read_affinity(
         &self,
         preference: usize,
-        read_selected: usize,
         earned: bool,
     ) -> Result<(), InvalidBucket> {
         self.validate_bucket(preference)?;
-        self.validate_bucket(read_selected)?;
         let mut state = self.lock();
-        state
-            .health
-            .set_read_affinity(preference, read_selected, earned);
-        state.applied_read_selected = read_selected;
+        state.health.set_read_affinity(preference, earned);
+        // What startup publishes: `seed_read_pin` only for an earned pin;
+        // otherwise reads alias the write pin.
+        state.applied_read_selected = if earned {
+            preference
+        } else {
+            state.applied_selected
+        };
         Ok(())
-    }
-
-    /// Whether this node has a region read preference at all. False for a node
-    /// that matched no bucket, so the worker skips read-affinity maintenance
-    /// entirely (its reads follow the write pin natively).
-    pub fn has_read_preference(&self) -> bool {
-        self.lock().health.read_preference.is_some()
-    }
-
-    /// Feed the worker's caught-up determination into the pure state machine.
-    /// Only ever gates *return* of reads to the region bucket.
-    pub fn set_region_caught_up(&self, caught_up: bool) {
-        self.lock().health.region_caught_up = caught_up;
     }
 
     /// The region bucket when checking whether reads may return to it is
-    /// worthwhile: a region preference exists, that bucket is Healthy and
-    /// topology-eligible, and reads are not already served from it. `None`
-    /// otherwise, so the worker runs the caught-up LIST only when it matters.
+    /// worthwhile: a region preference exists, that bucket is usable, and reads
+    /// are not already served from it. `None` otherwise, so the worker runs the
+    /// caught-up LIST only when it matters.
     pub fn read_return_pending(&self) -> Option<usize> {
         let state = self.lock();
         let region = state.health.read_preference?;
-        if state.applied_read_selected == region {
-            return None;
-        }
-        let healthy =
-            state.health.buckets.get(region).map(|b| b.state) == Some(HealthState::Healthy);
-        (healthy && !state.topology_blocked.contains(&region)).then_some(region)
+        (state.applied_read_selected != region && state.health.usable(region)).then_some(region)
     }
 
-    /// Confirm that the worker applied the desired read selection.
-    pub fn read_selection_applied(&self, index: usize) -> Result<(), InvalidBucket> {
-        self.validate_bucket(index)?;
-        self.lock().applied_read_selected = index;
-        Ok(())
-    }
-
-    /// Confirm one recovered bucket's topology stamp. Pending validation is
-    /// repeated in every snapshot until this ack, so transient failures retry.
+    /// Trust a bucket's topology stamp because the caller verified it after the
+    /// bucket's latest recovery: startup, whose verification I/O is what
+    /// observed the recovery. The worker acknowledges through
+    /// [`Self::topology_check_passed`] instead.
     pub fn topology_revalidated(&self, index: usize) -> Result<(), InvalidBucket> {
-        self.validate_bucket(index)?;
+        self.with_bucket(index, |bucket| bucket.topology = Topology::Verified)
+    }
+
+    /// Acknowledge a worker check of a bucket a snapshot listed. If the bucket
+    /// recovered again while the check was in flight, the check may have read
+    /// the stamp before that recovery, so it stays pending for the next
+    /// snapshot to re-list.
+    pub fn topology_check_passed(&self, index: usize) -> Result<(), InvalidBucket> {
+        self.with_bucket(index, |bucket| {
+            if bucket.topology == Topology::Checking {
+                bucket.topology = Topology::Verified;
+            }
+        })
+    }
+
+    fn with_bucket(
+        &self,
+        index: usize,
+        update: impl FnOnce(&mut BucketStatus),
+    ) -> Result<(), InvalidBucket> {
         let mut state = self.lock();
-        state.topology_revalidation.remove(&index);
-        state.topology_blocked.remove(&index);
+        let bucket_count = state.health.buckets.len();
+        let bucket = state.health.buckets.get_mut(index).ok_or(InvalidBucket {
+            index,
+            bucket_count,
+        })?;
+        update(bucket);
         Ok(())
     }
 
@@ -442,60 +461,30 @@ impl HealthController {
         now: Instant,
     ) -> Result<(), InvalidBucket> {
         let mut state = self.lock();
-        state.sync_region_topology_blocked();
-        let update = state.health.observe(index, signal, now)?;
-        state
-            .topology_revalidation
-            .extend(update.topology_revalidation.iter().copied());
-        state.topology_blocked.extend(update.topology_revalidation);
+        state.health.observe(index, signal, now)?;
         if classify(signal) == SignalClass::Ignored {
             state.alarms[index] = state.alarms[index].saturating_add(1);
         }
         Ok(())
     }
 
-    fn worker_tick_at(&self, now: Instant) -> WorkerHealthSnapshot {
+    fn worker_tick_at(&self, now: Instant, region_caught_up: bool) -> WorkerHealthSnapshot {
         let mut state = self.lock();
-        state.sync_region_topology_blocked();
-        state.health.tick(now);
+        state.health.tick(now, region_caught_up);
 
-        // `BucketHealth` deliberately knows nothing about topology I/O. If it
-        // chose a recovered-but-unvalidated candidate, resolve the desired
-        // selection here and feed that choice back into the state machine.
-        if state.topology_blocked.contains(&state.health.selected) {
-            let fallback = state
-                .health
-                .buckets
-                .iter()
-                .enumerate()
-                .find(|(index, bucket)| {
-                    bucket.state == HealthState::Healthy && !state.topology_blocked.contains(index)
-                })
-                .map(|(index, _)| index)
-                .unwrap_or(state.applied_selected);
-            state.health.selected = fallback;
-        }
-
-        let selected_index = state.health.selected_index();
+        let selected_index = state.health.selected;
         let selection_change =
             (selected_index != state.applied_selected).then_some(SelectionChange {
                 from: state.applied_selected,
                 to: selected_index,
             });
 
-        // Read selection: only a node with a region preference maintains a
-        // distinct read pin. Without one, reads follow the write pin natively
-        // (BucketSet::read_pin aliases pin), so never emit a read switch — that
-        // would double-bump the shared generation on every write failover. With a
-        // preference, take the pure machine's choice, but a topology-blocked
-        // region bucket falls back to the write selection just like a write
-        // candidate does above (a recovered stamp is not yet trustworthy).
+        // Without a region preference reads alias the write pin natively
+        // (BucketSet::read_pin), so never emit a read switch: it would
+        // double-bump the shared generation on every write failover.
         let (read_selected_index, read_selection_change) = if state.health.read_preference.is_some()
         {
-            let mut index = state.health.read_selected;
-            if state.topology_blocked.contains(&index) {
-                index = selected_index;
-            }
+            let index = state.health.read_index();
             let change = (index != state.applied_read_selected).then_some(SelectionChange {
                 from: state.applied_read_selected,
                 to: index,
@@ -505,7 +494,13 @@ impl HealthController {
             (selected_index, None)
         };
 
-        let topology_revalidation = state.topology_revalidation.iter().copied().collect();
+        let mut topology_revalidation = Vec::new();
+        for (index, bucket) in state.health.buckets.iter_mut().enumerate() {
+            if bucket.topology != Topology::Verified {
+                bucket.topology = Topology::Checking;
+                topology_revalidation.push(index);
+            }
+        }
         let alarms = state.alarms.clone();
         state.alarms.fill(0);
         let states = state
@@ -540,48 +535,44 @@ impl BucketHealth {
             return Err(HealthConfigError::ZeroLeaveThreshold);
         }
 
-        let mut buckets = vec![BucketStatus::unknown(); bucket_count];
-        buckets[0] = BucketStatus::selected();
+        let mut buckets = vec![BucketStatus::new(HealthState::Unknown); bucket_count];
+        buckets[0] = BucketStatus::new(HealthState::Healthy);
         Ok(Self {
             policy,
             buckets,
             selected: 0,
             read_preference: None,
-            read_selected: 0,
-            region_caught_up: false,
-            read_granted_by_failover: false,
-            region_topology_blocked: false,
+            read_pin: ReadPin::FollowWrite,
         })
     }
 
-    pub fn selected_index(&self) -> usize {
+    #[cfg(test)]
+    fn selected_index(&self) -> usize {
         self.selected
     }
 
-    #[cfg(test)]
-    pub fn read_selected_index(&self) -> usize {
-        self.read_selected
+    /// The bucket reads are served from.
+    fn read_index(&self) -> usize {
+        match (self.read_preference, self.read_pin) {
+            (Some(region), ReadPin::Earned) => region,
+            _ => self.selected,
+        }
     }
 
-    /// Seed the node's region read preference and the bucket reads start from.
-    /// Called once at startup; `read_selected` is where the read pin was seeded
-    /// (the region bucket if reachable AND converged, else the write selection).
-    ///
-    /// Those two can be the same bucket. When the write home is down at boot the
-    /// write pin fails over onto the region bucket, so an *unconverged* node
-    /// still starts with `read_selected == preference` — reads sitting on a
-    /// bucket that never passed the drain gate. Recording that as an earned pin
-    /// is the startup form of the defect `cc9627d` fixed at runtime: the write
-    /// pin later goes home, `evaluate_read` finds no loan to expire, and the
-    /// read pin never moves again — so the worker never proposes a read switch,
-    /// `BucketSet` never activates read affinity, and the node silently serves
-    /// every read from the write bucket for the rest of the process. Marking it
-    /// as the loan it is hands it straight to the machinery that already knows
-    /// what to do with one.
-    fn set_read_affinity(&mut self, preference: usize, read_selected: usize, earned: bool) {
+    fn usable(&self, index: usize) -> bool {
+        self.buckets.get(index).is_some_and(BucketStatus::usable)
+    }
+
+    /// Seed the node's region read preference. Only startup's convergence
+    /// verdict earns the pin, and only onto a usable bucket.
+    fn set_read_affinity(&mut self, preference: usize, earned: bool) {
         self.read_preference = Some(preference);
-        self.read_selected = read_selected;
-        self.read_granted_by_failover = read_selected == preference && !earned;
+        let pin = if earned {
+            ReadPin::Earned
+        } else {
+            ReadPin::FollowWrite
+        };
+        self.read_pin = next_read_pin(pin, self.usable(preference), false, false);
     }
 
     #[cfg(test)]
@@ -589,7 +580,9 @@ impl BucketHealth {
         self.buckets.get(index).map(|bucket| bucket.state)
     }
 
-    /// Apply one observation, then re-evaluate selection.
+    /// Apply one observation, then re-evaluate selection. The request path never
+    /// has a fresh caught-up check, so it can demote the read pin but never earn
+    /// it.
     pub fn observe(
         &mut self,
         index: usize,
@@ -601,18 +594,16 @@ impl BucketHealth {
             index,
             bucket_count,
         })?;
-        let mut topology_revalidation = Vec::new();
 
         match classify(signal) {
             SignalClass::Healthy => {
-                let became_reachable = bucket.state != HealthState::Healthy;
+                if bucket.state != HealthState::Healthy {
+                    bucket.topology = Topology::Pending;
+                }
                 bucket.state = HealthState::Healthy;
                 bucket.consecutive_failures = 0;
                 if bucket.healthy_since.is_none() {
                     bucket.healthy_since = Some(now);
-                }
-                if became_reachable {
-                    topology_revalidation.push(index);
                 }
             }
             SignalClass::AvailabilityFailure => {
@@ -625,123 +616,59 @@ impl BucketHealth {
             SignalClass::Ignored => {}
         }
 
-        Ok(self.evaluate(now, topology_revalidation))
+        Ok(self.evaluate(now, false))
     }
 
     /// Re-evaluate a time-based return without manufacturing a health signal.
-    pub fn tick(&mut self, now: Instant) -> HealthUpdate {
-        self.evaluate(now, Vec::new())
+    /// `region_caught_up` is the worker's caught-up check for this tick only.
+    pub fn tick(&mut self, now: Instant, region_caught_up: bool) -> HealthUpdate {
+        self.evaluate(now, region_caught_up)
     }
 
-    fn evaluate(&mut self, now: Instant, topology_revalidation: Vec<usize>) -> HealthUpdate {
-        let previous = self.selected;
-        let previous_read = self.read_selected;
+    fn evaluate(&mut self, now: Instant, region_caught_up: bool) -> HealthUpdate {
+        let (previous, previous_read) = (self.selected, self.read_index());
+        let window = self.policy.return_after_healthy;
 
-        if self.buckets[self.selected].state == HealthState::Unhealthy {
+        if !self.buckets[self.selected].usable() {
             // Availability wins over return hysteresis when the current bucket is
-            // gone. Pick the most-preferred bucket this node currently knows is
-            // healthy, regardless of which side of the current index it sits on.
-            if let Some(index) = self
-                .buckets
-                .iter()
-                .position(|bucket| bucket.state == HealthState::Healthy)
-            {
+            // gone or unverified. Pick the most-preferred usable bucket, on
+            // either side of the current index; with none, stay.
+            if let Some(index) = self.buckets.iter().position(BucketStatus::usable) {
                 self.selected = index;
             }
-        } else {
+        } else if let Some(index) = self.buckets[..self.selected]
+            .iter()
+            .position(|bucket| bucket.served(window, now))
+        {
             // The current bucket still works. A more-preferred bucket must prove
             // continuous health for the much longer return window before we move.
-            if let Some(index) = (0..self.selected).find(|&index| {
-                let bucket = &self.buckets[index];
-                bucket.state == HealthState::Healthy
-                    && bucket.healthy_since.is_some_and(|since| {
-                        now.saturating_duration_since(since) >= self.policy.return_after_healthy
-                    })
-            }) {
-                self.selected = index;
-            }
+            self.selected = index;
         }
 
-        self.evaluate_read(now);
+        if let Some(bucket) = self
+            .read_preference
+            .and_then(|region| self.buckets.get(region))
+        {
+            self.read_pin = next_read_pin(
+                self.read_pin,
+                bucket.usable(),
+                bucket.served(window, now),
+                region_caught_up,
+            );
+        }
 
+        let read = self.read_index();
         HealthUpdate {
             selected_index: self.selected,
             selection_change: (self.selected != previous).then_some(SelectionChange {
                 from: previous,
                 to: self.selected,
             }),
-            read_selected_index: self.read_selected,
-            read_selection_change: (self.read_selected != previous_read).then_some(
-                SelectionChange {
-                    from: previous_read,
-                    to: self.read_selected,
-                },
-            ),
-            topology_revalidation,
-        }
-    }
-
-    /// Choose the read bucket, on top of the just-computed write selection.
-    ///
-    /// The region bucket serves reads only while it is Healthy; it is abandoned
-    /// the instant it fails its availability streak (the same rule the write pin
-    /// uses to leave), and reads fall back to the write selection. Returning to
-    /// it is deliberately slow: it must prove continuous health for the full
-    /// return window *and* the worker must have confirmed it is caught up. While
-    /// the region bucket is also the write selection the caught-up gate is moot —
-    /// the write home is truth by definition — but that grant is a loan, not a
-    /// return: it is surrendered when the write pin goes home, and those reads
-    /// re-enter the drain gate. Only a pin earned through the gate survives a
-    /// write failover round trip.
-    fn evaluate_read(&mut self, now: Instant) {
-        let Some(region) = self.read_preference else {
-            self.read_selected = self.selected;
-            return;
-        };
-        if self.read_selected == region {
-            // A failover grant is a loan from the write pin: it ends when the
-            // write pin goes home, because the region bucket may owe repair notes
-            // from before the outage. An earned pin is not a loan.
-            let loan_expired = self.read_granted_by_failover && region != self.selected;
-            // A bucket whose topology stamp is being re-verified is not eligible
-            // for background replication (`bucket_eligible`, this file), so it
-            // can be accruing repair notes right now — and the worker is already
-            // steering the applied pin off it (`worker_tick_at`, below). Fail
-            // closed and demote here too, so the pure machine agrees instead of
-            // retaining an ungated pin that the ack silently re-applies. On ack
-            // it re-earns through the drain gate like anything else.
-            if self.buckets[region].state == HealthState::Unhealthy
-                || loan_expired
-                || self.region_topology_blocked
-            {
-                self.read_selected = self.selected;
-                // A dead or blocked region bucket that is also the write
-                // selection has nowhere to demote to: reads stay on it, so the
-                // pin is (re)marked as a loan — even one that was earned, which
-                // costs an extra return-window round trip later. Fail closed:
-                // whatever this bucket missed while dead or unverified, the
-                // gate re-checks before the pin counts as earned again.
-                self.read_granted_by_failover = self.read_selected == region;
-                // The worker only refreshes its caught-up verdict while a return
-                // is pending, so the pre-demotion value is stale by construction.
-                // Drop it, or the gate could pass before the first fresh probe.
-                self.region_caught_up = false;
-            }
-            return;
-        }
-        let status = &self.buckets[region];
-        let healthy_for_window = status.state == HealthState::Healthy
-            && status.healthy_since.is_some_and(|since| {
-                now.saturating_duration_since(since) >= self.policy.return_after_healthy
-            });
-        if healthy_for_window && self.region_caught_up {
-            self.read_selected = region;
-            self.read_granted_by_failover = false;
-        } else if region == self.selected {
-            self.read_selected = region;
-            self.read_granted_by_failover = true;
-        } else {
-            self.read_selected = self.selected;
+            read_selected_index: read,
+            read_selection_change: (read != previous_read).then_some(SelectionChange {
+                from: previous_read,
+                to: read,
+            }),
         }
     }
 }
@@ -756,6 +683,14 @@ mod tests {
 
     fn policy(failures: u32, healthy_secs: u64) -> HealthPolicy {
         HealthPolicy::new(failures, Duration::from_secs(healthy_secs)).unwrap()
+    }
+
+    /// A success whose topology check passes, as startup and the worker
+    /// acknowledge it. The update is the observation's, before the ack.
+    fn heal(health: &mut BucketHealth, index: usize, now: Instant) -> HealthUpdate {
+        let update = health.observe(index, BucketSignal::Success, now).unwrap();
+        health.buckets[index].topology = Topology::Verified;
+        update
     }
 
     #[test]
@@ -819,7 +754,7 @@ mod tests {
     fn leaves_only_after_consecutive_availability_failures() {
         let now = Instant::now();
         let mut health = BucketHealth::new(2, policy(3, 60)).unwrap();
-        health.observe(1, BucketSignal::Success, now).unwrap();
+        heal(&mut health, 1, now);
 
         for signal in [
             BucketSignal::Timeout,
@@ -846,9 +781,9 @@ mod tests {
     fn success_resets_the_failure_streak() {
         let now = Instant::now();
         let mut health = BucketHealth::new(2, policy(2, 60)).unwrap();
-        health.observe(1, BucketSignal::Success, now).unwrap();
+        heal(&mut health, 1, now);
         health.observe(0, BucketSignal::Timeout, now).unwrap();
-        health.observe(0, BucketSignal::Success, now).unwrap();
+        heal(&mut health, 0, now);
 
         let update = health
             .observe(0, BucketSignal::ConnectionFailure, now)
@@ -861,8 +796,8 @@ mod tests {
     fn failover_chooses_the_most_preferred_known_healthy_bucket() {
         let now = Instant::now();
         let mut health = BucketHealth::new(3, policy(1, 60)).unwrap();
-        health.observe(2, BucketSignal::Success, now).unwrap();
-        health.observe(1, BucketSignal::Success, now).unwrap();
+        heal(&mut health, 2, now);
+        heal(&mut health, 1, now);
 
         let update = health.observe(0, BucketSignal::Timeout, now).unwrap();
         assert_eq!(update.selected_index, 1);
@@ -887,18 +822,15 @@ mod tests {
     fn return_requires_continuous_health_for_the_full_window() {
         let now = Instant::now();
         let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
-        health.observe(1, BucketSignal::Success, now).unwrap();
+        heal(&mut health, 1, now);
         health.observe(0, BucketSignal::Timeout, now).unwrap();
         assert_eq!(health.selected_index(), 1);
 
-        let recovered = health
-            .observe(0, BucketSignal::Success, at(now, 1))
-            .unwrap();
+        let recovered = heal(&mut health, 0, at(now, 1));
         assert_eq!(recovered.selected_index, 1);
-        assert_eq!(recovered.topology_revalidation, vec![0]);
-        assert_eq!(health.tick(at(now, 10)).selection_change, None);
+        assert_eq!(health.tick(at(now, 10), false).selection_change, None);
 
-        let returned = health.tick(at(now, 11));
+        let returned = health.tick(at(now, 11), false);
         assert_eq!(returned.selected_index, 0);
         assert_eq!(
             returned.selection_change,
@@ -910,41 +842,35 @@ mod tests {
     fn a_flap_restarts_the_return_window_and_does_not_oscillate() {
         let now = Instant::now();
         let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
-        health.observe(1, BucketSignal::Success, now).unwrap();
+        heal(&mut health, 1, now);
         health.observe(0, BucketSignal::Timeout, now).unwrap();
-        health
-            .observe(0, BucketSignal::Success, at(now, 1))
-            .unwrap();
+        heal(&mut health, 0, at(now, 1));
 
         health
             .observe(0, BucketSignal::Timeout, at(now, 8))
             .unwrap();
-        health
-            .observe(0, BucketSignal::Success, at(now, 9))
-            .unwrap();
-        assert_eq!(health.tick(at(now, 18)).selected_index, 1);
+        heal(&mut health, 0, at(now, 9));
+        assert_eq!(health.tick(at(now, 18), false).selected_index, 1);
 
-        let returned = health.tick(at(now, 19));
+        let returned = health.tick(at(now, 19), false);
         assert_eq!(returned.selected_index, 0);
         assert_eq!(
             returned.selection_change,
             Some(SelectionChange { from: 1, to: 0 })
         );
-        assert_eq!(health.tick(at(now, 30)).selection_change, None);
+        assert_eq!(health.tick(at(now, 30), false).selection_change, None);
     }
 
     #[test]
     fn a_dead_selected_bucket_can_use_a_recovered_preferred_bucket_immediately() {
         let now = Instant::now();
         let mut health = BucketHealth::new(3, policy(1, 60)).unwrap();
-        health.observe(1, BucketSignal::Success, now).unwrap();
-        health.observe(2, BucketSignal::Success, now).unwrap();
+        heal(&mut health, 1, now);
+        heal(&mut health, 2, now);
         health.observe(0, BucketSignal::Timeout, now).unwrap();
         assert_eq!(health.selected_index(), 1);
 
-        health
-            .observe(0, BucketSignal::Success, at(now, 1))
-            .unwrap();
+        heal(&mut health, 0, at(now, 1));
         assert_eq!(
             health.selected_index(),
             1,
@@ -966,23 +892,25 @@ mod tests {
         let now = Instant::now();
         let mut health = BucketHealth::new(2, policy(1, 60)).unwrap();
 
-        let first = health.observe(1, BucketSignal::Success, now).unwrap();
-        assert_eq!(first.topology_revalidation, vec![1]);
-        assert!(first.has_transition());
+        let pending = |health: &BucketHealth| health.buckets[1].topology == Topology::Pending;
 
-        let steady = health
+        // Unknown -> Healthy counts: any first success while not Healthy.
+        health.observe(1, BucketSignal::Success, now).unwrap();
+        assert!(pending(&health));
+        health.buckets[1].topology = Topology::Verified;
+
+        health
             .observe(1, BucketSignal::Success, at(now, 1))
             .unwrap();
-        assert!(steady.topology_revalidation.is_empty());
-        assert!(!steady.has_transition());
+        assert!(!pending(&health), "a steady success raises nothing");
 
         health
             .observe(1, BucketSignal::HttpStatus(500), at(now, 2))
             .unwrap();
-        let healed = health
+        health
             .observe(1, BucketSignal::Success, at(now, 3))
             .unwrap();
-        assert_eq!(healed.topology_revalidation, vec![1]);
+        assert!(pending(&health));
     }
 
     #[test]
@@ -1015,7 +943,7 @@ mod tests {
             .observe_at(0, BucketSignal::ConnectionFailure, now)
             .unwrap();
 
-        let snapshot = controller.worker_tick_at(now);
+        let snapshot = controller.worker_tick_at(now, false);
         assert_eq!(snapshot.selected_index, 0);
         assert_eq!(snapshot.selection_change, None);
         assert_eq!(
@@ -1025,19 +953,19 @@ mod tests {
         assert_eq!(snapshot.topology_revalidation, vec![1]);
         assert_eq!(snapshot.alarms, vec![0, 0]);
 
-        let pending = controller.worker_tick_at(at(now, 1));
+        let pending = controller.worker_tick_at(at(now, 1), false);
         assert_eq!(pending.selection_change, snapshot.selection_change);
         assert_eq!(pending.topology_revalidation, vec![1]);
 
         controller.topology_revalidated(1).unwrap();
-        let ready = controller.worker_tick_at(at(now, 2));
+        let ready = controller.worker_tick_at(at(now, 2), false);
         assert_eq!(ready.selected_index, 1);
         assert_eq!(
             ready.selection_change,
             Some(SelectionChange { from: 0, to: 1 })
         );
-        controller.selection_applied(1).unwrap();
-        let quiet = controller.worker_tick_at(at(now, 2));
+        controller.apply_selection(1, || ()).unwrap();
+        let quiet = controller.worker_tick_at(at(now, 2), false);
         assert_eq!(quiet.selection_change, None);
         assert!(quiet.topology_revalidation.is_empty());
     }
@@ -1060,11 +988,11 @@ mod tests {
             .observe_at(1, BucketSignal::Success, now)
             .unwrap();
 
-        let snapshot = controller.worker_tick_at(now);
+        let snapshot = controller.worker_tick_at(now, false);
         assert_eq!(snapshot.topology_revalidation, vec![1]);
         assert_eq!(snapshot.alarms, vec![0, 2]);
         controller.topology_revalidated(1).unwrap();
-        assert_eq!(controller.worker_tick_at(now).alarms, vec![0, 0]);
+        assert_eq!(controller.worker_tick_at(now, false).alarms, vec![0, 0]);
     }
 
     #[test]
@@ -1081,19 +1009,19 @@ mod tests {
         controller
             .observe_at(0, BucketSignal::Timeout, now)
             .unwrap();
-        let to_b = controller.worker_tick_at(now);
+        let to_b = controller.worker_tick_at(now, false);
         assert_eq!(
             to_b.selection_change,
             Some(SelectionChange { from: 0, to: 1 })
         );
-        controller.selection_applied(1).unwrap();
+        controller.apply_selection(1, || ()).unwrap();
 
         // A recovers long enough to be preferred, but its topology check is
         // deliberately never acknowledged (the worker saw a mismatch).
         controller
             .observe_at(0, BucketSignal::Success, at(now, 1))
             .unwrap();
-        let rejected = controller.worker_tick_at(at(now, 11));
+        let rejected = controller.worker_tick_at(at(now, 11), false);
         assert_eq!(rejected.selected_index, 1);
         assert_eq!(rejected.topology_revalidation, vec![0]);
         assert!(!controller.bucket_eligible(0).unwrap());
@@ -1104,7 +1032,7 @@ mod tests {
         controller
             .observe_at(1, BucketSignal::Timeout, at(now, 12))
             .unwrap();
-        let to_c = controller.worker_tick_at(at(now, 12));
+        let to_c = controller.worker_tick_at(at(now, 12), false);
         assert_eq!(
             to_c.selection_change,
             Some(SelectionChange { from: 1, to: 2 })
@@ -1157,7 +1085,7 @@ mod tests {
             thread.join().unwrap();
         }
 
-        let snapshot = controller.worker_tick();
+        let snapshot = controller.worker_tick(false);
         assert_eq!(snapshot.alarms, vec![0, 800]);
         assert_eq!(snapshot.selected_index, 0);
     }
@@ -1168,18 +1096,16 @@ mod tests {
         // The node's region is the non-preferred bucket (index 1); reads start
         // following the write selection (bucket 0).
         let mut health = BucketHealth::new(2, policy(3, 10)).unwrap();
-        health.set_read_affinity(1, 0, true);
-        health.observe(1, BucketSignal::Success, base).unwrap();
+        health.set_read_affinity(1, false);
+        heal(&mut health, 1, base);
 
         // Window not elapsed: reads stay on the write bucket.
-        assert_eq!(health.tick(at(base, 5)).read_selected_index, 0);
+        assert_eq!(health.tick(at(base, 5), false).read_selected_index, 0);
         // Window elapsed but not caught up: still on the write bucket.
-        health.region_caught_up = false;
-        assert_eq!(health.tick(at(base, 11)).read_selected_index, 0);
+        assert_eq!(health.tick(at(base, 11), false).read_selected_index, 0);
         // Caught up and window elapsed: reads return to the region bucket, and
         // the write selection never moved.
-        health.region_caught_up = true;
-        let update = health.tick(at(base, 12));
+        let update = health.tick(at(base, 12), true);
         assert_eq!(update.read_selected_index, 1);
         assert_eq!(
             update.read_selection_change,
@@ -1195,8 +1121,8 @@ mod tests {
         // Region is bucket 1; reads follow the write selection (bucket 0) and
         // have never passed the drain gate.
         let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
-        health.set_read_affinity(1, 0, true);
-        health.observe(1, BucketSignal::Success, base).unwrap();
+        health.set_read_affinity(1, false);
+        heal(&mut health, 1, base);
 
         // The write home dies: writes fail over to the region bucket and reads
         // follow, gate or no gate — a dead bucket serves nothing.
@@ -1209,10 +1135,8 @@ mod tests {
         // The write home recovers and the write pin returns. The read grant was
         // only ever the write pin's; bucket 1 may still owe repair notes, so
         // reads go back to bucket 0 rather than staying latched.
-        health
-            .observe(0, BucketSignal::Success, at(base, 2))
-            .unwrap();
-        let returned = health.tick(at(base, 13));
+        heal(&mut health, 0, at(base, 2));
+        let returned = health.tick(at(base, 13), false);
         assert_eq!(returned.selected_index, 0);
         assert_eq!(returned.read_selected_index, 0);
         assert_eq!(
@@ -1221,8 +1145,7 @@ mod tests {
         );
 
         // The ordinary gate governs the return: window plus caught up earns it.
-        health.region_caught_up = true;
-        let earned = health.tick(at(base, 14));
+        let earned = health.tick(at(base, 14), true);
         assert_eq!(earned.read_selected_index, 1);
         assert_eq!(earned.selected_index, 0);
     }
@@ -1231,8 +1154,8 @@ mod tests {
     fn a_loan_outlives_the_region_bucket_dying_with_nowhere_to_demote_to() {
         let base = Instant::now();
         let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
-        health.set_read_affinity(1, 0, true);
-        health.observe(1, BucketSignal::Success, base).unwrap();
+        health.set_read_affinity(1, false);
+        heal(&mut health, 1, base);
 
         // The write home dies: reads are lent to the region bucket.
         let failover = health
@@ -1252,13 +1175,9 @@ mod tests {
 
         // Both heal and the write pin goes home. The loan was never repaid, so
         // reads leave the region bucket and re-enter the drain gate.
-        health
-            .observe(1, BucketSignal::Success, at(base, 3))
-            .unwrap();
-        health
-            .observe(0, BucketSignal::Success, at(base, 4))
-            .unwrap();
-        let returned = health.tick(at(base, 15));
+        heal(&mut health, 1, at(base, 3));
+        heal(&mut health, 0, at(base, 4));
+        let returned = health.tick(at(base, 15), false);
         assert_eq!(returned.selected_index, 0);
         assert_eq!(returned.read_selected_index, 0);
         assert_eq!(
@@ -1271,12 +1190,11 @@ mod tests {
     fn an_earned_read_pin_survives_a_write_failover_round_trip() {
         let base = Instant::now();
         let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
-        health.set_read_affinity(1, 0, true);
-        health.observe(1, BucketSignal::Success, base).unwrap();
+        health.set_read_affinity(1, false);
+        heal(&mut health, 1, base);
 
         // Reads earn the region pin through the gate before anything fails.
-        health.region_caught_up = true;
-        assert_eq!(health.tick(at(base, 11)).read_selected_index, 1);
+        assert_eq!(health.tick(at(base, 11), true).read_selected_index, 1);
 
         let failover = health
             .observe(0, BucketSignal::Timeout, at(base, 12))
@@ -1288,11 +1206,8 @@ mod tests {
         // the outage, so it missed nothing: the earned pin does not move, even
         // with the gate closed (the worker clears caught-up while reads sit on
         // the region bucket).
-        health
-            .observe(0, BucketSignal::Success, at(base, 13))
-            .unwrap();
-        health.region_caught_up = false;
-        let returned = health.tick(at(base, 24));
+        heal(&mut health, 0, at(base, 13));
+        let returned = health.tick(at(base, 24), false);
         assert_eq!(returned.selected_index, 0);
         assert_eq!(returned.read_selected_index, 1);
         assert_eq!(returned.read_selection_change, None);
@@ -1307,10 +1222,10 @@ mod tests {
         // not confirm convergence (an unreachable peer alone forces that), so
         // this pin never passed the drain gate.
         let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
-        health.observe(1, BucketSignal::Success, base).unwrap();
+        heal(&mut health, 1, base);
         health.observe(0, BucketSignal::Timeout, base).unwrap();
         assert_eq!(health.selected_index(), 1, "write pin failed over");
-        health.set_read_affinity(1, 1, false);
+        health.set_read_affinity(1, false);
 
         // The write home recovers and the write pin goes home. The read pin was
         // only ever the write pin's, so it must come with it — leaving the
@@ -1318,10 +1233,8 @@ mod tests {
         // recorded as a loan the pin simply never moved again, which also meant
         // the worker never proposed a read switch and read affinity stayed
         // inactive for the life of the process.
-        health
-            .observe(0, BucketSignal::Success, at(base, 1))
-            .unwrap();
-        let returned = health.tick(at(base, 12));
+        heal(&mut health, 0, at(base, 1));
+        let returned = health.tick(at(base, 12), false);
         assert_eq!(returned.selected_index, 0);
         assert_eq!(returned.read_selected_index, 0);
         assert_eq!(
@@ -1331,120 +1244,87 @@ mod tests {
         );
 
         // And the ordinary gate governs the real return.
-        health.region_caught_up = true;
-        assert_eq!(health.tick(at(base, 13)).read_selected_index, 1);
+        assert_eq!(health.tick(at(base, 13), true).read_selected_index, 1);
     }
 
     #[test]
-    fn a_topology_blocked_region_bucket_cannot_retain_the_read_pin() {
+    fn a_topology_blocked_region_bucket_cannot_hold_the_read_pin() {
         let base = Instant::now();
         let controller = HealthController::new(2, policy(1, 10)).unwrap();
 
-        // Boot observes the region bucket and acknowledges the stamp that first
-        // success raises (src/app.rs:1111-1130).
+        // Boot verifies the region bucket, then it flaps and heals inside the
+        // copy-matrix window (src/app.rs), after the boot ack loop: Healthy, but
+        // its stamp unverified and so ineligible for replication.
         controller
             .observe_at(1, BucketSignal::Success, base)
             .unwrap();
         controller.topology_revalidated(1).unwrap();
-
-        // Then it flaps and heals again inside the copy-matrix window
-        // (src/app.rs:1167) — AFTER that ack loop has run, so the stamp this
-        // heal raises has nothing left to acknowledge it until the worker's
-        // first cycle (src/worker.rs:308).
         controller
             .observe_at(1, BucketSignal::Timeout, at(base, 1))
             .unwrap();
         controller
             .observe_at(1, BucketSignal::Success, at(base, 2))
             .unwrap();
-        assert!(
-            !controller.bucket_eligible(1).unwrap(),
-            "a re-verifying bucket is ineligible for replication"
-        );
+        assert!(!controller.bucket_eligible(1).unwrap());
 
-        // Startup's convergence check ran before the flap, so it still says
-        // converged and seeds reads onto the region bucket — Healthy, but with
-        // its topology unverified. Nothing has demoted it, because it never went
-        // Unhealthy from the read pin's point of view.
-        controller.configure_read_affinity(1, 1, true).unwrap();
-        assert_eq!(controller.lock().health.read_selected, 1);
-
-        // The pure machine must give the pin up rather than retain it ungated:
-        // an ineligible bucket can be accruing repair notes right now. Asserted
-        // on `health.read_selected`, not the snapshot — `worker_tick_at` already
-        // steers the APPLIED pin away from a blocked bucket, so only the pure
-        // machine's own choice distinguishes retention from demotion.
-        let blocked = controller.worker_tick_at(at(base, 3));
+        // Startup's convergence check ran before the flap and says earned. The
+        // pin still may not land on a bucket that can be accruing repair notes.
+        controller.configure_read_affinity(1, true).unwrap();
+        assert_eq!(controller.lock().health.read_pin, ReadPin::FollowWrite);
+        let blocked = controller.worker_tick_at(at(base, 3), false);
         assert_eq!(
-            controller.lock().health.read_selected,
-            0,
-            "reads must leave a bucket whose topology is unverified"
+            blocked.read_selection_change,
+            Some(SelectionChange { from: 1, to: 0 }),
+            "reads seeded onto the region bucket move off it"
         );
-        assert_eq!(blocked.read_selected_index, 0);
-        controller.read_selection_applied(0).unwrap();
+        controller.apply_read_selection(0, || ()).unwrap();
 
-        // On acknowledgement it re-earns the pin through the drain gate rather
-        // than having the old one handed back.
-        controller.topology_revalidated(1).unwrap();
-        controller.set_region_caught_up(false);
+        // On acknowledgement it re-earns the pin through the gate.
+        controller.topology_check_passed(1).unwrap();
         assert_eq!(
-            controller.worker_tick_at(at(base, 13)).read_selected_index,
+            controller
+                .worker_tick_at(at(base, 13), false)
+                .read_selected_index,
             0,
             "the gate still governs the return"
         );
-        controller.set_region_caught_up(true);
         assert_eq!(
-            controller.worker_tick_at(at(base, 14)).read_selected_index,
+            controller
+                .worker_tick_at(at(base, 14), true)
+                .read_selected_index,
             1
         );
     }
 
     #[test]
-    fn a_caught_up_verdict_does_not_survive_the_outage_that_demoted_reads() {
+    fn the_request_path_can_demote_the_read_pin_but_never_earn_it() {
         let base = Instant::now();
         let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
-        health.set_read_affinity(1, 0, true);
-        health.observe(1, BucketSignal::Success, base).unwrap();
+        health.set_read_affinity(1, false);
+        heal(&mut health, 1, base);
 
-        // Reads earn the region pin: window elapsed, worker confirmed caught up.
-        health.region_caught_up = true;
-        assert_eq!(health.tick(at(base, 11)).read_selected_index, 1);
+        // Window served, yet an observation has no fresh caught-up check.
+        let observed = heal(&mut health, 0, at(base, 11));
+        assert_eq!(observed.read_selected_index, 0);
+        assert_eq!(health.tick(at(base, 11), true).read_selected_index, 1);
 
-        // The region bucket dies and reads fall back. It may miss writes for as
-        // long as it is gone, so the verdict that let reads in is now worthless.
-        let demoted = health
+        // The bucket dies and recovers; a caught-up verdict from before the
+        // outage is gone with the tick that consumed it.
+        health
             .observe(1, BucketSignal::Timeout, at(base, 12))
             .unwrap();
-        assert_eq!(demoted.read_selected_index, 0);
-
-        // It recovers and serves the whole return window. Reads must NOT come
-        // back on the pre-outage verdict — only a fresh caught-up check can say
-        // whether the repair notes from the outage have drained. This is checked
-        // through `observe` rather than `tick` on purpose: the request path
-        // re-evaluates the read pin too, and it never refreshes the verdict.
-        health
-            .observe(1, BucketSignal::Success, at(base, 13))
-            .unwrap();
-        let stale = health
-            .observe(0, BucketSignal::Success, at(base, 24))
-            .unwrap();
-        assert_eq!(
-            stale.read_selected_index, 0,
-            "reads returned to the region bucket on a caught-up verdict from before its outage"
-        );
-
-        // A fresh verdict is what earns it back.
-        health.region_caught_up = true;
-        assert_eq!(health.tick(at(base, 25)).read_selected_index, 1);
+        heal(&mut health, 1, at(base, 13));
+        assert_eq!(heal(&mut health, 0, at(base, 24)).read_selected_index, 0);
+        assert_eq!(health.tick(at(base, 25), true).read_selected_index, 1);
     }
 
     #[test]
     fn read_leaves_region_immediately_on_the_leave_threshold() {
         let base = Instant::now();
         let mut health = BucketHealth::new(2, policy(3, 10)).unwrap();
-        health.set_read_affinity(1, 1, true);
-        health.observe(1, BucketSignal::Success, base).unwrap();
-        assert_eq!(health.read_selected_index(), 1);
+        heal(&mut health, 1, base);
+        health.set_read_affinity(1, true);
+        assert_eq!(health.read_index(), 1);
 
         for _ in 0..2 {
             let update = health.observe(1, BucketSignal::Timeout, base).unwrap();
@@ -1462,7 +1342,7 @@ mod tests {
     fn no_read_preference_tracks_the_write_selection_in_every_state() {
         let base = Instant::now();
         let mut health = BucketHealth::new(2, policy(1, 10)).unwrap();
-        health.observe(1, BucketSignal::Success, base).unwrap();
+        heal(&mut health, 1, base);
         let update = health.observe(0, BucketSignal::Timeout, base).unwrap();
         assert_eq!(update.selected_index, 1);
         assert_eq!(update.read_selected_index, 1);
@@ -1478,9 +1358,9 @@ mod tests {
         // but with a region read preference set: the write selection is identical.
         let base = Instant::now();
         let mut health = BucketHealth::new(3, policy(1, 60)).unwrap();
-        health.set_read_affinity(2, 0, true);
-        health.observe(2, BucketSignal::Success, base).unwrap();
-        health.observe(1, BucketSignal::Success, base).unwrap();
+        health.set_read_affinity(2, false);
+        heal(&mut health, 2, base);
+        heal(&mut health, 1, base);
 
         let update = health.observe(0, BucketSignal::Timeout, base).unwrap();
         assert_eq!(update.selected_index, 1);
@@ -1494,7 +1374,7 @@ mod tests {
     fn controller_reports_read_selection_and_pending_return() {
         let base = Instant::now();
         let controller = HealthController::new(2, policy(1, 10)).unwrap();
-        controller.configure_read_affinity(1, 0, false).unwrap();
+        controller.configure_read_affinity(1, false).unwrap();
 
         // Region bucket 1 becomes reachable; a topology check blocks it until
         // acknowledged, so no return is pending yet.
@@ -1507,22 +1387,223 @@ mod tests {
 
         // With caught_up confirmed and the window elapsed, the worker snapshot
         // proposes the read switch; the write selection is untouched.
-        controller.set_region_caught_up(true);
-        let snap = controller.worker_tick_at(at(base, 11));
+        let snap = controller.worker_tick_at(at(base, 11), true);
         assert_eq!(snap.selected_index, 0);
         assert_eq!(snap.read_selected_index, 1);
         assert_eq!(
             snap.read_selection_change,
             Some(SelectionChange { from: 0, to: 1 })
         );
-        controller.read_selection_applied(1).unwrap();
+        controller.apply_read_selection(1, || ()).unwrap();
         assert_eq!(controller.read_return_pending(), None);
         assert_eq!(
             controller
-                .worker_tick_at(at(base, 12))
+                .worker_tick_at(at(base, 12), false)
                 .read_selection_change,
             None
         );
+    }
+
+    /// Every read-pin transition, over every region-bucket status that feeds
+    /// one, against the rules stated rather than the code: the pin leaves the
+    /// instant the bucket is unusable, enters only through the gate, and
+    /// nothing else moves it.
+    #[test]
+    fn read_pin_transitions_are_exhaustive() {
+        let window = Duration::from_secs(10);
+        let now = Instant::now() + window;
+        let mut edges = Vec::new();
+        for pin in [ReadPin::FollowWrite, ReadPin::Earned] {
+            for state in [
+                HealthState::Unknown,
+                HealthState::Healthy,
+                HealthState::Unhealthy,
+            ] {
+                for topology in [Topology::Verified, Topology::Pending, Topology::Checking] {
+                    for healthy_since in [None, Some(now), Some(now - window)] {
+                        for caught_up in [false, true] {
+                            let bucket = BucketStatus {
+                                state,
+                                consecutive_failures: 0,
+                                healthy_since,
+                                topology,
+                            };
+                            let usable = bucket.usable();
+                            let served = bucket.served(window, now);
+                            assert_eq!(
+                                usable,
+                                state == HealthState::Healthy && topology == Topology::Verified
+                            );
+                            assert!(!served || usable);
+
+                            let next = next_read_pin(pin, usable, served, caught_up);
+                            let expected = if !usable {
+                                ReadPin::FollowWrite
+                            } else if served && caught_up {
+                                ReadPin::Earned
+                            } else {
+                                pin
+                            };
+                            assert_eq!(
+                                next, expected,
+                                "{pin:?} {state:?} {topology:?} since={healthy_since:?} caught_up={caught_up}"
+                            );
+                            if !edges.contains(&(pin, next)) {
+                                edges.push((pin, next));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(
+            edges.len(),
+            4,
+            "every edge of the two-state machine is reachable"
+        );
+
+        // Where reads go, for every pin and both write placements.
+        let mut health = BucketHealth::new(3, policy(1, 10)).unwrap();
+        assert_eq!(
+            health.read_index(),
+            0,
+            "no preference follows the write pin"
+        );
+        health.read_preference = Some(1);
+        for selected in [0, 1] {
+            health.selected = selected;
+            health.read_pin = ReadPin::FollowWrite;
+            assert_eq!(health.read_index(), selected);
+            health.read_pin = ReadPin::Earned;
+            assert_eq!(health.read_index(), 1);
+        }
+    }
+
+    #[test]
+    fn a_topology_pending_bucket_is_never_selected_by_the_pure_machine() {
+        let base = Instant::now();
+        let controller = HealthController::new(2, policy(1, 10)).unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, base)
+            .unwrap();
+        controller.topology_revalidated(1).unwrap();
+        controller.configure_read_affinity(1, false).unwrap();
+
+        // Writes fail over onto the region bucket; reads follow.
+        controller
+            .observe_at(0, BucketSignal::Timeout, base)
+            .unwrap();
+        controller.apply_selection(1, || ()).unwrap();
+        controller.apply_read_selection(1, || ()).unwrap();
+
+        // The home heals and serves the full window, but its stamp is never
+        // acknowledged. A request-path observation must not send either pin
+        // there, though no worker tick has run to override anything.
+        controller
+            .observe_at(0, BucketSignal::Success, at(base, 1))
+            .unwrap();
+        controller
+            .observe_at(0, BucketSignal::Success, at(base, 12))
+            .unwrap();
+        let state = controller.lock();
+        assert_eq!(state.health.selected, 1);
+        assert_eq!(state.health.read_index(), 1);
+        drop(state);
+
+        // Nor is a pending bucket a failover target before any tick.
+        let controller = HealthController::new(2, policy(1, 10)).unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, base)
+            .unwrap();
+        controller
+            .observe_at(0, BucketSignal::Timeout, base)
+            .unwrap();
+        assert_eq!(controller.lock().health.selected, 0);
+    }
+
+    #[test]
+    fn a_switch_invalidated_after_its_snapshot_is_not_published() {
+        let base = Instant::now();
+        let controller = HealthController::new(2, policy(1, 10)).unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, base)
+            .unwrap();
+        controller.topology_revalidated(1).unwrap();
+        controller.configure_read_affinity(1, false).unwrap();
+
+        let snapshot = controller.worker_tick_at(at(base, 11), true);
+        assert_eq!(
+            snapshot.read_selection_change,
+            Some(SelectionChange { from: 0, to: 1 })
+        );
+        // While the worker awaits other checks, the region bucket flaps and
+        // comes back with its stamp unverified.
+        controller
+            .observe_at(1, BucketSignal::Timeout, at(base, 12))
+            .unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, at(base, 12))
+            .unwrap();
+        let mut published = false;
+        assert_eq!(
+            controller.apply_read_selection(1, || published = true),
+            None
+        );
+        assert!(!published, "a stale read switch reached the BucketSet");
+        assert_eq!(controller.lock().applied_read_selected, 0);
+
+        // The same for a write switch.
+        controller
+            .observe_at(0, BucketSignal::Timeout, at(base, 13))
+            .unwrap();
+        controller.topology_revalidated(1).unwrap();
+        let snapshot = controller.worker_tick_at(at(base, 13), false);
+        assert_eq!(
+            snapshot.selection_change,
+            Some(SelectionChange { from: 0, to: 1 })
+        );
+        controller
+            .observe_at(1, BucketSignal::Timeout, at(base, 14))
+            .unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, at(base, 14))
+            .unwrap();
+        assert_eq!(controller.apply_selection(1, || ()), None);
+        assert_eq!(controller.lock().applied_selected, 0);
+    }
+
+    #[test]
+    fn a_topology_check_cannot_clear_a_newer_recovery() {
+        let base = Instant::now();
+        let controller = HealthController::new(2, policy(1, 10)).unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, base)
+            .unwrap();
+        assert_eq!(
+            controller.worker_tick_at(base, false).topology_revalidation,
+            vec![1]
+        );
+
+        // The bucket recovers again while that check is in flight. The check may
+        // have read the stamp before this recovery, so it clears nothing.
+        controller
+            .observe_at(1, BucketSignal::Timeout, at(base, 1))
+            .unwrap();
+        controller
+            .observe_at(1, BucketSignal::Success, at(base, 1))
+            .unwrap();
+        controller.topology_check_passed(1).unwrap();
+        assert!(!controller.bucket_eligible(1).unwrap());
+
+        // The next snapshot re-lists it, and that check counts.
+        assert_eq!(
+            controller
+                .worker_tick_at(at(base, 2), false)
+                .topology_revalidation,
+            vec![1]
+        );
+        controller.topology_check_passed(1).unwrap();
+        assert!(controller.bucket_eligible(1).unwrap());
     }
 
     #[test]
@@ -1572,12 +1653,10 @@ mod tests {
 /// cycle. The boot model below is written against `src/app.rs` line by line for
 /// that reason.
 ///
-/// With those fixed it found a real one, which is why this module exists: a node
-/// booting with its write home down records reads on the region bucket as an
-/// EARNED pin, and read affinity then dies silently for the life of the process
-/// (`set_read_affinity`, fixed here; pinned by
-/// `an_unconverged_boot_onto_the_failed_over_write_home_is_a_loan_not_an_earned_pin`
-/// and by `test_read_affinity_survives_a_boot_with_the_write_home_down`).
+/// With those fixed it found a real one: a node booting with its write home down
+/// recorded reads on the region bucket as an earned pin, and read affinity then
+/// died silently for the life of the process. [`ReadPin`] now has no way to say
+/// that: an unconverged boot is `FollowWrite`, wherever the write pin is.
 #[cfg(test)]
 mod conformance_walk {
     use super::*;
@@ -1654,6 +1733,10 @@ mod conformance_walk {
         /// Flip a bucket's ground-truth reachability. Invisible to the
         /// controller until something observes it.
         Fault { bucket: usize },
+        /// Flip whether a reachable bucket's topology stamp (or storage format)
+        /// fails the worker's check: the bucket answers, but no ack comes, so
+        /// it stays pending for as long as the walk likes.
+        Mismatch { bucket: usize },
         /// One data-plane observation, reporting ground truth — what
         /// `ObservedStorage` feeds `health.observe` from real request and worker
         /// I/O (src/observed_storage.rs:55-61). `after_ms` is the wall clock it
@@ -1663,7 +1746,10 @@ mod conformance_walk {
         Probe { bucket: usize, after_ms: u64 },
         /// One full-cadence worker cycle: probe every bucket, then maintain
         /// selection. `racing` is what lands *inside* the cycle — see [`Racing`].
-        Tick { racing: Option<Racing> },
+        Tick {
+            racing: Option<Racing>,
+            after_snapshot: bool,
+        },
         /// Idle-cadence cycles: `secs` worker cycles that maintain selection
         /// without probing. Probing is traffic-gated; maintenance is not, so
         /// time never passes in this system without maintenance running
@@ -1685,10 +1771,19 @@ mod conformance_walk {
     /// construction and the verdict is already up to a cycle old when it is
     /// used. That staleness is inherent to the design, not a defect; the walk
     /// models it so the oracles are checked against it rather than around it.
+    ///
+    /// `Flap` and `after_snapshot` reach the other window: between the snapshot
+    /// and the publication of the switch it proposed, where the worker awaits
+    /// topology checks (src/worker.rs). A bucket that fails and recovers there
+    /// must neither have the stale switch published onto it nor its new
+    /// recovery cleared by the check already in flight.
     #[derive(Clone, Copy, Debug)]
     enum Racing {
         Probe(usize),
         Upload,
+        /// The bucket goes down long enough to cross the leave threshold and
+        /// comes back up.
+        Flap(usize),
     }
 
     /// Ground truth plus the real controller, driven together.
@@ -1702,8 +1797,12 @@ mod conformance_walk {
         leave_after_failures: u32,
         /// How the boot in [`Walk::new`] came out, for the failure report.
         boot: String,
-        /// Ground-truth reachability. Only [`Step::Fault`] changes it.
+        /// Ground-truth reachability. Only [`Step::Fault`] and
+        /// [`Racing::Flap`] change it.
         up: Vec<bool>,
+        /// Ground truth for the worker's topology/format check of a reachable
+        /// bucket: `true` fails it. Only [`Step::Mismatch`] changes it.
+        mismatched: Vec<bool>,
         /// Reachability as the startup topology report captured it, BEFORE the
         /// boot flap below could move it. The pin-seeding decision reads this
         /// snapshot rather than live health, because startup's does too
@@ -1720,7 +1819,7 @@ mod conformance_walk {
         /// before reads were admitted, which is the debt the drain gate exists
         /// to refuse. This is the design's own boundary, not a concession: the
         /// gate governs the RETURN of reads to a lagging bucket, never their
-        /// retention (`region_caught_up`'s contract, this file) — and the read
+        /// retention ([`next_read_pin`]) — and the read
         /// path falls through to the write bucket for an artifact the read
         /// bucket does not hold, so a note taken on with reads already in place
         /// costs a fall-through, not a wrong answer.
@@ -1737,6 +1836,29 @@ mod conformance_walk {
         /// cycle and capped at [`worst_case_cycle_span`].
         cycle_elapsed: Duration,
         trace: Vec<Step>,
+        /// How often each read-pin transition in [`Edge`] was taken.
+        coverage: [u64; EDGES],
+    }
+
+    /// The read-pin transitions the walk must take, so a schedule generator
+    /// that drifts away from one cannot pass silently. `DemoteAcrossAFlap` is
+    /// a demotion whose step also brought the bucket back, stamp unverified.
+    #[derive(Clone, Copy, Debug)]
+    enum Edge {
+        Earn,
+        DemoteUnhealthy,
+        DemoteAcrossAFlap,
+        EarnedAcrossWriteMove,
+        LoanEndsWithTheWritePin,
+    }
+    const EDGES: usize = 5;
+
+    /// What a transition is classified from, taken before and after each step.
+    #[derive(Clone, Copy)]
+    struct PinView {
+        pin: ReadPin,
+        selected: usize,
+        unhealthy: bool,
     }
 
     impl Walk {
@@ -1781,6 +1903,7 @@ mod conformance_walk {
                 leave_after_failures,
                 boot: String::new(),
                 boot_up: up.clone(),
+                mismatched: vec![false; bucket_count],
                 up,
                 notes: (0..boot_notes).collect(),
                 next_note: boot_notes,
@@ -1789,6 +1912,7 @@ mod conformance_walk {
                 now,
                 cycle_elapsed: Duration::ZERO,
                 trace: Vec::new(),
+                coverage: [0; EDGES],
             };
 
             // 1. Storages are wrapped in `ObservedStorage` BEFORE any I/O
@@ -1822,9 +1946,9 @@ mod conformance_walk {
                 }
             }
             // 4. One tick applies the resulting write selection (src/app.rs:1139-1148).
-            let initial = walk.controller.worker_tick_at(walk.now);
+            let initial = walk.controller.worker_tick_at(walk.now, false);
             if let Some(change) = initial.selection_change {
-                walk.controller.selection_applied(change.to).unwrap();
+                walk.controller.apply_selection(change.to, || ());
             }
 
             // 5. Between that tick and the pin seeding, startup runs
@@ -1876,12 +2000,11 @@ mod conformance_walk {
             let converged = reachable && every_peer_answered && walk.notes.is_empty();
             let read_index = if converged { region } else { write_index };
             walk.controller
-                .configure_read_affinity(region, read_index, converged)
+                .configure_read_affinity(region, converged)
                 .unwrap();
             // Only a converged region bucket gets the distinct read pin turned
-            // on (`seed_read_pin`, src/app.rs:1199-1200). Anything else leaves
-            // reads aliased to the write pin, however `configure_read_affinity`
-            // recorded them.
+            // on (`seed_read_pin`, src/app.rs). Anything else leaves reads
+            // aliased to the write pin.
             if converged {
                 walk.read_active = true;
             }
@@ -1889,10 +2012,8 @@ mod conformance_walk {
                 walk.admitted_at = walk.next_note;
             }
 
-            // 7. `initialize_indexes` (src/app.rs:1398) runs before the worker
-            //    starts and HEADs two keys on the write pin (src/app.rs:2072-2073),
-            //    both observed. So there is always at least one evaluation of the
-            //    read pin between seeding it and the first worker cycle.
+            // 7. `initialize_indexes` (src/app.rs) runs before the worker starts
+            //    and HEADs two keys on the write pin, both observed.
             walk.observe(write_index);
 
             walk.boot = format!(
@@ -1940,8 +2061,10 @@ mod conformance_walk {
 
         fn apply(&mut self, step: Step) {
             self.trace.push(step);
+            let before = self.pin_view();
             match step {
                 Step::Fault { bucket } => self.up[bucket] = !self.up[bucket],
+                Step::Mismatch { bucket } => self.mismatched[bucket] = !self.mismatched[bucket],
                 Step::Probe { bucket, after_ms } => {
                     // Clamped, not trusted: a request observation may only push
                     // the clock as far as the current cycle can still run.
@@ -1952,10 +2075,13 @@ mod conformance_walk {
                     self.cycle_elapsed += advance;
                     self.observe(bucket);
                 }
-                Step::Tick { racing } => self.worker_cycle(true, racing),
+                Step::Tick {
+                    racing,
+                    after_snapshot,
+                } => self.worker_cycle(true, racing, after_snapshot),
                 Step::Advance { secs } => {
                     for _ in 0..secs {
-                        self.worker_cycle(false, None);
+                        self.worker_cycle(false, None, false);
                     }
                 }
                 Step::Upload => self.upload(),
@@ -1967,7 +2093,35 @@ mod conformance_walk {
                     }
                 }
             }
-            self.check_flag_invariant(step);
+            self.check_earned_invariant(step);
+            self.record_edge(before, self.pin_view());
+        }
+
+        fn pin_view(&self) -> PinView {
+            let state = self.controller.lock();
+            PinView {
+                pin: state.health.read_pin,
+                selected: state.health.selected,
+                unhealthy: state.health.buckets[self.region].state == HealthState::Unhealthy,
+            }
+        }
+
+        fn record_edge(&mut self, before: PinView, after: PinView) {
+            let edge = match (before.pin, after.pin) {
+                (ReadPin::FollowWrite, ReadPin::Earned) => Edge::Earn,
+                (ReadPin::Earned, ReadPin::FollowWrite) if after.unhealthy => Edge::DemoteUnhealthy,
+                (ReadPin::Earned, ReadPin::FollowWrite) => Edge::DemoteAcrossAFlap,
+                (ReadPin::Earned, ReadPin::Earned) if before.selected != after.selected => {
+                    Edge::EarnedAcrossWriteMove
+                }
+                (ReadPin::FollowWrite, ReadPin::FollowWrite)
+                    if before.selected == self.region && after.selected != self.region =>
+                {
+                    Edge::LoanEndsWithTheWritePin
+                }
+                _ => return,
+            };
+            self.coverage[edge as usize] += 1;
         }
 
         /// One upload's fan-out. The fan-out skips an ineligible peer outright
@@ -2007,7 +2161,7 @@ mod conformance_walk {
         /// calls for it, then maintain selection (src/worker.rs:203-227). Only
         /// the probe is traffic-gated; the maintenance below runs every cycle,
         /// which is why wall-clock time cannot pass here without it.
-        fn worker_cycle(&mut self, probe: bool, racing: Option<Racing>) {
+        fn worker_cycle(&mut self, probe: bool, racing: Option<Racing>, after_snapshot: bool) {
             self.now += TICK;
             self.cycle_elapsed = Duration::ZERO;
             // `probe_buckets` (src/worker.rs:148, called at :219).
@@ -2016,7 +2170,7 @@ mod conformance_walk {
                     self.observe(bucket);
                 }
             }
-            self.maintain_bucket_selection(racing);
+            self.maintain_bucket_selection(racing, after_snapshot);
         }
 
         /// `worker::maintain_bucket_selection` (src/worker.rs:261-375), step for
@@ -2024,72 +2178,63 @@ mod conformance_walk {
         /// worker has applied is a property of this ordering, not a simulation
         /// of one: `read_return_pending` reads the *applied* pin, and the acks
         /// happen after the snapshot that produced them.
-        fn maintain_bucket_selection(&mut self, racing: Option<Racing>) {
-            // src/worker.rs:268-276. The caught-up LIST runs only while a return
-            // is pending; every cycle without one sets the belief false.
-            if self.controller.has_read_preference() {
-                match self.controller.read_return_pending() {
-                    // `region_bucket_caught_up` (src/worker.rs:398-425) asks
-                    // ground truth: does any peer still hold a `_repl/` note
-                    // owed to the region bucket? The real one additionally
-                    // answers false when a peer is unreachable; modelling only
-                    // the note count makes the gate strictly *more* permissive,
-                    // which is the direction that exposes over-admission.
-                    Some(_) => {
-                        let caught_up = self.notes.is_empty();
-                        self.controller.set_region_caught_up(caught_up);
-                    }
-                    None => self.controller.set_region_caught_up(false),
-                }
+        fn maintain_bucket_selection(&mut self, racing: Option<Racing>, after_snapshot: bool) {
+            // The caught-up LIST runs only while a return is pending, and its
+            // verdict feeds this one tick.
+            let caught_up = match self.controller.read_return_pending() {
+                // `region_bucket_caught_up` (src/worker.rs) asks ground truth:
+                // does any peer still hold a `_repl/` note owed to the region
+                // bucket? The real one additionally answers false when a peer is
+                // unreachable; modelling only the note count makes the gate
+                // strictly *more* permissive, which is the direction that
+                // exposes over-admission.
+                Some(_) => self.notes.is_empty(),
+                None => false,
+            };
+
+            // The caught-up LIST and the topology checks are sequential network
+            // I/O. Whatever the fleet does while one is in flight lands here.
+            if !after_snapshot {
+                self.race(racing);
+            }
+            let snapshot = self.controller.worker_tick_at(self.now, caught_up);
+            if after_snapshot {
+                self.race(racing);
             }
 
-            // The caught-up LIST is sequential network I/O. Whatever the fleet
-            // does while it is in flight lands here, before the gate evaluation
-            // that consumes its verdict.
-            if racing.is_some() {
-                let advance = IO_TIMEOUT.min(
-                    worst_case_cycle_span(self.bucket_count).saturating_sub(self.cycle_elapsed),
-                );
-                self.now += advance;
-                self.cycle_elapsed += advance;
-            }
-            match racing {
-                Some(Racing::Probe(bucket)) => self.observe(bucket),
-                Some(Racing::Upload) => self.upload(),
-                None => {}
-            }
-
-            let snapshot = self.controller.worker_tick_at(self.now);
-
-            // src/worker.rs:289-331. A recovered bucket's topology stamp is
-            // verified before anything may select it; an unreachable one blocks
-            // this cycle's switch and feeds back an availability failure.
+            // A recovered bucket's topology stamp is verified before anything
+            // may select it; an unreachable one blocks this cycle's switch and
+            // feeds back an availability failure, a mismatched one just blocks.
             let mut selection_blocked = HashSet::new();
             for index in &snapshot.topology_revalidation {
-                if self.up[*index] {
-                    self.controller.topology_revalidated(*index).unwrap();
-                } else {
+                if !self.up[*index] {
                     self.controller
                         .observe_at(*index, BucketSignal::Timeout, self.now)
                         .unwrap();
                     selection_blocked.insert(*index);
+                } else if self.mismatched[*index] {
+                    selection_blocked.insert(*index);
+                } else {
+                    self.controller.topology_check_passed(*index).unwrap();
                 }
             }
 
-            // src/worker.rs:333-345: apply and acknowledge the write switch.
             if let Some(change) = snapshot.selection_change {
                 if !selection_blocked.contains(&change.to) {
-                    self.controller.selection_applied(change.to).unwrap();
+                    self.controller.apply_selection(change.to, || ());
                 }
             }
 
-            // src/worker.rs:359-375: same gating for the read switch.
             if let Some(change) = snapshot.read_selection_change {
-                if !selection_blocked.contains(&change.to) {
+                if !selection_blocked.contains(&change.to)
+                    && self
+                        .controller
+                        .apply_read_selection(change.to, || ())
+                        .is_some()
+                {
                     // `switch_read` activates the distinct read pin the first
-                    // time it runs (src/worker.rs:362-363, src/buckets.rs:366-380).
+                    // time it runs (src/buckets.rs).
                     self.read_active = true;
-                    self.controller.read_selection_applied(change.to).unwrap();
                     // Reads just landed on the region bucket. Everything it owes
                     // from here on is debt taken on with reads already in place;
                     // everything below the watermark is debt the gate let them
@@ -2101,19 +2246,41 @@ mod conformance_walk {
             }
         }
 
-        /// Oracle 1, checked after every single step: the loan flag may only
-        /// ever be set while the read pin actually sits on the region bucket.
-        /// A flag that outlives the pin is the shape of the `cc9627d` defects.
-        fn check_flag_invariant(&self, step: Step) {
+        /// What lands inside a worker cycle's I/O, bounded by one `IO_TIMEOUT`.
+        fn race(&mut self, racing: Option<Racing>) {
+            let Some(racing) = racing else {
+                return;
+            };
+            let advance = IO_TIMEOUT
+                .min(worst_case_cycle_span(self.bucket_count).saturating_sub(self.cycle_elapsed));
+            self.now += advance;
+            self.cycle_elapsed += advance;
+            match racing {
+                Racing::Probe(bucket) => self.observe(bucket),
+                Racing::Upload => self.upload(),
+                Racing::Flap(bucket) => {
+                    self.up[bucket] = false;
+                    for _ in 0..self.leave_after_failures {
+                        self.observe(bucket);
+                    }
+                    self.up[bucket] = true;
+                    self.observe(bucket);
+                }
+            }
+        }
+
+        /// Oracle 1, checked after every single step: an earned read pin only
+        /// ever sits on a usable region bucket. One that survives the bucket
+        /// going Unhealthy or topology-pending is reads held on a bucket that
+        /// may be owed repair notes, with nothing left to move them.
+        fn check_earned_invariant(&self, step: Step) {
             let state = self.controller.lock();
-            if state.health.read_granted_by_failover && state.health.read_selected != self.region {
+            if state.health.read_pin == ReadPin::Earned && !state.health.usable(self.region) {
+                let status = state.health.buckets[self.region].clone();
                 drop(state);
                 self.fail(
-                    "FLAG",
-                    &format!(
-                        "read_granted_by_failover is set while the read pin is off the region \
-                         bucket (after {step:?})"
-                    ),
+                    "EARNED",
+                    &format!("the read pin is earned on an unusable region bucket {status:?} (after {step:?})"),
                 );
             }
         }
@@ -2124,7 +2291,10 @@ mod conformance_walk {
         /// report as violations.
         fn quiesce(&mut self) {
             for _ in 0..QUIET_TICKS {
-                self.apply(Step::Tick { racing: None });
+                self.apply(Step::Tick {
+                    racing: None,
+                    after_snapshot: false,
+                });
             }
 
             let state = self.controller.lock();
@@ -2138,7 +2308,7 @@ mod conformance_walk {
                 applied_write
             };
             let region_status = state.health.buckets[self.region].clone();
-            let region_blocked = state.topology_blocked.contains(&self.region);
+            let region_blocked = region_status.topology != Topology::Verified;
             drop(state);
 
             // Oracle 2 — SERVING. Reads may only be served from the region
@@ -2204,8 +2374,8 @@ mod conformance_walk {
             let _ = writeln!(
                 report,
                 "  state:     notes={:?} admitted_at={} stale_debt={} up={:?} states={:?} \
-                 applied_write={} applied_read={} health.selected={} health.read_selected={} \
-                 loan={} caught_up={} blocked={:?} read_active={}",
+                 applied_write={} applied_read={} health.selected={} read_pin={:?} \
+                 region_topology={:?} mismatched={:?} read_active={}",
                 self.notes,
                 self.admitted_at,
                 self.stale_debt(),
@@ -2219,10 +2389,9 @@ mod conformance_walk {
                 state.applied_selected,
                 state.applied_read_selected,
                 state.health.selected,
-                state.health.read_selected,
-                state.health.read_granted_by_failover,
-                state.health.region_caught_up,
-                state.topology_blocked,
+                state.health.read_pin,
+                state.health.buckets[self.region].topology,
+                self.mismatched,
                 self.read_active,
             );
             drop(state);
@@ -2262,19 +2431,24 @@ mod conformance_walk {
         fn draw(&mut self) -> Step {
             let bucket = self.rng.below(self.bucket_count as u64) as usize;
             match self.rng.below(100) {
-                0..=19 => Step::Tick { racing: None },
+                0..=19 => Step::Tick {
+                    racing: None,
+                    after_snapshot: false,
+                },
                 20..=29 => Step::Tick {
-                    racing: Some(if self.rng.below(3) == 0 {
-                        Racing::Upload
-                    } else {
-                        Racing::Probe(bucket)
+                    racing: Some(match self.rng.below(4) {
+                        0 => Racing::Upload,
+                        1 => Racing::Flap(bucket),
+                        _ => Racing::Probe(bucket),
                     }),
+                    after_snapshot: self.rng.below(2) == 0,
                 },
                 30..=49 => Step::Probe {
                     bucket,
                     after_ms: self.rng.below(1_200),
                 },
-                50..=66 => Step::Fault { bucket },
+                50..=64 => Step::Fault { bucket },
+                65..=66 => Step::Mismatch { bucket },
                 67..=74 => Step::Advance {
                     secs: 1 + self.rng.below(12),
                 },
@@ -2321,13 +2495,39 @@ mod conformance_walk {
                 }
             }
             // Always finish settled, so the last steps of every walk are checked
-            // by the settled-state oracles rather than only the flag invariant.
+            // by the settled-state oracles rather than only the earned invariant.
             self.quiesce();
         }
     }
 
-    fn walk(seed: u64, steps: usize) {
-        Walk::new(seed).run(steps);
+    /// Run one walk and return how often it took each read-pin transition.
+    fn walk(seed: u64, steps: usize) -> [u64; EDGES] {
+        let mut walk = Walk::new(seed);
+        walk.run(steps);
+        walk.coverage
+    }
+
+    /// Run a seed range and fail unless every read-pin transition was taken:
+    /// an oracle over a schedule that never demotes proves nothing.
+    fn walk_range(seeds: std::ops::Range<u64>, steps: usize) {
+        let mut total = [0u64; EDGES];
+        for seed in seeds {
+            for (sum, taken) in total.iter_mut().zip(walk(seed, steps)) {
+                *sum += taken;
+            }
+        }
+        for edge in [
+            Edge::Earn,
+            Edge::DemoteUnhealthy,
+            Edge::DemoteAcrossAFlap,
+            Edge::EarnedAcrossWriteMove,
+            Edge::LoanEndsWithTheWritePin,
+        ] {
+            assert!(
+                total[edge as usize] > 0,
+                "the walk never took {edge:?}: {total:?}"
+            );
+        }
     }
 
     fn env_usize(name: &str, default: usize) -> usize {
@@ -2350,9 +2550,7 @@ mod conformance_walk {
     /// long interleavings live (dev/TESTING.md).
     #[test]
     fn read_pin_conformance_walk() {
-        for seed in 0..256 {
-            walk(seed, 400);
-        }
+        walk_range(0..256, 400);
     }
 
     /// Deep tier: the nightly volume, run from
@@ -2365,9 +2563,7 @@ mod conformance_walk {
         let start = env_u64("PYPIRON_WALK_START", 0);
         let seeds = env_u64("PYPIRON_WALK_SEEDS", 20_000);
         let steps = env_usize("PYPIRON_WALK_STEPS", 400);
-        for seed in start..start.saturating_add(seeds) {
-            walk(seed, steps);
-        }
+        walk_range(start..start.saturating_add(seeds), steps);
         println!("read-pin conformance walk: {seeds} seeds x {steps} steps from {start}, clean");
     }
 }

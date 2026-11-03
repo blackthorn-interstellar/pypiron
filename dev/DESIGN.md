@@ -550,7 +550,10 @@ fall-through; a bounded absence (a not-yet-copied artifact, a missed yank) reads
 through to the write pin or is briefly accepted. The read pin leaves its bucket
 on the same availability streak the write pin uses and returns only after the
 full return window *and* a worker-confirmed caught-up check (no other bucket
-holds an undrained `_repl/<region>/` note). A node that matches no region reads from the write
+holds an undrained `_repl/<region>/` note). Reads either follow the write pin
+or are pinned to the region bucket after earning it; following the write pin onto
+the region bucket during a failover earns nothing, and those reads leave with it.
+A node that matches no region reads from the write
 selection — misdetection costs latency, never correctness — and writes never
 move off the write selection.
 

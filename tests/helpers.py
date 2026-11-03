@@ -398,9 +398,10 @@ def http_request_auth(
     password: str,
     data: Optional[bytes] = None,
     timeout: float = 10.0,
+    headers: Optional[Dict[str, str]] = None,
 ) -> Tuple[int, bytes, Dict[str, str]]:
     """Authenticated request (DELETE/POST management API); does not raise."""
-    headers = {"Authorization": _encode_basic_auth(username, password)}
+    headers = {**(headers or {}), "Authorization": _encode_basic_auth(username, password)}
     return _http_request(url, method=method, headers=headers, data=data, timeout=timeout)
 
 

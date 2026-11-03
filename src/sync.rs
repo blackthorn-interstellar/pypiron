@@ -1695,7 +1695,7 @@ async fn load_cursors(client: &Client, resolved: &Resolved) -> Cursors {
         return Cursors::new();
     }
     match fetch_cursors(client, resolved).await {
-        Ok(map) => map
+        Ok((map, _)) => map
             .into_iter()
             .filter_map(|(name, v)| Some((name, serde_json::from_value(v).ok()?)))
             .collect(),
@@ -1707,19 +1707,32 @@ async fn load_cursors(client: &Client, resolved: &Resolved) -> Cursors {
 }
 
 /// The stored cursor memo as an untyped object, so entries this binary can't
-/// parse (another sync version's) survive a merge untouched.
+/// parse (another sync version's) survive a merge untouched, plus its `ETag`
+/// (absent from a server that predates conditional saves).
 async fn fetch_cursors(
     client: &Client,
     resolved: &Resolved,
-) -> Result<serde_json::Map<String, serde_json::Value>> {
+) -> Result<(serde_json::Map<String, serde_json::Value>, Option<String>)> {
     let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
     let resp = with_admin_auth(client.get(&url), resolved).send().await?;
     if !resp.status().is_success() {
         bail!("GET /sync/cursors [{}]", resp.status());
     }
+    let etag = resp
+        .headers()
+        .get(reqwest::header::ETAG)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let body = resp.bytes().await?;
-    serde_json::from_slice(&body).context("stored sync cursor memo is not a JSON object")
+    let map =
+        serde_json::from_slice(&body).context("stored sync cursor memo is not a JSON object")?;
+    Ok((map, etag))
 }
+
+/// Saves that lose the `If-Match` race to another sync before giving up. Each
+/// retry re-reads and re-merges, so only a destination under a stampede of
+/// concurrent syncs runs out.
+const CURSOR_SAVE_ATTEMPTS: usize = 5;
 
 /// This run's cursor changes: `Some` stores a fresh entry, `None` drops a stale
 /// one (`--full` re-synced the project but produced nothing to replay).
@@ -1745,9 +1758,10 @@ fn merge_cursors(
 }
 
 /// Merge this run's cursor updates into a fresh read of the stored memo and
-/// write it back. Best-effort: a failure just means the next run re-fetches, so
-/// it never fails an otherwise-good sync. A memo it couldn't read is never
-/// written over — that would wipe every other project's cursor.
+/// write it back under `If-Match`, re-reading and re-merging when another sync
+/// saved in between (412). Best-effort: a failure just means the next run
+/// re-fetches, so it never fails an otherwise-good sync. A memo it couldn't
+/// read is never written over — that would wipe every other project's cursor.
 async fn save_cursors(client: &Client, resolved: &Resolved, updates: &CursorUpdates) {
     if resolved.repair_upload_times || updates.is_empty() {
         return;
@@ -1756,16 +1770,22 @@ async fn save_cursors(client: &Client, resolved: &Resolved, updates: &CursorUpda
         info!("[dry-run] would persist the sync cursor memo to the destination (no write)");
         return;
     }
+    let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
     let result = async {
-        let body = merge_cursors(fetch_cursors(client, resolved).await?, updates)?;
-        let url = format!("{}/sync/cursors", resolved.dst_base.trim_end_matches('/'));
-        let resp = with_admin_auth(client.put(&url).body(body), resolved)
-            .send()
-            .await?;
-        if !resp.status().is_success() {
-            bail!("PUT /sync/cursors [{}]", resp.status());
+        for _ in 0..CURSOR_SAVE_ATTEMPTS {
+            let (stored, etag) = fetch_cursors(client, resolved).await?;
+            let mut req = client.put(&url).body(merge_cursors(stored, updates)?);
+            if let Some(etag) = etag {
+                req = req.header(reqwest::header::IF_MATCH, etag);
+            }
+            let resp = with_admin_auth(req, resolved).send().await?;
+            match resp.status() {
+                reqwest::StatusCode::PRECONDITION_FAILED => continue,
+                s if s.is_success() => return Ok(()),
+                s => bail!("PUT /sync/cursors [{s}]"),
+            }
         }
-        Ok::<(), anyhow::Error>(())
+        bail!("PUT /sync/cursors lost {CURSOR_SAVE_ATTEMPTS} races to concurrent saves")
     }
     .await;
     if let Err(e) = result {

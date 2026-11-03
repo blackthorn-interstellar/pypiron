@@ -349,6 +349,52 @@ def test_full_sync_keeps_other_projects_cursors(source_dest, pypiron_bin, tmp_pa
     )
 
 
+def test_cursor_save_is_a_compare_and_swap(disk_server):
+    url = f"{disk_server['base_url']}/sync/cursors"
+    auth = _admin(disk_server)
+    code, body, hdrs = http_request_auth("GET", url, **auth)
+    assert code == 200 and json.loads(body) == {}
+    first = hdrs["etag"]
+
+    def put(body: bytes, etag=None):
+        headers = {"If-Match": etag} if etag else {}
+        return http_request_auth("PUT", url, data=body, headers=headers, **auth)[0]
+
+    assert put(b'{"a": 1}', first) == 204
+    # A second save from the same, now stale, read loses instead of clobbering.
+    assert put(b'{"b": 1}', first) == 412
+    assert put(b'{"b": 1}', '"not-a-token"') == 412
+    code, body, hdrs = http_request_auth("GET", url, **auth)
+    assert json.loads(body) == {"a": 1}
+    assert put(b'{"a": 2}', hdrs["etag"]) == 204
+    # An older sync sends no If-Match; its save stays unconditional.
+    assert put(b'{"c": 1}') == 204
+    assert json.loads(http_request_auth("GET", url, **auth)[1]) == {"c": 1}
+
+
+@pytest.mark.skipif(os.name != "posix", reason="requires a FIFO to pause a real storage read")
+def test_a_concurrent_cursor_save_is_merged_not_dropped(source_dest, pypiron_bin, tmp_path):
+    source, dest = source_dest["source"], source_dest["dest"]
+    lists = _seeded(source, tmp_path, "memoi", "memoj")
+    rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memoi"])
+    assert rc == 0, out + err
+    memo = dest["data_dir"] / "_sync" / "cursors.json"
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        # --full skips loading the memo, so the dest reads it twice: the
+        # preflight, then the save's merge read.
+        with pause_disk_read(memo) as preflight:
+            result = pool.submit(_run_sync, pypiron_bin, source, dest, lists["memoj"], "--full")
+            preflight()
+        with pause_disk_read(memo) as save_read:
+            save_read()
+            # Another sync saves while this one holds the now-stale read.
+            memo.write_text(json.dumps({**json.loads(memo.read_text()), "other": {"etag": 7}}))
+        rc, out, err = result.result(timeout=60)
+    assert rc == 0, out + err
+    assert "could not persist sync cursors" not in out + err
+    assert {"memoi", "memoj", "other"} <= set(json.loads(memo.read_text()))
+
+
 def test_a_failed_full_sync_is_retried_by_the_next_run(source_dest, pypiron_bin, tmp_path):
     """--full is the self-heal: a project it failed to repair must not be skipped
     by the next run's 304 just because upstream did not change."""

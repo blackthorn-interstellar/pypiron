@@ -14,6 +14,7 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD as b64url, Engine};
 use time::{format_description::well_known::Rfc3339, OffsetDateTime};
 use tracing::warn;
 
@@ -276,23 +277,35 @@ fn json_response(value: serde_json::Value) -> Response<Body> {
 }
 /// Read the sync-cursor blob (the server-side memo a mirror-over-HTTP sync
 /// reads to stay conditional). Admin-gated; an absent blob is an empty object,
-/// not a 404 — a first-ever sync run is the normal case.
+/// not a 404 — a first-ever sync run is the normal case. The `ETag` is the
+/// write pin's storage token (base64url, since S3's packs a control byte),
+/// `""` when absent, so a sync's merge can be saved with `If-Match`.
 pub(crate) async fn sync_cursors_get(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
 ) -> Result<impl IntoResponse, (StatusCode, String)> {
     require_admin(&state, &headers)?;
-    let bytes = match state.pin().storage.get_bytes(sync::CURSORS_KEY).await {
-        Ok(b) => b,
-        Err(e) if storage::is_not_found(&e) => b"{}".to_vec(),
+    let (bytes, token) = match state.pin().storage.get_with_etag(sync::CURSORS_KEY).await {
+        Ok(Some(found)) => found,
+        Ok(None) => (b"{}".to_vec(), String::new()),
         Err(e) => return Err(internal("read", e)),
     };
-    Ok(([(header::CONTENT_TYPE, "application/json")], bytes))
+    let etag = format!("\"{}\"", b64url.encode(token));
+    Ok((
+        [
+            (header::CONTENT_TYPE, "application/json".to_string()),
+            (header::ETAG, etag),
+        ],
+        bytes,
+    ))
 }
 
 /// Replace the sync-cursor blob. Admin-gated. The body must be a JSON object
 /// (sync's own format); we validate that much so a malformed PUT can't poison
 /// the next sync's reads, but the contents are otherwise opaque to the server.
+/// With `If-Match` (an `ETag` from the GET) the write is a compare-and-swap on
+/// the write pin, 412 when another save landed since that read; without it the
+/// write is unconditional, as older sync clients expect.
 pub(crate) async fn sync_cursors_put(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -304,6 +317,13 @@ pub(crate) async fn sync_cursors_put(
     // dependency memo under `--include-dependencies` — read it under a cap sized
     // for a large mirror only once the admin credential is proven.
     require_admin(&state, request.headers())?;
+    // Outer `None`: no `If-Match`. Inner `None`: one that names no token we
+    // issued, which can never match.
+    let if_match = request.headers().get(header::IF_MATCH).map(|v| {
+        let quoted = v.to_str().ok()?.trim();
+        let inner = quoted.strip_prefix('"')?.strip_suffix('"')?;
+        String::from_utf8(b64url.decode(inner).ok()?).ok()
+    });
     let body = axum::body::to_bytes(request.into_body(), 64 * 1024 * 1024)
         .await
         .map_err(|_| {
@@ -318,12 +338,30 @@ pub(crate) async fn sync_cursors_put(
             "cursors body must be a JSON object".into(),
         ));
     }
-    state
-        .pin()
-        .storage
-        .put_bytes(sync::CURSORS_KEY, body.to_vec(), Some("application/json"))
-        .await
-        .map_err(|e| internal("write", e))?;
+    let storage = &state.pin().storage;
+    let key = sync::CURSORS_KEY;
+    let written = match if_match {
+        None => storage
+            .put_bytes(key, body.to_vec(), Some("application/json"))
+            .await
+            .map(|()| true),
+        Some(None) => Ok(false),
+        Some(Some(token)) if token.is_empty() => storage
+            .put_if_none_match(key, body.to_vec())
+            .await
+            .map(|w| w.is_some()),
+        Some(Some(token)) => storage
+            .put_if_match(key, &token, body.to_vec())
+            .await
+            .map(|w| w.is_some()),
+    }
+    .map_err(|e| internal("write", e))?;
+    if !written {
+        return Err((
+            StatusCode::PRECONDITION_FAILED,
+            "sync cursors changed since they were read".into(),
+        ));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 

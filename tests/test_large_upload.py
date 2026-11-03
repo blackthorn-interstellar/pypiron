@@ -10,11 +10,13 @@ that have a local emulator (S3/MinIO, Azure/Azurite).
 from __future__ import annotations
 
 import hashlib
+import http.client
 import io
 import os
 import re
 import tarfile
 import time
+from urllib.parse import urlparse
 
 import pytest
 
@@ -25,7 +27,7 @@ from .conftest import (
     _s3_signed,
     _start_s3_server,
 )
-from .helpers import http_get_bytes, upload_legacy, wait_for_file_in_index
+from .helpers import http_get_bytes, legacy_upload_request, upload_legacy, wait_for_file_in_index
 
 pytestmark = pytest.mark.integration
 
@@ -100,6 +102,25 @@ def s3_server_faulty(tmp_path_factory, pypiron_bin, request):
         buckets.close()
 
 
+def _upload_then_hang_up(server, sdist, held) -> None:
+    """Upload `sdist`, then hang up once `held()` says the server reached the
+    write the fault proxy is holding. The hang-up point is the held write, never
+    a client timeout racing a slow (debug, CI) server through the body."""
+    url = urlparse(server["legacy"])
+    body, headers = legacy_upload_request(
+        sdist, username=server["user"], password=server["password"]
+    )
+    conn = http.client.HTTPConnection(url.hostname, url.port, timeout=120)
+    try:
+        conn.request("POST", url.path, body=body, headers=headers)
+        deadline = time.monotonic() + 60
+        while not held():
+            assert time.monotonic() < deadline, "the upload never reached the held write"
+            time.sleep(0.1)
+    finally:
+        conn.close()
+
+
 def _open_multipart_uploads(minio, bucket):
     code, body = _s3_signed(minio, "GET", f"/{bucket}", query={"uploads": ""})
     assert code == 200, body[:200]
@@ -118,14 +139,9 @@ def test_dropped_large_upload_aborts_its_multipart(s3_server_faulty, tmp_path):
 
     # The upload starts, but its part writes hang; the client then gives up.
     faults.hold_puts(bucket, "_staging/")
-    try:
-        upload_legacy(
-            server["legacy"], sdist, username=server["user"], password=server["password"], timeout=5
-        )
-    except OSError:  # the client's read timeout: it hung up on the server
-        pass
-    else:
-        pytest.fail("the upload should still have been writing its parts")
+    _upload_then_hang_up(
+        server, sdist, lambda: faults.count(bucket=bucket, method="PUT", needle="_staging/") >= 1
+    )
     assert faults.count(bucket=bucket, method="POST", needle="uploads") >= 1
 
     deadline = time.monotonic() + 10
@@ -154,15 +170,11 @@ def test_dropped_large_upload_cleans_up_its_staging_copy(s3_server_faulty, tmp_p
     # The staging upload completes; the copy to the final key hangs.
     final_key = f"packages/halfway/{sdist.name}"
     faults.hold_puts(bucket, final_key)
-    try:
-        upload_legacy(
-            server["legacy"], sdist, username=server["user"], password=server["password"], timeout=5
-        )
-    except OSError:  # the client's read timeout: it hung up on the server
-        pass
-    else:
-        pytest.fail("the upload should still have been publishing")
-    assert faults.count(bucket=bucket, method="PUT", needle=f"{final_key}?") >= 1
+    _upload_then_hang_up(
+        server,
+        sdist,
+        lambda: faults.count(bucket=bucket, method="PUT", needle=f"{final_key}?") >= 1,
+    )
 
     deadline = time.monotonic() + 10
     while _s3_list(minio, bucket, "_staging/") and time.monotonic() < deadline:

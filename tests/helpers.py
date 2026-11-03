@@ -765,6 +765,32 @@ def upload_legacy(
     expect_status. Set `follow_redirects=False` to observe the server's raw
     status (urllib would otherwise transparently chase a 3xx and mask it).
     """
+    body, hdrs = legacy_upload_request(
+        wheel_path, username=username, password=password, fields=fields, filename=filename
+    )
+    if follow_redirects:
+        code, resp_body, _ = _http_request(
+            legacy_url, method="POST", headers=hdrs, data=body, timeout=timeout
+        )
+    else:
+        code, resp_body, _ = _post_no_redirect(legacy_url, headers=hdrs, data=body, timeout=timeout)
+    if code != expect_status:
+        raise RuntimeError(
+            f"Upload returned {code}, expected {expect_status}: {resp_body.decode('utf-8', 'replace')}"
+        )
+    return code, resp_body
+
+
+def legacy_upload_request(
+    wheel_path: Path,
+    *,
+    username: Optional[str] = None,
+    password: Optional[str] = None,
+    fields: Optional[Dict[str, str]] = None,
+    filename: Optional[str] = None,
+) -> Tuple[bytes, Dict[str, str]]:
+    """The body and headers `upload_legacy` POSTs, for tests that drive the
+    connection themselves."""
     filename = filename if filename is not None else wheel_path.name
     file_bytes = wheel_path.read_bytes()
     # Legacy binary formats (.egg/.exe/.msi) carry no parseable name/version; a
@@ -813,18 +839,7 @@ def upload_legacy(
     hdrs = {"Content-Type": f"multipart/form-data; boundary={boundary}"}
     if username and password:
         hdrs["Authorization"] = _encode_basic_auth(username, password)
-
-    if follow_redirects:
-        code, resp_body, _ = _http_request(
-            legacy_url, method="POST", headers=hdrs, data=body, timeout=timeout
-        )
-    else:
-        code, resp_body, _ = _post_no_redirect(legacy_url, headers=hdrs, data=body, timeout=timeout)
-    if code != expect_status:
-        raise RuntimeError(
-            f"Upload returned {code}, expected {expect_status}: {resp_body.decode('utf-8', 'replace')}"
-        )
-    return code, resp_body
+    return body, hdrs
 
 
 # ----------------------------- Binary path helper ----------------------------

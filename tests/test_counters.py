@@ -399,5 +399,8 @@ def test_counts_landing_after_their_day_is_totalled_show_on_metrics(
     while late.exists() and time.monotonic() < deadline:
         time.sleep(0.2)
     assert not late.exists(), "the late batch was swept"
+    # The metric is bumped after the sweep returns, a moment after the unlink.
+    while _discarded(base) < 1 and time.monotonic() < deadline:
+        time.sleep(0.2)
     assert _discarded(base) == 1
     assert _stats(base, "latecount")["total"] == 5

@@ -566,11 +566,16 @@ def _drift(original: bytes, ours_should_win: bool) -> bytes:
     """`original` with only its upload-time changed, picked so the same-sha merge's
     digest tie-break goes the requested way (the smaller sha256 wins)."""
     doc = json.loads(original)
-    for day in range(1, 29):
-        when = f"2020-02-{day:02d}T00:00:00Z"
-        drifted = original.replace(doc["upload-time"].encode(), when.encode())
-        assert drifted != original
-        ours_wins = hashlib.sha256(original).digest() <= hashlib.sha256(drifted).digest()
+    old = doc["upload-time"].encode()
+    original_digest = hashlib.sha256(original).digest()
+    for i in range(1, 10_000):
+        hour, rem = divmod(i, 3600)
+        minute, second = divmod(rem, 60)
+        when = f"2020-01-01T{hour:02d}:{minute:02d}:{second:02d}Z"
+        drifted = original.replace(old, when.encode(), 1)
+        if drifted == original:
+            continue
+        ours_wins = original_digest <= hashlib.sha256(drifted).digest()
         if ours_wins == ours_should_win:
             return drifted
     raise AssertionError("no upload-time gave the wanted tie-break")

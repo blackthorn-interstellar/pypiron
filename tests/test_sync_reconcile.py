@@ -402,9 +402,10 @@ def test_a_failed_full_sync_is_retried_by_the_next_run(source_dest, pypiron_bin,
     lists = _seeded(source, tmp_path, "memoh")
     rc, out, err = _run_sync(pypiron_bin, source, dest, lists["memoh"])
     assert rc == 0, out + err
+    (filename,) = _dest_filenames(source, "memoh")
+    wait_for_file_in_index(dest["simple"], "memoh", filename)
     # The dest lost its copy, and the repair download fails (the source still
     # lists the file, so its index and ETag are unchanged).
-    (filename,) = _dest_filenames(dest, "memoh")
     code, _, _ = http_request_auth(
         "DELETE", f"{dest['base_url']}/files/memoh/{filename}", **_admin(dest)
     )

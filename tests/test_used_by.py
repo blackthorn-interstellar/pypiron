@@ -79,8 +79,10 @@ def test_audit_rebuilds_lost_used_by_files(disk_server_fast_reconcile, tmp_path)
         path.unlink()
     # A tick can rewrite lib.json with only the packages it just rebuilt
     # (the last seed upload is `any`) before the audit fills in the rest.
+    # The worker will not start another audit until 10× the last one's
+    # duration have passed, which under parallel load exceeds 30s.
     expected = {"any", "app", "old"}
-    deadline = time.monotonic() + 30
+    deadline = time.monotonic() + 90
     while (got := set(json.loads(used_by.read_text())) if used_by.exists() else set()) != expected:
         assert time.monotonic() < deadline, f"the audit never rebuilt lib.json: {got}"
         time.sleep(0.2)

@@ -549,17 +549,30 @@ def test_selected_bucket_deletion_switches_and_retry_succeeds(minio_two, s3_serv
         timeout=10,
         what="fallback bucket known healthy",
     )
-    minio_remove_bucket(minio_two, a)
     wheel = make_wheel("missingselected", "1.0", tmp_path)
-    _retry_upload(server, wheel, timeout=15)
+    key = f"packages/missingselected/{wheel.name}"
+    minio_remove_bucket(minio_two, a)
+
+    def _landed_on_fallback():
+        # A 200 against a resurrected A is not success: the wait re-deletes
+        # that bucket (a53b7e9 / c4d9844) and the bytes go with it. Keep
+        # retrying until selection has moved and the write is on B.
+        try:
+            _upload(server, wheel)
+        except RuntimeError:
+            pass
+        return (
+            _selected_bucket(server) == b
+            and _bucket_health(server, a) == -1
+            and minio_key_exists_in(minio_two, b, key)
+        )
+
     _eventually_bucket_stays_gone(
         minio_two,
         a,
-        lambda: _selected_bucket(server) == b and _bucket_health(server, a) == -1,
-        what="deleted bucket fails out and selection moves to the fallback",
+        _landed_on_fallback,
+        what="deleted bucket fails out and the retried upload lands on the fallback",
     )
-    key = f"packages/missingselected/{wheel.name}"
-    assert minio_key_exists_in(minio_two, b, key)
 
     # Restore the fixture member and prove the durable marker heals it while B
     # remains selected (the default return window is five minutes).

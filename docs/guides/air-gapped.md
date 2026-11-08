@@ -80,8 +80,10 @@ of its extras, on any platform: sync also copies each version of each
 dependency that some requirement allows. That is often far more than the list
 itself — `fastapi` alone brings about a hundred projects. Use
 [mirror filters](../reference/configuration.md#mirror-selection) to keep only
-the offline clients' Python versions and platforms. A package you list keeps
-its own range even when a dependency asks for more.
+the offline clients' Python versions and platforms. The dependencies shrink with
+them: a Linux-only mirror skips what only Windows or macOS needs, and
+`exclude-python-below = "3.9"` skips backports for older Pythons. A package you
+list keeps its own range even when a dependency asks for more.
 
 To copy only the exact versions one project locks instead, export them and
 leave `include-dependencies` out:

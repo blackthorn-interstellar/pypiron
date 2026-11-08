@@ -316,11 +316,12 @@ impl Follow {
 
     fn closure(
         &self,
-        roots: &[crate::sync::PackageSpec],
+        mirror: &ResolvedMirror,
         private: &crate::names::PrivateNames,
     ) -> BTreeMap<String, Want> {
+        let targets = crate::sync::dependency_targets(mirror);
         let known = self.known.lock().unwrap_or_else(|e| e.into_inner());
-        deps::closure(roots, &known.memo, private)
+        deps::closure(&mirror.include_packages, &known.memo, private, &targets)
     }
 }
 
@@ -1896,7 +1897,7 @@ impl Proxy {
         // What an earlier run read answers startup's ask at once; this
         // refresh then only catches up on what was published since.
         if self.load_followed(state, follow).await {
-            let wants = follow.closure(&self.mirror.include_packages, &state.private);
+            let wants = follow.closure(&self.mirror, &state.private);
             self.publish_scope(follow, &wants);
             follow.answered.send_replace(1);
         }
@@ -1931,7 +1932,7 @@ impl Proxy {
     async fn refresh_dependencies(&self, state: &AppState, follow: &Follow) {
         let mut done: HashSet<(String, Want)> = HashSet::new();
         loop {
-            let wants = follow.closure(&self.mirror.include_packages, &state.private);
+            let wants = follow.closure(&self.mirror, &state.private);
             self.publish_scope(follow, &wants);
             let round: Vec<(String, Want)> = wants
                 .into_iter()
@@ -1982,12 +1983,12 @@ impl Proxy {
             // Owned, so the reads below hold no borrow across an await.
             unread
                 .into_iter()
-                .map(|(version, file)| (version, file.clone()))
+                .map(|(version, key, file)| (version, key, file.clone()))
                 .collect::<Vec<_>>()
         };
         // `Err` = the fetch failed; `Ok(None)` = no metadata file to read.
         let read: Vec<_> = stream::iter(unread)
-            .map(|(version, file)| async move {
+            .map(|(version, key, file)| async move {
                 let requires = if file.has_core_metadata() {
                     self.fetch_metadata_url(pkg, &file)
                         .await
@@ -1996,21 +1997,21 @@ impl Proxy {
                 } else {
                     Ok(None)
                 };
-                (version, requires)
+                (version, key, requires)
             })
             .buffer_unordered(FOLLOW_CONCURRENCY)
             .collect()
             .await;
         let mut known = follow.known.lock().unwrap_or_else(|e| e.into_inner());
         let known = &mut *known;
-        for (version, requires) in read {
+        for (version, key, requires) in read {
             match requires {
                 Ok(requires) => {
                     known
                         .memo
                         .entry(pkg.to_string())
                         .or_default()
-                        .record(version, requires);
+                        .record(version, key, requires);
                     known.dirty = true;
                 }
                 Err(()) => {
@@ -2062,15 +2063,14 @@ impl Proxy {
         };
         let unread = {
             let known = follow.known.lock().unwrap_or_else(|e| e.into_inner());
-            let seen = known.memo.get(pkg);
-            files
-                .iter()
-                .filter(|f| !self.fill_refused_by_yank(f))
-                .filter_map(|f| infer_version_from_filename(&f.filename))
-                .any(|v| {
-                    !seen.is_some_and(|m| m.releases.contains_key(&v))
-                        && !known.failed.contains(&(pkg.to_string(), v))
-                })
+            let none = DepsMemo::default();
+            known
+                .memo
+                .get(pkg)
+                .unwrap_or(&none)
+                .unread(files.iter().filter(|f| !self.fill_refused_by_yank(f)))
+                .into_iter()
+                .any(|(v, _, _)| !known.failed.contains(&(pkg.to_string(), v)))
         };
         if unread {
             follow.ask();

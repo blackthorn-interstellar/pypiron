@@ -292,11 +292,13 @@ pub struct MirrorArgs {
 
     /// Also include every dependency of the included packages, and theirs,
     /// until nothing new turns up. Follows every extra of an included package
-    /// and every platform, and takes each version some requirement allows, so
-    /// any included release installs. The other filters and package excludes
-    /// still apply; a dependency never widens a package you included yourself.
-    /// Reads each release's metadata file (PEP 658); a release without one has
-    /// its dependencies skipped.
+    /// and every platform the platform filters keep, and takes each version
+    /// some requirement allows, so any included release installs. A
+    /// dependency only a filtered-out platform or a Python below
+    /// --exclude-python-below needs is skipped. The other filters and package
+    /// excludes still apply; a dependency never widens a package you included
+    /// yourself. Reads the metadata file (PEP 658) of every kept wheel; a
+    /// release without one has its dependencies skipped.
     #[arg(long = "include-dependencies", env = "PYPIRON_INCLUDE_DEPENDENCIES")]
     pub include_dependencies: bool,
 
@@ -1519,7 +1521,9 @@ struct CursorEntry {
     /// a re-run reads metadata only for new releases and an unchanged listing
     /// (304) still knows where to go next. A release's metadata never changes,
     /// so this outlives a config change. Absent = never read; that forces a 200.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Saved as `requires`: older cursors' `deps` read one wheel per release,
+    /// and ignoring them reads every release again, once.
+    #[serde(rename = "requires", default, skip_serializing_if = "Option::is_none")]
     deps: Option<DepsMemo>,
 }
 
@@ -2362,6 +2366,7 @@ pub async fn run_sync(
         .filter(|_| resolved.mirror.include_dependencies)
         .filter_map(|(name, c)| Some((name.clone(), c.deps.clone()?)))
         .collect();
+    let targets = dependency_targets(&resolved.mirror);
     let mut done: HashSet<(String, Want)> = HashSet::new();
     let progress = Arc::new(Progress::new(0));
     let ticker = (!args.no_progress).then(|| spawn_progress(progress.clone()));
@@ -2372,6 +2377,7 @@ pub async fn run_sync(
             &resolved.mirror.include_packages,
             &memos,
             &resolved.private,
+            &targets,
             &done,
         );
         if jobs.is_empty() {
@@ -3211,24 +3217,24 @@ async fn read_dependencies(
     progress: &Progress,
 ) -> Result<DepsMemo> {
     let unread = memo.unread(selected.iter().map(|s| &s.file));
-    let read: Vec<(String, Option<Vec<String>>)> = stream::iter(unread)
-        .map(|(version, file)| async move {
+    let read: Vec<(String, String, Option<Vec<String>>)> = stream::iter(unread)
+        .map(|(version, key, file)| async move {
             let requires = if file.has_core_metadata() {
                 Some(fetch_requires(client, resolved, file).await?)
             } else {
                 None
             };
-            Ok::<_, anyhow::Error>((version, requires))
+            Ok::<_, anyhow::Error>((version, key, requires))
         })
         .buffer_unordered(resolved.concurrency)
         .try_collect()
         .await?;
-    for (version, requires) in read {
+    for (version, key, requires) in read {
         if requires.is_none() {
             info!("{pkg} {version}: no metadata file on the source; its dependencies are not followed");
             progress.no_metadata();
         }
-        memo.record(version, requires);
+        memo.record(version, key, requires);
     }
     Ok(memo)
 }
@@ -3845,6 +3851,34 @@ fn held_back_by_newer(file: &SimpleFile, m: &ResolvedMirror) -> Option<OffsetDat
     .then_some(uploaded)
 }
 
+/// Where this mirror's releases install, as its platform filters and Python
+/// floor say ([`deps::Targets`]), so dependencies only other platforms or
+/// older Pythons need are not followed.
+pub(crate) fn dependency_targets(m: &ResolvedMirror) -> deps::Targets {
+    let narrowed = m.exclude_windows
+        || !m.exclude_platform_tag.is_empty()
+        || !m.include_platform_tag.is_empty();
+    // An include naming a platform the follower doesn't know could be any.
+    let known: Vec<String> = deps::known_platform_tags()
+        .chain(["any".to_string()])
+        .collect();
+    let unknown = m
+        .include_platform_tag
+        .iter()
+        .any(|pat| !tokens_match_any(&known, std::slice::from_ref(pat)));
+    let kept = |tag: &str| {
+        let tag = [tag.to_string()];
+        !(m.exclude_windows && tag[0].starts_with("win"))
+            && !tokens_all_excluded(&tag, &m.exclude_platform_tag)
+            && (m.include_platform_tag.is_empty()
+                || tokens_match_any(&tag, &m.include_platform_tag))
+    };
+    deps::Targets::new(
+        (narrowed && !unknown).then_some(kept),
+        m.exclude_python_below,
+    )
+}
+
 /// True when `filters` is set and matches every token — no tag on this axis
 /// survives the exclusion.
 fn tokens_all_excluded(tokens: &[String], filters: &[String]) -> bool {
@@ -4253,6 +4287,44 @@ mod tests {
             fixes_skip_cooldown: true,
             fix_settle: time::Duration::hours(1),
         }
+    }
+
+    #[test]
+    fn dependency_targets_follow_the_platform_filters() {
+        let win = "pywin32; sys_platform == 'win32'";
+        let mac = "appnope; sys_platform == 'darwin'";
+        let x86 = "x; platform_machine == 'x86_64'";
+        let follows = |m: ResolvedMirror| {
+            let t = dependency_targets(&m);
+            [win, mac, x86].map(|r| t.admits(r.split_once(';').unwrap().1))
+        };
+        assert_eq!(follows(base_filter()), [true, true, true]);
+        let linux_ci = ResolvedMirror {
+            exclude_platform_tag: vec!["win*".into(), "macosx_*".into()],
+            ..base_filter()
+        };
+        assert_eq!(follows(linux_ci), [false, false, true]);
+        let no_windows = ResolvedMirror {
+            exclude_windows: true,
+            ..base_filter()
+        };
+        assert_eq!(follows(no_windows), [false, true, true]);
+        let arm_linux = ResolvedMirror {
+            include_platform_tag: vec!["any".into(), "manylinux_2_28_aarch64".into()],
+            ..base_filter()
+        };
+        assert_eq!(follows(arm_linux), [false, false, false]);
+        // A platform the follower doesn't know could be anything.
+        let riscv = ResolvedMirror {
+            include_platform_tag: vec!["manylinux_2_28_aarch64".into(), "*riscv64".into()],
+            ..base_filter()
+        };
+        assert_eq!(follows(riscv), [true, true, true]);
+        let floor = ResolvedMirror {
+            exclude_python_below: Some((3, 9)),
+            ..base_filter()
+        };
+        assert!(!dependency_targets(&floor).admits("python_version < '3.8'"));
     }
 
     fn named_file(filename: &str) -> SimpleFile {

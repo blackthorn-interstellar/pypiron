@@ -364,15 +364,17 @@ Rules:
   layer.
 - Excludes win.
 - `include-dependencies = true` also includes everything the included packages
-  need, so any included release installs with any of its extras on any
+  need, so any included release installs with any of its extras on any kept
   platform. Each dependency takes every version some requirement allows. Your
   filters and excludes still apply, and a package you include keeps its own
-  version range. `sync` copies the dependencies; the proxy serves them on
+  version range. Platform filters and `exclude-python-below` also narrow what
+  is followed: a dependency only Windows or Python 3.7 needs is skipped when
+  you keep neither. `sync` copies the dependencies; the proxy serves them on
   request. The proxy works out the dependencies in the background. Until it
   has (on its first start, or just after an included package publishes a
   release with a new dependency), a request for a dependency waits up to
-  20 seconds and then gets a 503 to retry. Dependencies come from each
-  release's metadata file, which PyPI provides for wheels. Old releases that
+  20 seconds and then gets a 503 to retry. Dependencies come from the
+  metadata file of every wheel you keep, which PyPI provides for wheels. Old releases that
   only have an sdist are skipped, and `sync` counts them in its summary.
 - `include-format` accepts `wheel`, `sdist`, and `other`.
 - Tag filters match wheel tags and support `*`. They never drop sdists; use

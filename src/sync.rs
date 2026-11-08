@@ -1521,9 +1521,7 @@ struct CursorEntry {
     /// a re-run reads metadata only for new releases and an unchanged listing
     /// (304) still knows where to go next. A release's metadata never changes,
     /// so this outlives a config change. Absent = never read; that forces a 200.
-    /// Saved as `requires`: older cursors' `deps` read one wheel per release,
-    /// and ignoring them reads every release again, once.
-    #[serde(rename = "requires", default, skip_serializing_if = "Option::is_none")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     deps: Option<DepsMemo>,
 }
 

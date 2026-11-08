@@ -151,7 +151,7 @@ def test_dependencies_follow_every_extra_platform_and_allowed_version(
     # The memo lets the next run start from the whole closure: one round, and
     # nothing left to copy.
     cursors = json.loads((disk_server["data_dir"] / "_sync/cursors.json").read_text())
-    assert ["lib>=2"] in [r[:1] for r in cursors["app"]["requires"]["metadata"]["1.0"].values()]
+    assert ["lib>=2"] in [r[:1] for r in cursors["app"]["deps"]["metadata"]["1.0"].values()]
     again = _sync(pypiron_bin, source, disk_server, "--include-package", "app")
     assert "following dependencies" not in again, again
     assert "· 0 files ·" in again, again

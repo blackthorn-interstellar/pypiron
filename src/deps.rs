@@ -528,9 +528,7 @@ pub(crate) fn specifiers(want: &Want) -> Option<Vec<VersionSpecifiers>> {
 pub(crate) struct DepsMemo {
     /// Release version → metadata file ([`metadata_key`]) → its
     /// `Requires-Dist` entries. A release without any metadata file has one
-    /// empty entry under [`NO_METADATA`], so it is reported once. Required, so
-    /// a memo saved before files were read separately is unreadable and
-    /// everything is read again.
+    /// empty entry under [`NO_METADATA`], so it is reported once.
     pub(crate) metadata: BTreeMap<String, BTreeMap<String, Vec<String>>>,
 }
 

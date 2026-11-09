@@ -320,6 +320,16 @@ pub(crate) async fn legacy_upload(
     if !valid_artifact_filename(&filename) {
         return Err((StatusCode::BAD_REQUEST, "Invalid filename".into()));
     }
+    if filename.len() > sidecar::MAX_NEW_ARTIFACT_FILENAME_BYTES {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            format!(
+                "Filename too long: {} bytes, the limit is {}",
+                filename.len(),
+                sidecar::MAX_NEW_ARTIFACT_FILENAME_BYTES
+            ),
+        ));
+    }
 
     let pkg_norm = match fields.get("name") {
         Some(name) => normalize_pkg_name(name),

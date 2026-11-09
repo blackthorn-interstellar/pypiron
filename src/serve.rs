@@ -578,7 +578,17 @@ async fn eligible_proxy<'a>(
     match proxy::eligible(state, storage, pkg).await {
         Ok(true) => ProxyDecision::Serve(proxy),
         Ok(false) => ProxyDecision::FallThrough,
-        Err(e) => ProxyDecision::Deny(read_error(e)),
+        Err(e) => ProxyDecision::Deny(eligibility_error(e)),
+    }
+}
+
+/// An `eligible` failure: a dependency scope still being read is an upstream
+/// outage pip and uv retry; anything else is a storage read error.
+fn eligibility_error(e: anyhow::Error) -> Response<Body> {
+    if e.is::<proxy::ScopePending>() {
+        upstream_unavailable()
+    } else {
+        read_error(e)
     }
 }
 
@@ -608,6 +618,8 @@ async fn proxy_package_index(
     match proxy::eligible(state, storage, pkg).await {
         Ok(true) => {}
         Ok(false) => return ControlFlow::Continue(false),
+        // Scope not read yet: serve what is local, else the retryable outage.
+        Err(e) if e.is::<proxy::ScopePending>() => return ControlFlow::Continue(true),
         // Origin unreadable is an outage: never answer "what owns this name"
         // questions optimistically (the dependency-confusion direction).
         Err(e) => return ControlFlow::Break(read_error(e)),
@@ -1288,7 +1300,7 @@ async fn proxy_ensure_artifact(
     match proxy::eligible(state, storage.as_ref(), pkg).await {
         Ok(true) => {}
         Ok(false) => return ProxyEnsure::Serve { filled: false },
-        Err(e) => return ProxyEnsure::Fail(read_error(e)),
+        Err(e) => return ProxyEnsure::Fail(eligibility_error(e)),
     }
     match proxy
         .ensure_artifact_cached(state, storage, pkg, filename, tee_allowed)

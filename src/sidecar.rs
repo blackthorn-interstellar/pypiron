@@ -41,6 +41,15 @@ pub const MIRROR_QUARANTINED_SUFFIX: &str = ".mirror-quarantined";
 /// longer move the body — the supersede may still be running.
 pub const SUPERSEDING_SUFFIX: &str = ".superseding";
 
+/// Longest artifact filename a new write may store. A disk backend bounds each
+/// path component at NAME_MAX (255 bytes on Linux and macOS), and every
+/// companion is the artifact's name plus a suffix, so the longest suffix sets
+/// the budget. A longer name stores its body, fails its sidecar, and leaves a
+/// file no index rebuild can get past. Reads keep the longer
+/// [`crate::names::MAX_ARTIFACT_FILENAME_BYTES`], so a name already in an
+/// object store stays reachable.
+pub const MAX_NEW_ARTIFACT_FILENAME_BYTES: usize = 255 - MIRROR_QUARANTINED_SUFFIX.len();
+
 /// PEP 592 yank state: `false`, `true`, or a reason string.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(untagged)]
@@ -246,6 +255,24 @@ pub fn is_artifact(filename: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_companion_of_a_new_filename_fits_name_max() {
+        for suffix in [
+            SIDECAR_SUFFIX,
+            METADATA_SUFFIX,
+            PROVENANCE_SUFFIX,
+            TOMBSTONE_SUFFIX,
+            FROZEN_SUFFIX,
+            MIRROR_QUARANTINED_SUFFIX,
+            SUPERSEDING_SUFFIX,
+        ] {
+            assert!(
+                MAX_NEW_ARTIFACT_FILENAME_BYTES + suffix.len() <= 255,
+                "{suffix}"
+            );
+        }
+    }
 
     #[test]
     fn artifact_filter_excludes_sidecars_and_dotfiles() {

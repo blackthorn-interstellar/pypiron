@@ -12,6 +12,8 @@ from __future__ import annotations
 
 import json
 import os
+import socket
+import time
 from pathlib import Path
 
 import pytest
@@ -327,3 +329,49 @@ def test_proxy_included_package_keeps_its_own_spec(source, tmp_path_factory, pyp
         assert _served(proxy, "unrelated") is None
     finally:
         gen.close()
+
+
+def test_a_stuck_dependency_refresh_never_holds_a_private_page(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """The upstream accepts connections and never answers, so the first
+    dependency refresh hangs. A private package is answered at once rather than
+    after the refresh wait, and a name the scope can't vouch for yet gets a 503
+    pip and uv retry, with Retry-After, rather than an empty one."""
+    hung = socket.socket()
+    hung.bind(("127.0.0.1", 0))
+    hung.listen(64)
+    gen = _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=[
+            "--proxy-upstream",
+            f"http://127.0.0.1:{hung.getsockname()[1]}/simple/",
+            "--allow-insecure-upstream",
+            "--exclude-newer",
+            "",
+            "--include-dependencies",
+            "--include-package",
+            "app",
+        ],
+    )
+    server = next(gen)
+    try:
+        wheel = make_wheel("privpkg", "1.0", tmp_path)
+        upload_legacy(
+            server["legacy"],
+            wheel,
+            username=server["user"],
+            password=server["password"],
+        )
+        started = time.monotonic()
+        wait_for_file_in_index(server["simple"], "privpkg", wheel.name)
+        assert time.monotonic() - started < 10
+
+        status, body, headers = http_get(f"{server['simple']}unknownpkg/", timeout=60)
+        assert status == 503
+        assert headers.get("retry-after")
+        assert b"retry shortly" in body
+    finally:
+        gen.close()
+        hung.close()

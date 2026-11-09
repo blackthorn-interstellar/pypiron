@@ -75,13 +75,14 @@ pub fn infer_package_from_filename(filename: &str) -> String {
 /// keeping a request-controlled name from sizing a path segment or a map key.
 const MAX_PKG_NAME_BYTES: usize = 256;
 
-/// Longest artifact `filename` path segment, on the write path and the read
-/// path alike. Real wheel and sdist names run far under this; the cap keeps a
-/// request-controlled string out of the download-counter and presign caches,
-/// which bound entry *count*, not key length — without it a client can pin
-/// memory with 400 KB filenames. Upload and download share the one const on
-/// purpose: a name the reader would refuse must never reach storage, or the
-/// bytes are written, listed in `/simple/`, and permanently unreachable.
+/// Longest artifact `filename` path segment the read path serves. Real wheel
+/// and sdist names run far under this; the cap keeps a request-controlled
+/// string out of the download-counter and presign caches, which bound entry
+/// *count*, not key length — without it a client can pin memory with 400 KB
+/// filenames. New writes stop shorter, at
+/// [`crate::sidecar::MAX_NEW_ARTIFACT_FILENAME_BYTES`]: a name the reader would
+/// refuse must never reach storage, or the bytes are written, listed in
+/// `/simple/`, and permanently unreachable.
 pub const MAX_ARTIFACT_FILENAME_BYTES: usize = 256;
 
 /// A well-formed PEP 503 normalized name: nonempty, at most

@@ -69,24 +69,31 @@ def test_normal_upload_with_modest_metadata_succeeds(disk_server, tmp_path):
 # The download path refuses any filename over 256 bytes. Upload has to agree, or
 # a longer name is written, listed in /simple/, and then 404s on every GET.
 MAX_ARTIFACT_FILENAME_BYTES = 256
+# New writes stop shorter: a disk backend bounds every path component at
+# NAME_MAX (255 bytes), and the longest companion suffix (`.mirror-quarantined`)
+# is 19 bytes.
+MAX_NEW_ARTIFACT_FILENAME_BYTES = 236
 _SUFFIX = "-1.0-py3-none-any.whl"
 
 
-def test_a_very_long_filename_uploads_and_downloads(disk_server, tmp_path):
-    """A long filename round-trips: upload, index, artifact GET, and the PEP 658
-    companion — which is the name plus a suffix, so the servable cap has to be
-    measured against the artifact name, not the whole URL segment.
-
-    Long, not maximal: a disk backend bounds every path component at NAME_MAX
-    (255 bytes on macOS and Linux alike) and writes each companion through a
-    `.tmp-<nanos>-<pid>-<seq>-<name>` sibling, which spends ~34 of those bytes
-    before the sidecar suffix. The 256-byte cap itself is pinned by the
-    `valid_artifact_filename` unit test, which no filesystem constrains.
-    """
-    pkg = "longname"
-    version = "1" + ".0" * 66  # 133 bytes of PEP 440
+def _wheel_named(pkg, length, tmp_path):
+    """A real wheel whose filename is exactly `length` bytes, stretched through
+    its version so the filename still names its own project."""
+    fixed = len(f"{pkg}--py3-none-any.whl")
+    room = length - fixed
+    version = ("1" if room % 2 else "11") + ".0" * ((room - 1) // 2)
     wheel = make_wheel(pkg, version, tmp_path)
-    assert 150 < len(wheel.name) < 200
+    assert len(wheel.name) == length
+    return wheel
+
+
+def test_the_longest_storable_filename_round_trips(disk_server, tmp_path):
+    """A filename at the write cap round-trips on disk: upload, index, artifact
+    GET, and the PEP 658 companion, which is the name plus a suffix. One past
+    it used to store the body and then fail every sidecar write, leaving the
+    package's index unbuildable."""
+    pkg = "longname"
+    wheel = _wheel_named(pkg, MAX_NEW_ARTIFACT_FILENAME_BYTES, tmp_path)
 
     upload_legacy(
         disk_server["legacy"],
@@ -104,6 +111,33 @@ def test_a_very_long_filename_uploads_and_downloads(disk_server, tmp_path):
     code, meta, _ = http_get(f"{url}.metadata")
     assert code == 200
     assert b"Metadata-Version" in meta
+
+
+def test_filename_past_the_write_cap_is_rejected_and_the_package_still_indexes(
+    disk_server, tmp_path
+):
+    """One byte past the write cap is refused up front, and the package's other
+    files keep indexing."""
+    pkg = "toolong"
+    long_wheel = _wheel_named(pkg, MAX_NEW_ARTIFACT_FILENAME_BYTES + 1, tmp_path)
+    code, body = upload_legacy(
+        disk_server["legacy"],
+        long_wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+        expect_status=400,
+    )
+    assert code == 400
+    assert b"Filename too long" in body
+
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_file_in_index(disk_server["simple"], pkg, wheel.name)
 
 
 def test_filename_past_the_servable_cap_is_rejected(disk_server, tmp_path):

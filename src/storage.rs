@@ -1883,14 +1883,16 @@ impl DiskStorage {
         // distinct staging path per call. On a coarse-clock host two concurrent
         // writes to the same key can read identical nanos, share one tmp inode,
         // and clobber each other's bytes (corrupting e.g. the .origin marker).
+        //
+        // The name carries nothing of the destination's: a temp name that grew
+        // with it would hit NAME_MAX for a destination that itself fits.
         static TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-        let name = path
-            .file_name()
-            .and_then(|n| n.to_str())
-            .ok_or_else(|| anyhow!("bad path"))?;
+        if path.file_name().is_none() {
+            bail!("bad path");
+        }
         let nanos = OffsetDateTime::now_utc().unix_timestamp_nanos();
         let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
-        Ok(path.with_file_name(format!(".tmp-{nanos}-{}-{seq}-{name}", std::process::id())))
+        Ok(path.with_file_name(format!(".tmp-{nanos}-{}-{seq}", std::process::id())))
     }
 
     /// hard_link `tmp`→`dest` as an atomic create-if-absent (EEXIST → already

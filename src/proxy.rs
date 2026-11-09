@@ -300,18 +300,19 @@ impl Follow {
         self.wake.notify_one();
     }
 
-    /// Wait until every refresh asked for so far has finished.
-    async fn settled(&self) -> Result<()> {
+    /// A refresh asked for has not finished yet.
+    fn pending(&self) -> bool {
+        *self.answered.borrow() < self.asked.load(Ordering::Acquire)
+    }
+
+    /// Wait until every refresh asked for so far has finished; false if that
+    /// took longer than [`FOLLOW_WAIT`].
+    async fn settled(&self) -> bool {
         let target = self.asked.load(Ordering::Acquire);
         let mut rx = self.answered.subscribe();
-        tokio::time::timeout(FOLLOW_WAIT, async {
-            rx.wait_for(|&answered| answered >= target).await.is_ok()
-        })
-        .await
-        .ok()
-        .filter(|&ok| ok)
-        .map(|_| ())
-        .ok_or_else(|| anyhow!("still reading the included packages' dependencies; retry shortly"))
+        tokio::time::timeout(FOLLOW_WAIT, rx.wait_for(|&answered| answered >= target))
+            .await
+            .is_ok_and(|r| r.is_ok())
     }
 
     fn closure(
@@ -799,6 +800,19 @@ fn advisory_blocks(state: &AppState, pkg: &str, filename: &str) -> bool {
     !snap.blocking(pkg, version.as_deref()).is_empty()
 }
 
+/// The dependency scope is still being read and does not yet include this
+/// name: answer a retryable outage, never "no such package".
+#[derive(Debug)]
+pub(crate) struct ScopePending;
+
+impl std::fmt::Display for ScopePending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("still reading the included packages' dependencies; retry shortly")
+    }
+}
+
+impl std::error::Error for ScopePending {}
+
 /// May this package be served from upstream at all? Private names, the reserved
 /// private names, and (when a scope is configured) names outside the allowlist
 /// never fall through — that is the entire defense.
@@ -806,21 +820,28 @@ pub async fn eligible(state: &AppState, storage: &dyn Storage, pkg: &str) -> Res
     if state.private.matches(pkg) {
         return Ok(false);
     }
-    // The package allowlist is fail-closed and never reads storage (it may wait
-    // on a pending dependency refresh), so it gates before the origin read — an
-    // unapproved name never even touches storage.
+    // The package allowlist is fail-closed and gates before the origin read, so
+    // an unapproved name never touches storage — except when the check would
+    // wait on a dependency refresh: a private name is answered first, so a slow
+    // upstream can't hold a private package's page hostage.
     if let Some(proxy) = &state.proxy {
         if proxy.name_fully_denied(pkg) {
+            return Ok(false);
+        }
+        if proxy.scope_would_wait(pkg) && is_private(storage, pkg).await? {
             return Ok(false);
         }
         if !proxy.in_scope(pkg).await? {
             return Ok(false);
         }
     }
-    match origin::read_origin(storage, pkg).await? {
-        Some(owner) if owner == origin::PRIVATE => Ok(false),
-        _ => Ok(true),
-    }
+    Ok(!is_private(storage, pkg).await?)
+}
+
+async fn is_private(storage: &dyn Storage, pkg: &str) -> Result<bool> {
+    Ok(origin::read_origin(storage, pkg)
+        .await?
+        .is_some_and(|owner| owner == origin::PRIVATE))
 }
 
 impl Proxy {
@@ -973,12 +994,23 @@ impl Proxy {
     /// [`Self::name_in_scope`], once the dependency scope has caught up with
     /// every refresh asked for: an installer asks for a new dependency right
     /// after the listing that revealed it. A dependency's versions can widen
-    /// too, so every name but an included one waits.
+    /// too, so every name but an included one waits. A refresh that outlasts
+    /// [`FOLLOW_WAIT`] (a stuck upstream) leaves a name already in scope served
+    /// on its last-known versions; one not yet in scope is [`ScopePending`].
     async fn in_scope(&self, pkg: &str) -> Result<bool> {
         if let Some(follow) = self.follow.as_ref().filter(|f| !f.listed.contains(pkg)) {
-            follow.settled().await?;
+            if !follow.settled().await && !self.name_in_scope(pkg) {
+                return Err(ScopePending.into());
+            }
         }
         Ok(self.name_in_scope(pkg))
+    }
+
+    /// Would [`Self::in_scope`] wait on a dependency refresh for this name?
+    fn scope_would_wait(&self, pkg: &str) -> bool {
+        self.follow
+            .as_ref()
+            .is_some_and(|f| !f.listed.contains(pkg) && f.pending())
     }
 
     /// True only for a bare (whole-name) exclude — what the pull gate
@@ -1336,6 +1368,10 @@ impl Proxy {
         let Some(file) = found.files.iter().find(|f| f.filename == filename) else {
             return Ok(false); // not upstream, or filtered out
         };
+        if filename.len() > crate::sidecar::MAX_NEW_ARTIFACT_FILENAME_BYTES {
+            warn!(%pkg, %filename, "proxy: refusing to cache a filename too long to store");
+            return Ok(false);
+        }
 
         if self.fill_refused_by_yank(file) {
             debug!(%pkg, %filename, "proxy: refusing to cache a file yanked upstream");

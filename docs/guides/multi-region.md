@@ -35,6 +35,9 @@ Put a load balancer in front of them:
 - Send readiness checks to `/ready`.
 - Send process-liveness checks to `/health`.
 - Route clients to the nearest healthy region.
+- Set `--trusted-proxy` on every node, so a few wrong passwords lock out one
+  client rather than everyone behind the balancer
+  ([details](standard-cloud.md#more-nodes)).
 
 `/ready` returns `503` only when a node cannot serve reads or is shutting down.
 `/health` stays `200` while the process is alive, including during a storage

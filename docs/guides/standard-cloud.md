@@ -222,6 +222,12 @@ behind a load balancer:
 
 Terminate TLS at the load balancer. Do not expose `/metrics` publicly.
 
+Set `--trusted-proxy` on every node behind it. Without it, every client appears
+to come from the load balancer's address, so five wrong passwords from anyone
+lock out everyone for the [login cooldown](../security.md#login-throttling).
+pypiron uses the last address in `X-Forwarded-For`, so the balancer must add
+the client's address as the last entry.
+
 ## Point clients at it
 
 Publish to `/legacy/` and install from `/simple/`. Follow

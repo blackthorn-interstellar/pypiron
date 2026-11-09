@@ -43,7 +43,6 @@ from .helpers import (
     run_checked,
     sha256_file,
     upload_legacy,
-    wait_for_file_in_index,
 )
 
 pytestmark = [pytest.mark.integration, pytest.mark.chaos]
@@ -441,7 +440,7 @@ def proxy_over_fault_reclaim(
         tmp_path,
         worker_args=(
             "--intent-grace-secs",
-            "10",
+            "3",
             "--reconcile-interval-secs",
             "1",
         ),
@@ -611,8 +610,13 @@ def test_hash_mismatch_is_never_committed(proxy_over_fault, tmp_path):
     _healthy_fetch_matches(proxy, pkg, filename, sha256_file(wheel))
 
 
-def test_worker_reclaims_failed_proxy_claim_for_private_upload(proxy_over_fault_reclaim, tmp_path):
-    """The real single-bucket audit releases a stable abandoned mirror claim."""
+def test_failed_proxy_fill_keeps_the_public_name_out_of_private_hands(
+    proxy_over_fault_reclaim, tmp_path
+):
+    """A fill that dies before its bytes land still leaves the mirror claim, and
+    the audit never frees it: upstream lists the name, so an uploader claiming
+    it private is the dependency-confusion direction. `pypiron origin release`
+    is the deliberate way to repurpose it."""
     proxy, upstream = proxy_over_fault_reclaim
     pkg = "reclaimfailedproxy"
     mirror_wheel = make_wheel(pkg, "1.0", tmp_path / "mirror")
@@ -622,27 +626,17 @@ def test_worker_reclaims_failed_proxy_claim_for_private_upload(proxy_over_fault_
     code, _, _ = http_get(f"{proxy['base_url']}/files/{pkg}/{filename}", timeout=FAULT_GET_TIMEOUT)
     assert code != 200
     origin_file = _pkg_dir(proxy, pkg) / ".origin"
-    assert origin_file.exists()
     assert origin_owner(origin_file.read_text()) == "mirror"
 
-    deadline = time.monotonic() + 20
-    owner = "mirror"
-    while time.monotonic() < deadline:
-        owner = origin_owner(origin_file.read_text())
-        if owner == "unclaimed":
-            break
-        time.sleep(0.2)
-    assert owner == "unclaimed", "worker audits did not reclaim the abandoned mirror claim"
-
-    private_wheel = make_wheel(pkg, "2.0", tmp_path / "private")
+    time.sleep(10)  # several audits, well past two sightings an intent grace apart
+    assert origin_owner(origin_file.read_text()) == "mirror"
     upload_legacy(
         proxy["legacy"],
-        private_wheel,
+        make_wheel(pkg, "2.0", tmp_path / "private"),
         username=proxy["user"],
         password=proxy["password"],
+        expect_status=403,
     )
-    wait_for_file_in_index(proxy["simple"], pkg, private_wheel.name)
-    assert origin_owner(origin_file.read_text()) == "private"
 
 
 def test_client_disconnect_leaves_a_completed_fill(proxy_over_fault, tmp_path):

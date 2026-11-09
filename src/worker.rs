@@ -401,7 +401,6 @@ async fn maintain_bucket_selection(state: &AppState) -> bool {
                 // reset the remaining selected-bucket views explicitly.
                 *state.global_names.lock().await = None;
                 *state.inventory.lock().await = InventoryMap::default();
-                state.empty_origin_observations.lock().await.clear();
                 info!(
                     from = %state.buckets.handles()[change.from].name,
                     to = %state.buckets.handles()[change.to].name,
@@ -564,78 +563,6 @@ pub(crate) async fn stale_unpaired_intents_ignoring(
 
 fn intent_is_ignored(nonce: &str, ignored_nonce: Option<&str>) -> bool {
     ignored_nonce == Some(nonce)
-}
-
-/// Reclaim an empty mirror claim only after two audit observations of the same
-/// nonce-bearing claim version separated by the intent grace. The proxy failure
-/// path deliberately does not release claims: only the leader audit has enough
-/// evidence to distinguish an orphan from a slow live writer.
-async fn reclaim_empty_mirror_claim(
-    state: &AppState,
-    storage: &dyn Storage,
-    pkg: &str,
-    generation: u64,
-) -> Result<()> {
-    let key = (generation, pkg.to_string());
-    let Some(observed) = crate::origin::read_origin_observation(storage, pkg).await? else {
-        state.empty_origin_observations.lock().await.remove(&key);
-        return Ok(());
-    };
-    if observed.state != crate::origin::OriginState::Mirror {
-        state.empty_origin_observations.lock().await.remove(&key);
-        return Ok(());
-    }
-    if crate::origin::package_has_truth(storage, pkg).await?
-        || has_live_intent(state, storage, pkg).await?
-    {
-        state.empty_origin_observations.lock().await.remove(&key);
-        return Ok(());
-    }
-
-    let now = Instant::now();
-    let grace = std::time::Duration::from_secs(state.intent_grace.whole_seconds().max(0) as u64);
-    let ready = {
-        let mut observations = state.empty_origin_observations.lock().await;
-        match observations.get(&key) {
-            Some((etag, first)) if etag == &observed.etag => now.duration_since(*first) >= grace,
-            _ => {
-                observations.insert(key.clone(), (observed.etag.clone(), now));
-                false
-            }
-        }
-    };
-    if !ready {
-        return Ok(());
-    }
-
-    // Re-check intents immediately before consuming the exact claim version.
-    if has_live_intent(state, storage, pkg).await? {
-        state.empty_origin_observations.lock().await.remove(&key);
-        return Ok(());
-    }
-    let released = crate::origin::release_observed_empty_mirror(storage, pkg, &observed).await?;
-    state.empty_origin_observations.lock().await.remove(&key);
-    let Some(unclaimed) = released else {
-        return Ok(());
-    };
-
-    // A writer can appear between the final list and the CAS. Re-list after the
-    // release; if anything appeared, immediately reclaim mirror with a fresh
-    // nonce. A concurrent private claim still wins and is never overwritten.
-    let appeared = crate::origin::package_has_truth(storage, pkg).await?
-        || has_live_intent(state, storage, pkg).await?;
-    if appeared {
-        let claim = crate::origin::claim_origin(
-            storage,
-            pkg,
-            crate::origin::ClaimRequest::new(crate::origin::MIRROR, Some(&unclaimed)),
-        )
-        .await?;
-        if claim.owner != crate::origin::MIRROR {
-            warn!(package=%pkg, owner=%claim.owner, "empty mirror claim changed while audit reverted a raced release");
-        }
-    }
-    Ok(())
 }
 
 pub async fn run_worker_until(
@@ -2190,30 +2117,23 @@ async fn audit_shard(
                         }
                     }
                 }
-                if has_artifacts {
-                    state
-                        .empty_origin_observations
-                        .lock()
-                        .await
-                        .remove(&(generation, pkg.clone()));
-                    if state.buckets.is_multi() {
-                        match crate::replicate::quarantine_mirror_artifacts(storage, &pkg).await {
-                            Ok(0) => {}
-                            Ok(count) => {
-                                maintenance_changed = true;
-                                error!(package=%pkg, count, "audit: quarantined mirror artifacts under private claim");
-                            }
-                            Err(e) => {
-                                maintenance_failed = true;
-                                error!(package=%pkg, error=?e, "audit: private-claim quarantine failed");
-                            }
+                // An emptied claim is never released here: the audit can't tell
+                // a fill that died before its bytes from an admin's eviction,
+                // and both name a project upstream lists. Freeing one would let
+                // an uploader take a public name private; `pypiron origin
+                // release` is the deliberate path.
+                if has_artifacts && state.buckets.is_multi() {
+                    match crate::replicate::quarantine_mirror_artifacts(storage, &pkg).await {
+                        Ok(0) => {}
+                        Ok(count) => {
+                            maintenance_changed = true;
+                            error!(package=%pkg, count, "audit: quarantined mirror artifacts under private claim");
+                        }
+                        Err(e) => {
+                            maintenance_failed = true;
+                            error!(package=%pkg, error=?e, "audit: private-claim quarantine failed");
                         }
                     }
-                } else if let Err(e) =
-                    reclaim_empty_mirror_claim(state, storage, &pkg, generation).await
-                {
-                    error!(package=%pkg, error=?e, "audit: empty mirror claim proof failed");
-                    maintenance_failed = true;
                 }
                 let unchanged = fingerprint_unchanged && !maintenance_changed;
                 if unchanged {
@@ -4824,9 +4744,6 @@ mod tests {
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
             inventory: Arc::new(tokio::sync::Mutex::new(InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
-            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
             metrics: Arc::new(crate::metrics::Metrics::new()),
             counters: Arc::new(crate::counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
@@ -4975,33 +4892,6 @@ mod tests {
         inv.upsert("a", PkgStat::default());
         let t = inv.totals();
         assert_eq!((t.projects, t.releases, t.files, t.bytes), (1, 2, 2, 25));
-    }
-
-    #[tokio::test]
-    async fn single_bucket_audit_reclaims_an_abandoned_empty_mirror_claim() {
-        let storage = Arc::new(InMemStorage::default());
-        storage.insert(
-            &crate::origin::origin_key("abandoned"),
-            br#"{"origin":"mirror","nonce":"00000000000000000000000000000000"}"#.to_vec(),
-        );
-        let mut state = AppState::headless(storage.clone());
-        state.intent_grace = time::Duration::ZERO;
-
-        reclaim_empty_mirror_claim(&state, storage.as_ref(), "abandoned", 0)
-            .await
-            .unwrap();
-        reclaim_empty_mirror_claim(&state, storage.as_ref(), "abandoned", 0)
-            .await
-            .unwrap();
-
-        assert_eq!(
-            crate::origin::read_origin_observation(storage.as_ref(), "abandoned")
-                .await
-                .unwrap()
-                .unwrap()
-                .state,
-            crate::origin::OriginState::Unclaimed
-        );
     }
 
     /// The audit walk observed a package artifactless (an upload's origin claim

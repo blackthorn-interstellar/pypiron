@@ -212,8 +212,6 @@ type PackageStatsCache = Arc<
 /// request — so one refcounted `Bytes` serves them all; the worker drops it when
 /// the name set changes and the TTL bounds cross-node staleness.
 type ProjectsPageCache = Arc<std::sync::Mutex<Option<(std::time::Instant, u64, bytes::Bytes)>>>;
-type EmptyOriginObservations =
-    Arc<tokio::sync::Mutex<std::collections::HashMap<(u64, String), (String, std::time::Instant)>>>;
 
 /// Default in-RAM artifact-write budget, in units of the 64 MiB single-PUT
 /// ceiling (see [`AppState::artifact_write_semaphore`]): four × 64 MiB is a
@@ -360,11 +358,6 @@ pub struct AppState {
     pub inventory: Arc<tokio::sync::Mutex<worker::InventoryMap>>,
     /// Wakes the worker immediately after a write drops a dirty marker.
     pub worker_nudge: Arc<tokio::sync::Notify>,
-    /// First empty-mirror observations retained across leader audits. A claim
-    /// is reclaimable only when its exact nonce-bearing version is still empty
-    /// on the same selection generation after the intent grace; process
-    /// restarts and bucket switches restart the proof.
-    pub empty_origin_observations: EmptyOriginObservations,
     /// Hand-rolled Prometheus counters served at /metrics.
     pub metrics: Arc<metrics::Metrics>,
     /// Distributed S3-backed event counters (per-package/version downloads per
@@ -643,9 +636,6 @@ impl AppState {
             global_names: Arc::new(tokio::sync::Mutex::new(None)),
             inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
             worker_nudge: Arc::new(tokio::sync::Notify::new()),
-            empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            )),
             metrics: Arc::new(metrics::Metrics::new()),
             counters: Arc::new(counters::Counters::disabled()),
             download_board: Arc::new(std::sync::Mutex::new(None)),
@@ -1711,9 +1701,6 @@ async fn run_serve(
         global_names: Arc::new(tokio::sync::Mutex::new(None)),
         inventory: Arc::new(tokio::sync::Mutex::new(worker::InventoryMap::default())),
         worker_nudge: Arc::new(tokio::sync::Notify::new()),
-        empty_origin_observations: Arc::new(tokio::sync::Mutex::new(
-            std::collections::HashMap::new(),
-        )),
         metrics,
         counters,
         download_board: Arc::new(std::sync::Mutex::new(None)),

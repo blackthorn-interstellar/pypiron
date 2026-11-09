@@ -10,13 +10,12 @@
 //!   (absent) --claim--> mirror           (create-if-absent)
 //!  unclaimed --claim--> private|mirror    (put-if-match sentinel)
 //!     mirror --demote-> private           (put-if-match, the only demotion)
-//!     mirror --release-> unclaimed        (put-if-match, orphan cleanup)
-//!    private is terminal
+//!  private|mirror --release-> unclaimed  (put-if-match, `pypiron origin release`)
+//!    private is terminal outside that operator release
 //! ```
 //!
 //! The claim never transits through *absent* after creation: absent is what
-//! authorizes a proxy to fill from upstream, so releasing a failed claim
-//! rewrites it to the `unclaimed` sentinel (which `read_origin` folds into
+//! authorizes a proxy to fill from upstream, so a release rewrites it to the `unclaimed` sentinel (which `read_origin` folds into
 //! "may claim") rather than deleting it. An unconditional delete could erase a
 //! claim that went `private` mid-flight, re-opening the dependency-confusion
 //! window.
@@ -28,8 +27,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
-#[cfg(test)]
-use tracing::warn;
 
 use crate::app::{DIRTY_PREFIX, PACKAGES_PREFIX};
 use crate::storage::{is_not_found, Storage};
@@ -234,9 +231,9 @@ pub struct Claim {
     /// The origin that now holds the claim: ours when `etag` is present, else a
     /// racer's.
     pub owner: String,
-    /// The claim object's etag *when this call created it* — the token
-    /// [`release_empty_claim`] and the proxy's pre-commit re-check need to CAS
-    /// their own exact claim. `None` when we did not create it.
+    /// The claim object's etag *when this call created it* — the token the
+    /// proxy's pre-commit re-check needs to CAS its own exact claim. `None` when
+    /// we did not create it.
     pub etag: Option<String>,
 }
 
@@ -360,34 +357,6 @@ pub(crate) async fn demote_mirror_to_private(
         .map(|next| next.etag))
 }
 
-/// Release an observed orphan `mirror` claim if the package still has no
-/// truth or permanent fences. The state check happens before the listing, and the CAS consumes
-/// the same observation afterward. The next state is a freshly nonce'd
-/// `unclaimed` object, never absence.
-pub async fn release_observed_empty_mirror(
-    storage: &dyn Storage,
-    pkg: &str,
-    observed: &OriginObservation,
-) -> Result<Option<OriginObservation>> {
-    if observed.state != OriginState::Mirror {
-        return Ok(None);
-    }
-    if package_has_truth(storage, pkg).await? {
-        return Ok(None);
-    }
-    Ok(storage
-        .put_if_match(
-            &origin_key(pkg),
-            &observed.etag,
-            encode_claim(OriginState::Unclaimed)?,
-        )
-        .await?
-        .map(|etag| OriginObservation {
-            state: OriginState::Unclaimed,
-            etag,
-        }))
-}
-
 pub(crate) async fn package_has_truth(storage: &dyn Storage, pkg: &str) -> Result<bool> {
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
     let claim_key = origin_key(pkg);
@@ -396,26 +365,6 @@ pub(crate) async fn package_has_truth(storage: &dyn Storage, pkg: &str) -> Resul
         .await?
         .iter()
         .any(|entry| entry.key != claim_key))
-}
-
-/// Compatibility wrapper for existing proxy callers that carry only an etag.
-/// Re-read and bind it back to its state before performing the mirror-only CAS.
-#[cfg(test)]
-pub(crate) async fn release_empty_claim(storage: &dyn Storage, pkg: &str, expected_etag: &str) {
-    let result = async {
-        let Some(observed) = read_origin_observation(storage, pkg).await? else {
-            return Ok::<(), anyhow::Error>(());
-        };
-        if observed.etag != expected_etag {
-            return Ok(());
-        }
-        release_observed_empty_mirror(storage, pkg, &observed).await?;
-        Ok(())
-    }
-    .await;
-    if let Err(e) = result {
-        warn!(package=%pkg, error=?e, "could not release orphan claim");
-    }
 }
 
 /// Deliberately release an empty package for operator-directed repurposing.
@@ -714,8 +663,8 @@ mod tests {
     #[tokio::test]
     async fn release_rewrites_to_unclaimed_not_absent() {
         let s = store();
-        let claim = claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
-        release_empty_claim(s.as_ref(), "pkg", claim.etag.as_deref().unwrap()).await;
+        claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
+        assert!(release_for_repurpose(s.as_ref(), "pkg").await.unwrap());
         // read_origin folds the sentinel into "unclaimed" so a proxy may fill…
         assert_eq!(read_origin(s.as_ref(), "pkg").await.unwrap(), None);
         // …but the object still exists (never absent), carrying the sentinel.
@@ -729,8 +678,8 @@ mod tests {
     #[tokio::test]
     async fn unclaimed_can_be_reclaimed_by_the_next_writer() {
         let s = store();
-        let first = claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
-        release_empty_claim(s.as_ref(), "pkg", first.etag.as_deref().unwrap()).await;
+        claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
+        assert!(release_for_repurpose(s.as_ref(), "pkg").await.unwrap());
         // A private upload now legitimately claims the released name.
         let second = claim_origin(s.as_ref(), "pkg", PRIVATE).await.unwrap();
         assert!(second.etag.is_some());
@@ -744,8 +693,8 @@ mod tests {
     #[tokio::test]
     async fn observed_unclaimed_hint_claims_directly_and_rejects_other_states() {
         let s = store();
-        let first = claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
-        release_empty_claim(s.as_ref(), "pkg", first.etag.as_deref().unwrap()).await;
+        claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
+        assert!(release_for_repurpose(s.as_ref(), "pkg").await.unwrap());
         let unclaimed = read_origin_observation(s.as_ref(), "pkg")
             .await
             .unwrap()
@@ -773,42 +722,6 @@ mod tests {
         assert_eq!(
             read_origin(s.as_ref(), "pkg").await.unwrap().as_deref(),
             Some(PRIVATE)
-        );
-    }
-
-    #[tokio::test]
-    async fn release_does_not_run_when_artifacts_remain() {
-        let s = store();
-        let claim = claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
-        s.insert("packages/pkg/pkg-1.0-py3-none-any.whl", b"bytes".to_vec());
-        release_empty_claim(s.as_ref(), "pkg", claim.etag.as_deref().unwrap()).await;
-        assert_eq!(
-            read_origin(s.as_ref(), "pkg").await.unwrap().as_deref(),
-            Some(MIRROR)
-        );
-    }
-
-    #[tokio::test]
-    async fn stale_releaser_loses_after_demotion() {
-        // The ABA the CAS closes: a proxy claims mirror, the claim is demoted to
-        // private (a merge or a racing private world), and the proxy's late
-        // release must NOT clobber the now-private claim.
-        let s = store();
-        let claim = claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
-        let mirror_etag = claim.etag.unwrap();
-        let demoted = demote_mirror_to_private(s.as_ref(), "pkg", &mirror_etag)
-            .await
-            .unwrap();
-        assert!(
-            demoted.is_some(),
-            "demotion CAS must succeed on a fresh mirror claim"
-        );
-        // The proxy, still holding the stale mirror etag, tries to release.
-        release_empty_claim(s.as_ref(), "pkg", &mirror_etag).await;
-        assert_eq!(
-            read_origin(s.as_ref(), "pkg").await.unwrap().as_deref(),
-            Some(PRIVATE),
-            "the stale releaser must lose; private is terminal"
         );
     }
 
@@ -862,10 +775,6 @@ mod tests {
             .await
             .unwrap()
             .is_none());
-        assert!(release_observed_empty_mirror(s.as_ref(), "pkg", &private)
-            .await
-            .unwrap()
-            .is_none());
         assert_eq!(
             read_origin(s.as_ref(), "pkg").await.unwrap().as_deref(),
             Some(PRIVATE)
@@ -877,7 +786,7 @@ mod tests {
         let s = store();
         let first = claim_origin(s.as_ref(), "pkg", MIRROR).await.unwrap();
         let stale_mirror_etag = first.etag.unwrap();
-        release_empty_claim(s.as_ref(), "pkg", &stale_mirror_etag).await;
+        assert!(release_for_repurpose(s.as_ref(), "pkg").await.unwrap());
 
         let unclaimed = read_origin_observation(s.as_ref(), "pkg")
             .await
@@ -899,7 +808,6 @@ mod tests {
                 .unwrap()
                 .is_none()
         );
-        release_empty_claim(s.as_ref(), "pkg", &stale_mirror_etag).await;
         assert_eq!(
             read_origin(s.as_ref(), "pkg").await.unwrap().as_deref(),
             Some(MIRROR)

@@ -4,6 +4,7 @@ pattern) policy."""
 from __future__ import annotations
 
 import shutil
+import time
 
 import pytest
 
@@ -149,11 +150,29 @@ def test_private_patterns_from_config_file(tmp_path_factory, pypiron_bin, tmp_pa
         gen.close()
 
 
-def test_origin_claim_survives_deletion(disk_server, tmp_path):
+@pytest.fixture()
+def disk_server_fast_audit(tmp_path_factory, pypiron_bin):
+    """Audits every second with the shortest intent grace, so a claim the audit
+    would release is released within a few seconds."""
+    server = _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--reconcile-interval-secs", "1", "--intent-grace-secs", "3"],
+    )
+    try:
+        yield next(server)
+    finally:
+        server.close()
+
+
+def test_origin_claim_survives_deletion(disk_server_fast_audit, tmp_path):
     """A mirror-owned name emptied by deletion must not become re-claimable as
-    private — that would be the dependency-confusion direction. The .origin
-    claim is durable; re-purposing a name needs storage access."""
+    private — that would be the dependency-confusion direction — not even after
+    the background audit has seen it empty. The .origin claim is durable;
+    re-purposing a name is `pypiron origin release`."""
     from .helpers import http_request_auth
+
+    disk_server = disk_server_fast_audit
 
     # Claim the name as mirror via storage (what sync does).
     pkg_dir = disk_server["data_dir"] / "packages" / PACKAGE
@@ -188,7 +207,12 @@ def test_origin_claim_survives_deletion(disk_server, tmp_path):
     )
     assert code == 204
 
-    # The claim is still mirror — a private re-upload remains forbidden.
+    # The claim is still mirror — a private re-upload remains forbidden, and
+    # stays so after several audits (two empty sightings an intent grace apart
+    # used to release it).
+    assert origin_owner((pkg_dir / ".origin").read_text()) == "mirror"
+    upload_legacy(disk_server["legacy"], wheel_path, expect_status=403, **creds)
+    time.sleep(10)
     assert origin_owner((pkg_dir / ".origin").read_text()) == "mirror"
     upload_legacy(disk_server["legacy"], wheel_path, expect_status=403, **creds)
 

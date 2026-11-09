@@ -1249,7 +1249,6 @@ every transition is a conditional write (CAS):
   (absent) --claim--> mirror             create-if-absent
  unclaimed --claim--> private | mirror   put-if-match on the sentinel
     mirror --demote--> private           put-if-match (private beats mirror on merge)
-    mirror --audit--> unclaimed          put-if-match (proven orphan cleanup)
 private|mirror --admin release-> unclaimed  put-if-match (empty package only)
    private is terminal outside the explicit admin release
 ```
@@ -1277,11 +1276,11 @@ The claim, not the occupancy of the canonical key, is what fences that writer:
 private is terminal and never-deleted, and a mirror upload cannot survive the
 post-publish claim re-check under it.
 
-Request failures never release a claim. The leader audit may reclaim an empty
-mirror claim only after two identical observations separated by the intent
-grace, with no artifacts or live intents. It CAS-writes `unclaimed`, re-lists,
-and restores the old owner with a fresh nonce if activity appeared. The operator
-equivalent, `pypiron origin release <pkg>`, requires every configured bucket to
+Nothing automatic releases a claim — not a request failure, not the audit. An
+empty mirror claim looks the same whether its fill died before the bytes landed
+or an admin evicted the cache, and either way upstream lists the name; freeing it
+would let an uploader take a public name private. The one release,
+`pypiron origin release <pkg>`, requires every configured bucket to
 be reachable and empty of all package truth except the claim, plus no write
 intents or replication notes for that package. Deletes never touch `.origin`.
 Like tombstones, `.origin` is never lifecycle-expired.

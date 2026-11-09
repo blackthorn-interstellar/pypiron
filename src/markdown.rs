@@ -176,6 +176,18 @@ pub fn render_limited(md: &str) -> String {
     out
 }
 
+/// HTML-escape plain text under the same ceiling as [`render_limited`], ending
+/// in a plain-text truncation line when it does not fit. For a description
+/// shown verbatim: escaping alone would turn a 16 MiB `METADATA` body into a
+/// page several times that size.
+pub fn escape_limited(text: &str) -> String {
+    let mut out = String::new();
+    if !push_escaped(&mut out, text, MAX_RENDERED_BYTES) {
+        out.push_str("\n… description truncated …");
+    }
+    out
+}
+
 /// HTML-escape `text` into `out`, appending at most `room` bytes. The source is
 /// trimmed *before* escaping so a single huge text node can't transiently
 /// allocate several times the ceiling, and the escaped result is trimmed again
@@ -278,6 +290,15 @@ pub(crate) fn safe_href(url: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn escape_limited_bounds_text_that_escaping_would_grow() {
+        // `&` escapes to five bytes, so this would be 5x the ceiling unbounded.
+        let out = escape_limited(&"&".repeat(MAX_RENDERED_BYTES));
+        assert!(out.len() <= MAX_RENDERED_BYTES + 64, "{}", out.len());
+        assert!(out.ends_with("… description truncated …"));
+        assert_eq!(escape_limited("a < b"), "a &lt; b");
+    }
 
     #[test]
     fn basic_formatting_renders() {

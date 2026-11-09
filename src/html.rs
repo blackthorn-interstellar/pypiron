@@ -818,7 +818,7 @@ fn description_panel(meta: Option<&CoreMetadata>) -> String {
                     "<div class=\"snip-h\"><span class=\"snip-label\">Readme</span>\
 <span class=\"muted-s\">shown unrendered</span></div>\
 <pre class=\"readme\"><code>{}</code></pre>",
-                    encode_text(desc),
+                    markdown::escape_limited(desc),
                 )
             }
         }

@@ -264,6 +264,37 @@ def test_project_page_shows_metadata_files_and_unrendered_readme(disk_server, tm
     assert 'href="/files/projpkg/projpkg-2.1.0-py3-none-any.whl"' in html
 
 
+def test_project_page_stays_small_for_a_huge_unrendered_readme(disk_server, tmp_path):
+    """A plain-text description is shown verbatim, and escaping grows it: 8 MiB
+    of `&` compresses to a few KB of wheel but would escape to a 40 MiB page.
+    The page stops at the same ceiling as a rendered README and says so; the
+    summary and classifier list are clamped too."""
+    wheel = make_wheel(
+        "hugereadme",
+        "1.0",
+        tmp_path,
+        metadata_extra=f"Keywords: {'k' * (1 << 20)}\n"
+        + "".join(f"Classifier: c{i}\n" for i in range(5000)),
+        description="&" * (8 << 20),
+    )
+    assert wheel.stat().st_size < 256 << 10
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_project_in_global(disk_server["simple"], "hugereadme")
+
+    code, body, _ = http_get(f"{disk_server['base_url']}/project/hugereadme/")
+    assert code == 200
+    assert len(body) < 3 << 20, len(body)
+    html = body.decode()
+    assert "description truncated" in html
+    assert "<li>c999</li>" in html
+    assert "<li>c1000</li>" not in html
+
+
 def test_project_page_renders_markdown_readme_through_whitelist(disk_server, tmp_path):
     """A wheel declaring text/markdown gets its README rendered through the
     locked-down whitelist: real markdown becomes HTML, raw script is dropped."""

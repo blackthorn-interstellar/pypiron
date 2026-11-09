@@ -46,6 +46,61 @@ impl CoreMetadata {
     }
 }
 
+/// Longest single field the project page shows. PyPI caps `Summary` at 512
+/// characters; nothing real comes near this.
+const MAX_DISPLAY_FIELD_BYTES: usize = 4 * 1024;
+/// Most entries the page shows in one list (classifiers, dependencies, links).
+const MAX_DISPLAY_LIST_ITEMS: usize = 1000;
+
+impl CoreMetadata {
+    /// Clamp everything but the description (whose renderers bound their own
+    /// output) to what a human page can usefully show. A `METADATA` body may be
+    /// 16 MiB, and escaping only grows it, so without this one upload can make a
+    /// page large enough to flush the whole page cache. Display only: code that
+    /// reads `requires_dist` to resolve dependencies calls [`parse`] directly.
+    pub fn bounded_for_display(mut self) -> Self {
+        for field in [
+            &mut self.version,
+            &mut self.summary,
+            &mut self.author,
+            &mut self.author_email,
+            &mut self.license,
+            &mut self.requires_python,
+            &mut self.keywords,
+            &mut self.description_content_type,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            clamp(field);
+        }
+        for list in [&mut self.classifiers, &mut self.requires_dist] {
+            list.truncate(MAX_DISPLAY_LIST_ITEMS);
+            list.iter_mut().for_each(clamp);
+        }
+        self.project_urls.truncate(MAX_DISPLAY_LIST_ITEMS);
+        for (label, url) in &mut self.project_urls {
+            clamp(label);
+            clamp(url);
+        }
+        self
+    }
+}
+
+/// Cut `s` to at most [`MAX_DISPLAY_FIELD_BYTES`] on a char boundary, marking
+/// the cut with an ellipsis.
+fn clamp(s: &mut String) {
+    if s.len() <= MAX_DISPLAY_FIELD_BYTES {
+        return;
+    }
+    let mut end = MAX_DISPLAY_FIELD_BYTES;
+    while !s.is_char_boundary(end) {
+        end -= 1;
+    }
+    s.truncate(end);
+    s.push('…');
+}
+
 /// Parse core-metadata bytes. Invalid UTF-8 is lossily decoded rather than
 /// rejected — display is best-effort and must never fail the page.
 pub fn parse(bytes: &[u8]) -> CoreMetadata {
@@ -152,6 +207,25 @@ fn split_headers_body(text: &str) -> (Vec<(String, String)>, &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn display_bounds_clamp_fields_and_lists_but_not_the_description() {
+        let mut md = format!("Summary: {}é\n", "s".repeat(MAX_DISPLAY_FIELD_BYTES - 1));
+        for i in 0..MAX_DISPLAY_LIST_ITEMS + 5 {
+            md.push_str(&format!("Classifier: c{i}\n"));
+        }
+        let body = "d".repeat(MAX_DISPLAY_FIELD_BYTES * 2);
+        md.push('\n');
+        md.push_str(&body);
+        let m = parse(md.as_bytes()).bounded_for_display();
+        // The cut lands before the two-byte `é` rather than splitting it.
+        assert_eq!(
+            m.summary,
+            Some(format!("{}…", "s".repeat(MAX_DISPLAY_FIELD_BYTES - 1)))
+        );
+        assert_eq!(m.classifiers.len(), MAX_DISPLAY_LIST_ITEMS);
+        assert_eq!(m.description.as_deref(), Some(body.as_str()));
+    }
 
     #[test]
     fn parses_modern_wheel_metadata_with_body_description() {

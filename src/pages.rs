@@ -674,7 +674,7 @@ async fn load_core_metadata(
 ) -> Option<coremeta::CoreMetadata> {
     let key = sidecar::metadata_key(&format!("{PACKAGES_PREFIX}{pkg}/{}", rep.filename));
     let bytes = storage.get_bytes(&key).await.ok()?;
-    Some(coremeta::parse(&bytes))
+    Some(coremeta::parse(&bytes).bounded_for_display())
 }
 
 /// Parse a representative file's relayed `.provenance` companion into its

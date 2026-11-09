@@ -1180,17 +1180,21 @@ async fn advisory_byte_gate(
         return None; // the common path: no origin read, no I/O
     }
 
-    // A hit — but a private-origin name never consults either set. Only the
-    // claim proves that: a reserved name can still hold grandfathered mirror
-    // bytes (reserving a name does not re-own what is already cached).
-    match origin::read_origin_claim(storage, pkg).await {
-        Ok(Some(origin::OriginState::Private)) => return None,
-        // Mirror, the unclaimed sentinel, or no claim at all: not proven private,
-        // so a same-named blocked artifact is refused (fail-closed).
-        Ok(_) => {}
-        Err(e) => {
-            // Only reachable on a probe hit; a storage read error fails closed.
-            warn!(error = ?e, %pkg, "advisory gate: origin read failed; blocking fail-closed");
+    // An OSV hit on a private-origin name is a namesake on PyPI, not this
+    // package: let it through. A quarantine is never a namesake — on a private
+    // name only an admin can set one — so it blocks every origin. Only the claim
+    // proves private: a reserved name can still hold grandfathered mirror bytes
+    // (reserving a name does not re-own what is already cached).
+    if !quarantined {
+        match origin::read_origin_claim(storage, pkg).await {
+            Ok(Some(origin::OriginState::Private)) => return None,
+            // Mirror, the unclaimed sentinel, or no claim at all: not proven private,
+            // so a same-named blocked artifact is refused (fail-closed).
+            Ok(_) => {}
+            Err(e) => {
+                // Only reachable on a probe hit; a storage read error fails closed.
+                warn!(error = ?e, %pkg, "advisory gate: origin read failed; blocking fail-closed");
+            }
         }
     }
 

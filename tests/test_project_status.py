@@ -115,9 +115,37 @@ def test_quarantined_project_omits_file_links_but_keeps_marker(disk_server, tmp_
     assert '<meta name="pypi:project-status" content="quarantined">' in html
     assert "<a href" not in html
 
-    # The artifact bytes still exist on disk — Phase 1 relays the marker but
-    # does not gate downloads (that fail-closed gate is deferred to Phase 2).
+    # Quarantine omits links and refuses downloads; it never deletes the bytes.
     assert (disk_server["data_dir"] / "packages" / pkg / wheel.name).exists()
+
+
+def test_quarantined_private_project_refuses_direct_downloads(disk_server, tmp_path):
+    """An admin quarantines their own private project (a bad build got out):
+    a lockfile that pins the file URL must be refused too, not just resolvers
+    reading the now-empty index. Only advisory namesakes exempt private names."""
+    server = disk_server
+    pkg = "privatefreeze"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    upload_legacy(
+        server["legacy"],
+        wheel,
+        username=server["uploader_user"],
+        password=server["uploader_password"],
+    )
+    wait_for_file_in_index(server["simple"], pkg, wheel.name)
+    file_url = f"{server['base_url']}/files/{pkg}/{wheel.name}"
+    assert http_get(file_url)[0] == 200
+
+    code, _, _ = http_request_auth(
+        "POST",
+        f"{server['base_url']}/project/{pkg}/status",
+        data=b'{"status":"quarantined"}',
+        username=server["admin_user"],
+        password=server["admin_password"],
+    )
+    assert code == 200
+    assert http_get(file_url)[0] == 403
+    assert http_get(f"{file_url}.metadata")[0] == 403
 
 
 def test_admin_status_endpoint_sets_and_clears(disk_server, tmp_path):

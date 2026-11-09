@@ -34,11 +34,18 @@ use storage::Storage;
 /// surfaces the same data as `/metrics`, but legibly, and only to operators who
 /// can already read. When reads are public (no read credential), everyone sees
 /// it — consistent with that deployment's open posture.
+///
+/// Under read auth the panel's presence answers whether a credential is right,
+/// so a wrong one gets the same 401 as every other gated route: the failed-login
+/// throttle counts only 401s, and a 200 here was an uncounted guessing oracle.
 pub async fn root(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response<Body> {
     let ctx = page_context(&state, &headers);
     // Registry inventory (counts only) is public — shown under the header.
     let inventory = state.metrics.inventory();
     if !state.is_reader(&headers) {
+        if headers.contains_key(header::AUTHORIZATION) {
+            return unauthorized();
+        }
         return html_ok(html::landing_html(&ctx, inventory.as_ref(), None));
     }
     let snap = state.metrics.snapshot();

@@ -55,6 +55,25 @@ def test_five_failures_lock_the_address_out(disk_server_login_cooldown):
     assert code == 200
 
 
+def test_wrong_passwords_on_the_landing_page_count_as_failed_logins(
+    disk_server_login_cooldown,
+):
+    """The landing page folds in an activity panel for a valid reader, so a
+    wrong credential there must be a counted 401, not a 200 whose size tells
+    a right guess from a wrong one."""
+    server = disk_server_login_cooldown
+    root = f"{server['base_url']}/"
+    code, _, _ = http_get(root)
+    assert code == 200  # anonymous visitors still get the front door
+
+    bad = _auth_header("reader", "wrong")
+    for attempt in range(5):
+        code, _, _ = http_get(root, headers=bad)
+        assert code == 401, f"attempt {attempt}"
+    code, _, _ = http_get(root, headers=_auth_header("reader", "readersecret"))
+    assert code == 429
+
+
 def test_role_denials_are_not_failed_logins(disk_server_login_cooldown):
     """A valid credential lacking the role (403) never accumulates: only a
     credential that authenticates as nobody (401) is a guess."""

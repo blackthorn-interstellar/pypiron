@@ -175,10 +175,15 @@ def _proxy_env(proxy_url: str) -> dict:
     }
 
 
-def test_sync_routes_through_forward_proxy(forward_proxy, tmp_path_factory, pypiron_bin, tmp_path):
+@pytest.mark.parametrize("proxy_host", ["127.0.0.1", "localhost"])
+def test_sync_routes_through_forward_proxy(
+    forward_proxy, proxy_host, tmp_path_factory, pypiron_bin, tmp_path
+):
     """A full disk->disk sync, with proxy env set, routes both the source fetch
     and the destination upload through the forward proxy — and still lands the
-    package. Proves the sync client honors HTTP(S)_PROXY (no more `.no_proxy()`)."""
+    package. Proves the sync client honors HTTP(S)_PROXY (no more `.no_proxy()`).
+    Named by a hostname that resolves to a private address, as a corporate
+    proxy's usually does, the proxy is still reachable."""
     with ExitStack() as stack:
         src_gen = _start_disk_server(tmp_path_factory, pypiron_bin)
         source = next(src_gen)
@@ -197,7 +202,7 @@ def test_sync_routes_through_forward_proxy(forward_proxy, tmp_path_factory, pypi
         wait_for_file_in_index(source["simple"], "egresspkg", wheel.name)
 
         env = os.environ.copy()
-        env.update(_proxy_env(forward_proxy.url))
+        env.update(_proxy_env(forward_proxy.url.replace("127.0.0.1", proxy_host)))
         env["PYPIRON_ADVISORY_FEED"] = ""  # keep the sync run hermetic
         result = subprocess.run(
             [

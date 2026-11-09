@@ -29,7 +29,9 @@
 //!     `https` target goes to the proxy via `CONNECT` and the proxy resolves the
 //!     name. So for a *name* target the resolver is bypassed: **name-based SSRF
 //!     enforcement moves to the proxy's own egress ACL**, which is the deliberate
-//!     egress control point once a proxy is in the path.
+//!     egress control point once a proxy is in the path. The proxy's own name
+//!     is exempt from the address filter: a corporate proxy usually lives on a
+//!     private range, and the operator named it.
 //!   * The pre-flight [`Guard::check_target`] is **unaffected** — it runs on the
 //!     original URL and every redirect `Location` regardless of proxying. So an
 //!     **IP-literal internal target stays blocked on every hop**, including the
@@ -138,6 +140,11 @@ pub(crate) struct Guard {
     /// Operator-allow-listed CIDRs: a target IP inside one is permitted even if
     /// it is otherwise forbidden.
     allow_cidrs: Vec<IpNet>,
+    /// The forward-proxy hosts named in the proxy env vars. A corporate proxy
+    /// usually resolves to a private address; the operator named it, so its
+    /// *name* resolves unfiltered. Exempt at DNS only, never in
+    /// [`Guard::check_target`]: targets are judged as before.
+    proxy_hosts: HashSet<String>,
 }
 
 impl Guard {
@@ -159,10 +166,15 @@ impl Guard {
                     .with_context(|| format!("--proxy-allow-cidr '{raw}' is not a valid CIDR"))
             })
             .collect::<Result<Vec<_>>>()?;
+        let proxy_env = ["HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY"]
+            .iter()
+            .flat_map(|k| [std::env::var(k), std::env::var(k.to_lowercase())])
+            .filter_map(Result::ok);
         Ok(Self {
             upstream_host,
             allow_hosts: allow_hosts.iter().cloned().collect(),
             allow_cidrs,
+            proxy_hosts: proxy_env.filter_map(|v| proxy_host(&v)).collect(),
         })
     }
 
@@ -220,6 +232,17 @@ impl Guard {
     }
 }
 
+/// The host of a proxy env value, which may omit the scheme (`proxy:3128`), as
+/// reqwest accepts it.
+fn proxy_host(raw: &str) -> Option<String> {
+    let raw = raw.trim();
+    let url = Url::parse(raw)
+        .ok()
+        .filter(Url::has_host)
+        .or_else(|| Url::parse(&format!("http://{raw}")).ok())?;
+    url.host_str().map(str::to_ascii_lowercase)
+}
+
 /// DNS resolver that refuses to hand back a forbidden address for a non-exempt
 /// host. Filtering at resolve time (rather than validating a name up front)
 /// closes the DNS-rebind gap: reqwest connects to exactly the addresses returned
@@ -239,7 +262,8 @@ impl reqwest::dns::Resolve for SsrfGuardResolver {
         let guard = self.guard.clone();
         let host = name.as_str().to_string();
         Box::pin(async move {
-            let exempt = guard.host_exempt(&host);
+            let exempt =
+                guard.host_exempt(&host) || guard.proxy_hosts.contains(&host.to_ascii_lowercase());
             let addrs = tokio::net::lookup_host((host.as_str(), 0)).await?;
             let filtered: Vec<std::net::SocketAddr> = addrs
                 .filter(|addr| exempt || guard.ip_allowed(&addr.ip()))
@@ -484,5 +508,21 @@ mod tests {
     fn bad_cidr_is_a_hard_error() {
         let err = Guard::new("https://pypi.org", &[], &["not-a-cidr".to_string()]).unwrap_err();
         assert!(err.to_string().contains("valid CIDR"));
+    }
+
+    #[test]
+    fn proxy_host_reads_env_values_with_or_without_a_scheme() {
+        for (raw, host) in [
+            (
+                "http://corp-proxy.internal:3128",
+                Some("corp-proxy.internal"),
+            ),
+            ("corp-proxy.internal:3128", Some("corp-proxy.internal")),
+            ("http://user:pw@10.0.0.5:8080/", Some("10.0.0.5")),
+            (" socks5h://Proxy.Example ", Some("proxy.example")),
+            ("", None),
+        ] {
+            assert_eq!(proxy_host(raw).as_deref(), host, "{raw:?}");
+        }
     }
 }

@@ -804,7 +804,10 @@ jobs:
           maturin-version: v1.15.0
           target: ${{ matrix.target }}
           args: --release --locked ${{ matrix.zig }} --out dist
-          sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
+          # Never on Windows: sccache 0.16 hands cl.exe mimalloc's `/WX-` as a
+          # source file (C1083), which failed every Windows dry run while the
+          # uncached tag builds passed.
+          sccache: ${{ !startsWith(github.ref, 'refs/tags/') && matrix.kind != 'windows' }}
           manylinux: ${{ matrix.manylinux || 'auto' }}
         env:
           CFLAGS_aarch64_unknown_linux_gnu: "-D__ARM_ARCH=8"

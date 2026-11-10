@@ -704,6 +704,19 @@ impl AppState {
         token::verify(key, &pass, now).map(|c| c.role)
     }
 
+    /// Does the request carry a `__token__` this server's key signed, expired
+    /// or not? Such a token guesses at no secret, so the login throttle never
+    /// counts it: a CI job holding a token past its five minutes gets 401s, not
+    /// a lockout that also refuses its address's valid logins.
+    pub(crate) fn presents_signed_token(&self, headers: &HeaderMap) -> bool {
+        let Some(key) = nonempty(self.token_signing_key.as_deref()) else {
+            return false;
+        };
+        basic_credentials(headers).is_some_and(|(user, pass)| {
+            token::is_token_username(&user) && token::signed_claims(key, &pass).is_some()
+        })
+    }
+
     /// Does the request authenticate as admin? A token's role is capped by what
     /// this node can grant: no admin credential, no admin token; no write
     /// credential, no write token (see `is_uploader`) — even for a token a peer
@@ -2094,8 +2107,11 @@ async fn log_requests(
                 // can't answer a guess, so it reserves no budget.
                 let unchecked = is_read
                     && read_ignores_credential(req.uri().path(), state.read_credential().is_none());
-                let guess = (!unchecked && !state.authenticates(req.headers()))
-                    .then(|| state.login_throttle.fingerprint(req.headers()));
+                let headers = req.headers();
+                let guess = (!unchecked
+                    && !state.authenticates(headers)
+                    && !state.presents_signed_token(headers))
+                .then(|| state.login_throttle.fingerprint(headers));
                 state.login_throttle.admit(ip, guess)
             })
     } else {

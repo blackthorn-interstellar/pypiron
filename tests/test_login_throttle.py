@@ -7,6 +7,10 @@ same time share the five tries."""
 
 from __future__ import annotations
 
+import base64
+import hashlib
+import hmac
+import json
 import select
 import socket
 import time
@@ -258,3 +262,35 @@ def test_distinct_stale_credentials_on_public_reads_are_never_refused(
     finally:
         for sock in held:
             sock.close()
+
+
+def _signed_token(iat: int, exp: int) -> str:
+    """A reader token signed with the cooldown server's key."""
+
+    def b64(raw: bytes) -> str:
+        return base64.urlsafe_b64encode(raw).rstrip(b"=").decode()
+
+    payload = b64(json.dumps({"role": "reader", "iat": iat, "exp": exp}).encode())
+    key = b"test-signing-key-0123456789abcdef"
+    mac = b64(hmac.new(key, payload.encode(), hashlib.sha256).digest())
+    return f"pypiron-{payload}.{mac}"
+
+
+def test_an_expired_token_is_not_a_failed_login(disk_server_login_cooldown):
+    """A job that keeps using its token past the five minutes gets 401s, but the
+    token is genuine, not a password guess: it must not lock its address out."""
+    server = disk_server_login_cooldown
+    url = f"{server['simple']}index.json"
+    now = int(time.time())
+    expired = _auth_header("__token__", _signed_token(now - 600, now - 300))
+    for attempt in range(6):
+        code, _, _ = http_get(url, headers=expired)
+        assert code == 401, f"attempt {attempt}"
+    code, _, _ = http_get(url, headers=_auth_header("reader", "readersecret"))
+    assert code == 200
+
+    # A forged token is still a guess.
+    forged = _auth_header("__token__", _signed_token(now, now + 300)[:-2] + "AA")
+    for attempt in range(5):
+        assert http_get(url, headers=forged)[0] == 401, f"forged attempt {attempt}"
+    assert http_get(url, headers=forged)[0] == 429

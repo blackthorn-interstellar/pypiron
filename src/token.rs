@@ -104,11 +104,10 @@ pub fn mint(signing_key: &str, claims: &Claims) -> anyhow::Result<String> {
     Ok(format!("{PREFIX}{payload}.{mac}"))
 }
 
-/// Verify a token against the signing key and the current time. Returns the
-/// claims only if the prefix, signature and encoding check out and the token is
-/// neither expired nor issued in the future (beyond [`MAX_CLOCK_SKEW_SECS`]);
-/// any failure is `None` (fail closed — a bad token never authenticates).
-pub fn verify(signing_key: &str, token: &str, now_unix: i64) -> Option<Claims> {
+/// The claims of a token this key signed, checking prefix, signature and
+/// encoding but not time. A signed token that has expired is not a guess at
+/// any secret; [`verify`] is what decides whether it authenticates.
+pub fn signed_claims(signing_key: &str, token: &str) -> Option<Claims> {
     let body = token.strip_prefix(PREFIX)?;
     let (payload, mac) = body.split_once('.')?;
     let expected = b64url.encode(hmac_sha256(signing_key.as_bytes(), payload.as_bytes()));
@@ -116,7 +115,15 @@ pub fn verify(signing_key: &str, token: &str, now_unix: i64) -> Option<Claims> {
     if !ct_eq(mac, &expected) {
         return None;
     }
-    let claims: Claims = serde_json::from_slice(&b64url.decode(payload).ok()?).ok()?;
+    serde_json::from_slice(&b64url.decode(payload).ok()?).ok()
+}
+
+/// Verify a token against the signing key and the current time. Returns the
+/// claims only if the prefix, signature and encoding check out and the token is
+/// neither expired nor issued in the future (beyond [`MAX_CLOCK_SKEW_SECS`]);
+/// any failure is `None` (fail closed — a bad token never authenticates).
+pub fn verify(signing_key: &str, token: &str, now_unix: i64) -> Option<Claims> {
+    let claims = signed_claims(signing_key, token)?;
     if now_unix >= claims.exp || claims.iat > now_unix.saturating_add(MAX_CLOCK_SKEW_SECS) {
         return None;
     }
@@ -184,6 +191,9 @@ mod tests {
         assert!(verify("key", &t, 2000).is_none());
         assert!(verify("key", &t, 2001).is_none());
         assert!(verify("key", &t, 1999).is_some());
+        // Still signed, though: an expired token is not a forgery.
+        assert!(signed_claims("key", &t).is_some());
+        assert!(signed_claims("other-key", &t).is_none());
     }
 
     #[test]

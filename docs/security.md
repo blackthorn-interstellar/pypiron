@@ -180,6 +180,7 @@ credentials cross an untrusted network.
   Wrong passwords sent at the same time share those five tries: once five are
   in flight, further logins from that address get `429` until one finishes.
   Repeating the same credential across parallel requests counts as one try.
+  An expired install token gets `401` but is not counted.
 - Under a flood of failed logins from many addresses, new addresses are
   grouped by network (IPv4 `/24`, then `/16`; IPv6 `/48`, then `/32`), so one
   network's addresses share a single lockout and can't crowd out everyone

@@ -40,7 +40,8 @@ md-5 = "0.11"
 # Offline PEP 740 (Sigstore bundle) verification — all pure-Rust RustCrypto, no
 # network, no unsafe. p256: DSSE leaf signature, Rekor v1 SET, and CT SCT (all
 # ECDSA-P256/SHA-256). p384: the Fulcio cert chain (ECDSA-P384/SHA-384).
-# ed25519-dalek: the Rekor "Log2025" SET. x509-cert: parse/re-encode Fulcio
+# ed25519-dalek: held for Rekor v2 ("Log2025") checkpoint verification, which
+# replaces the SET there and is not built yet. x509-cert: parse/re-encode Fulcio
 # certs. See src/attest.rs; the trust root is embedded (src/assets/).
 p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8"] }
 p384 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8"] }

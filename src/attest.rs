@@ -18,8 +18,10 @@
 //!      Timestamp verifies against an embedded CT-log key (RFC 6962 precert).
 //!   4. Transparency — the logged entry's body is over *this* DSSE signature and
 //!      payload, and its Signed Entry Timestamp (SET) verifies against the
-//!      embedded Rekor log key named by the entry's log id (ECDSA-P256 for the v1
-//!      log, Ed25519 for "Log2025"), within that key's validity window.
+//!      embedded Rekor v1 log key (ECDSA-P256) named by the entry's log id,
+//!      within that key's validity window. Rekor v2 ("Log2025") entries carry no
+//!      SET and no integrated time — they need checkpoint + timestamp-authority
+//!      verification, not built yet — so they fail closed to "relayed".
 //!   5. Binding — the statement's subject sha256 equals the served artifact's.
 //!
 //! On a full pass we return the signer identity read from the **certificate**
@@ -627,7 +629,8 @@ fn sct_signed_entry(sct: &Sct, issuer_key_hash: &[u8], precert_tbs: &[u8]) -> Ve
 /// Rekor Signed Entry Timestamp verification. Canonicalizes
 /// `{body, integratedTime, logID, logIndex}` (RFC 8785 field order), matches the
 /// entry's log id to an embedded Rekor key, and verifies the SET within that
-/// key's validity window. Handles ECDSA-P256 (v1 log) and Ed25519 (Log2025).
+/// key's validity window. ECDSA-P256 only: the v1 log is the one that issues
+/// SETs (Rekor v2 entries have none).
 fn verify_set(entry: &Value, root: &TrustedRoot, integrated_time: i64) -> bool {
     let Some(set_sig) = entry
         .pointer("/inclusionPromise/signedEntryTimestamp")
@@ -672,12 +675,9 @@ fn verify_set(entry: &Value, root: &TrustedRoot, integrated_time: i64) -> bool {
         let Some(spki) = b64(&tlog.public_key.raw_bytes) else {
             continue;
         };
-        let ok = match tlog.public_key.key_details.as_str() {
-            "PKIX_ED25519" => ed25519_verify(&spki, &canon, &set_sig),
-            "PKIX_ECDSA_P256_SHA_256" => ecdsa_verify(&spki, &canon, &set_sig),
-            _ => false,
-        };
-        if ok {
+        if tlog.public_key.key_details == "PKIX_ECDSA_P256_SHA_256"
+            && ecdsa_verify(&spki, &canon, &set_sig)
+        {
             return true;
         }
     }
@@ -718,27 +718,6 @@ fn ecdsa_verify(spki_der: &[u8], msg: &[u8], der_sig: &[u8]) -> bool {
             .unwrap_or(false);
     }
     false
-}
-
-/// Verify a raw Ed25519 signature over `msg` with an SPKI public key. The raw
-/// 32-byte key is read from the SPKI's subjectPublicKey bit string.
-fn ed25519_verify(spki_der: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-    let Ok(spki) = x509_cert::spki::SubjectPublicKeyInfoOwned::from_der(spki_der) else {
-        return false;
-    };
-    let Some(raw) = spki.subject_public_key.as_bytes() else {
-        return false;
-    };
-    let Ok(arr) = <[u8; 32]>::try_from(raw) else {
-        return false;
-    };
-    let Ok(vk) = ed25519_dalek::VerifyingKey::from_bytes(&arr) else {
-        return false;
-    };
-    let Ok(sig) = ed25519_dalek::Signature::from_slice(sig) else {
-        return false;
-    };
-    vk.verify_strict(msg, &sig).is_ok()
 }
 
 // ---- helpers ----
@@ -1200,64 +1179,6 @@ mod tests {
             b[step] ^= 0xff;
             assert!(verify(&b, SAMPLEPROJECT_SHA).is_none());
         }
-    }
-
-    #[test]
-    fn set_verifies_ed25519_log_by_key_type() {
-        // PyPI still logs to the P-256 v1 log, so no real bundle exercises the
-        // Ed25519 "Log2025" path. Prove that path with a synthetic trust root and
-        // a SET signed by a generated Ed25519 key — the dispatch-by-key-type and
-        // the Ed25519 primitive are the load-bearing parts.
-        use ed25519_dalek::{Signer, SigningKey};
-
-        let sk = SigningKey::from_bytes(&[7u8; 32]);
-        // Ed25519 SubjectPublicKeyInfo: fixed prefix + the 32-byte raw key.
-        let mut spki = vec![
-            0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-        ];
-        spki.extend_from_slice(sk.verifying_key().as_bytes());
-        let key_id = [9u8; 32];
-        let entry = serde_json::json!({
-            "logIndex": "42",
-            "logId": {"keyId": base64::engine::general_purpose::STANDARD.encode(key_id)},
-            "canonicalizedBody": "Zm9vYmFy",
-        });
-        let integrated_time = 1_780_000_000i64;
-        let canon = serde_json::to_vec(&SetPayload {
-            body: "Zm9vYmFy",
-            integrated_time,
-            log_id: hex(&key_id),
-            log_index: 42,
-        })
-        .unwrap();
-        let sig = sk.sign(&canon);
-
-        let good = |set_b64: String| -> Value {
-            let mut e = entry.clone();
-            e["inclusionPromise"] = serde_json::json!({ "signedEntryTimestamp": set_b64 });
-            e
-        };
-        let root = TrustedRoot {
-            certificate_authorities: vec![],
-            ctlogs: vec![],
-            tlogs: vec![TlogKey {
-                log_id: LogId {
-                    key_id: base64::engine::general_purpose::STANDARD.encode(key_id),
-                },
-                public_key: PublicKey {
-                    raw_bytes: base64::engine::general_purpose::STANDARD.encode(&spki),
-                    key_details: "PKIX_ED25519".to_string(),
-                    valid_for: None,
-                },
-            }],
-        };
-        let set_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
-        assert!(verify_set(&good(set_b64), &root, integrated_time));
-        // A tampered SET fails; a mismatched integrated time (breaks canon) fails.
-        let bad = base64::engine::general_purpose::STANDARD.encode([0u8; 64]);
-        assert!(!verify_set(&good(bad.clone()), &root, integrated_time));
-        let set_b64 = base64::engine::general_purpose::STANDARD.encode(sig.to_bytes());
-        assert!(!verify_set(&good(set_b64), &root, integrated_time + 1));
     }
 
     #[test]

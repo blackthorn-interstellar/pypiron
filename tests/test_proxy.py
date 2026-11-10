@@ -7,14 +7,16 @@ from __future__ import annotations
 
 import contextlib
 import hashlib
+import http.server
 import json
 import os
 import subprocess
+import threading
 import time
 
 import pytest
 
-from .conftest import _DISK_SERVER_CREDS, _start_proxy_pair
+from .conftest import _DISK_SERVER_CREDS, _start_disk_server, _start_proxy_pair
 from .helpers import (
     ACCEPT_PEP691,
     find_free_port,
@@ -196,6 +198,100 @@ def test_yanked_upstream_file_stays_listed_and_serves_a_pin(
             assert b"Metadata-Version" in md
     finally:
         gen.close()
+
+
+@contextlib.contextmanager
+def _static_upstream(files):
+    """A minimal PEP 691 upstream serving `files`: {filename: (bytes, declared
+    size)}, all under one project. The declared size is whatever the test says,
+    which is how a listing can claim a file larger than any disk."""
+    by_name = {name: body for name, (body, _) in files.items()}
+    index = {
+        "meta": {"api-version": "1.1"},
+        "name": "bigpkg",
+        "files": [
+            {
+                "filename": name,
+                "url": f"/files/{name}",
+                "hashes": {"sha256": hashlib.sha256(body).hexdigest()},
+                "size": size,
+                "upload-time": "2020-01-01T00:00:00Z",
+            }
+            for name, (body, size) in files.items()
+        ],
+    }
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):  # noqa: N802
+            if self.path.rstrip("/") == "/simple/bigpkg":
+                body, ctype = json.dumps(index).encode(), ACCEPT_PEP691
+            elif self.path.startswith("/files/") and self.path[7:] in by_name:
+                body, ctype = by_name[self.path[7:]], "application/octet-stream"
+            else:
+                self.send_response(404)
+                self.end_headers()
+                return
+            self.send_response(200)
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, *args):
+            pass
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_address[1]}"
+    finally:
+        server.shutdown()
+        thread.join(timeout=5)
+
+
+def test_fill_larger_than_free_spool_space_is_refused_with_retry_after(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """A cold-cache fill whose declared size can't fit in the spool disk's free
+    space is refused up front with a retryable 503, before a byte is spooled,
+    while a fill that fits proceeds exactly as before."""
+    small = make_wheel("bigpkg", "1.0", tmp_path)
+    huge_name = "bigpkg-2.0-py3-none-any.whl"
+    files = {
+        small.name: (small.read_bytes(), small.stat().st_size),
+        # Declares 4 EiB: no spool filesystem has that much free.
+        huge_name: (small.read_bytes(), 1 << 62),
+    }
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    with _static_upstream(files) as upstream_url:
+        gen = _start_disk_server(
+            tmp_path_factory,
+            pypiron_bin,
+            extra_args=[
+                "--proxy-upstream",
+                upstream_url,
+                "--allow-insecure-upstream",
+                "--exclude-newer",
+                "",
+                "--spool-dir",
+                str(spool),
+            ],
+        )
+        proxy = next(gen)
+        try:
+            code, _, headers = http_get(f"{proxy['base_url']}/files/bigpkg/{huge_name}")
+            assert code == 503
+            assert {k.lower(): v for k, v in headers.items()}.get("retry-after") == "30"
+            assert list(spool.iterdir()) == [], "a refused fill must not spool"
+            assert not (proxy["data_dir"] / "packages" / "bigpkg" / huge_name).exists()
+
+            code, body, _ = http_get(f"{proxy['base_url']}/files/bigpkg/{small.name}")
+            assert code == 200
+            assert body == small.read_bytes()
+        finally:
+            gen.close()
 
 
 def test_project_removed_upstream_lists_cached_files_yanked(

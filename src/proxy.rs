@@ -2349,7 +2349,12 @@ impl Proxy {
                 }
                 // A guard refusal is deterministic — the target is forbidden and
                 // no retry changes that, so fail fast instead of backing off 6s.
-                Err(e) if e.downcast_ref::<ssrf::Blocked>().is_some() => {
+                // So is a full spool disk: retrying in 2s rarely finds 100s of
+                // MB freed, and the client retries on its 503 anyway.
+                Err(e)
+                    if e.downcast_ref::<ssrf::Blocked>().is_some()
+                        || e.downcast_ref::<crate::spool_space::SpoolFull>().is_some() =>
+                {
                     if let Some(progress) = progress {
                         progress.failed();
                     }
@@ -2405,6 +2410,13 @@ impl Proxy {
                 );
             }
         }
+        // Disk admission, before the first spooled byte: the declared size must
+        // fit in the spool filesystem's free space minus what running fills
+        // still have to write, minus a floor. Unsized bodies reserve nothing and
+        // rely on the re-check below. Concurrency itself stays unbounded.
+        let mut reservation =
+            crate::spool_space::Reservation::reserve(&state.spool_dir, file.size)?;
+        let mut recheck_at = crate::spool_space::RECHECK_BYTES;
         let mut spool = UploadSpool::new(&state.spool_dir).await?;
         // Upstream answered 200 and there is a file to follow: this is where a
         // waiting tee attaches, which is why nothing before it can 200 a client.
@@ -2414,7 +2426,18 @@ impl Proxy {
         let mut stream = resp.bytes_stream();
         let mut published = 0u64;
         while let Some(chunk) = stream.next().await {
-            spool.write_chunk(&chunk?).await?;
+            let chunk = chunk?;
+            spool.write_chunk(&chunk).await?;
+            reservation.wrote(chunk.len() as u64);
+            // Something else (an upload, another tenant of the disk) may be
+            // eating the space this fill was admitted into; stop before the
+            // floor goes rather than at ENOSPC.
+            if spool.size() >= recheck_at {
+                recheck_at = spool
+                    .size()
+                    .saturating_add(crate::spool_space::RECHECK_BYTES);
+                reservation.still_fits(&state.spool_dir)?;
+            }
             // Abort a body that overruns its ceiling before it can fill the disk
             // (the read timeout bounds time, not size, and an overrun fails the
             // sha check anyway) — a lying or absent Content-Length is caught here.

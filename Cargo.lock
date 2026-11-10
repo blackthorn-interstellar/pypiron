@@ -1844,6 +1844,7 @@ dependencies = [
  "ipnet",
  "md-5",
  "mimalloc",
+ "nix",
  "object_store",
  "p256",
  "p384",

@@ -89,6 +89,11 @@ mimalloc = "0.1.52"
 # upload/fill/index hash runs in software, ~5x slower on Graviton and Apple
 # silicon. x86 gets SHA-NI either way. Windows is left out: sha2-asm's build
 # script doesn't target MSVC.
+# Already in the tree via object_store; its safe `statvfs` wrapper reads the
+# spool disk's free space for proxy-fill admission (src/spool_space.rs).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.31", default-features = false, features = ["fs"] }
+
 [target.'cfg(all(target_arch = "aarch64", not(windows)))'.dependencies]
 sha2 = { version = "0.10", features = ["asm"] }
 

@@ -1324,9 +1324,27 @@ async fn proxy_ensure_artifact(
     {
         Ok(proxy::FillOutcome::Done { filled }) => ProxyEnsure::Serve { filled },
         Ok(proxy::FillOutcome::Streaming(fill)) => ProxyEnsure::Stream(fill),
+        Err(e) if e.downcast_ref::<crate::spool_space::SpoolFull>().is_some() => {
+            warn!(%pkg, %filename, error = %e, "proxy: fill refused, spool disk nearly full");
+            ProxyEnsure::Fail(spool_full())
+        }
         Err(e) => ProxyEnsure::Fail(read_error(e)),
     }
 }
+
+/// 503 for a cold-cache download refused because the spool disk is nearly
+/// full. pip and uv retry it; by then running fills have usually committed.
+fn spool_full() -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::SERVICE_UNAVAILABLE)
+        .header(header::RETRY_AFTER, SPOOL_FULL_RETRY_SECS)
+        .header(header::CACHE_CONTROL, "no-store")
+        .body(Body::from("spool disk nearly full; retry shortly"))
+        .unwrap_or_else(not_found)
+}
+
+/// `Retry-After` on a spool-full refusal.
+const SPOOL_FULL_RETRY_SECS: u64 = 30;
 
 /// Which sidecar companion of an artifact is being served. Metadata (PEP 658)
 /// and provenance (PEP 740) follow identical fence, passthrough, and caching

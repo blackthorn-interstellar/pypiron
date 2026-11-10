@@ -51,6 +51,7 @@ pub mod sidecar;
 pub mod sidecar_cache;
 pub mod sim;
 pub mod simple;
+pub mod spool_space;
 pub mod ssrf;
 pub mod status;
 pub mod storage;

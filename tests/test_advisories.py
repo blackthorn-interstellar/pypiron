@@ -297,6 +297,27 @@ def test_ac7_explicit_unreachable_source_refuses_start(pypiron_bin, tmp_path):
     assert "advisory" in (cp.stdout + cp.stderr).lower()
 
 
+@pytest.mark.parametrize(
+    "extra_args",
+    [
+        ["--malware-block", "false"],
+        ["--malware-block", "false", "--advisory-feed", "http://127.0.0.1:9"],
+    ],
+    ids=["block-false", "block-false-explicit-feed"],
+)
+def test_explicit_malware_block_false_never_requires_a_snapshot(pypiron_bin, tmp_path, extra_args):
+    """Turning blocking off is not a request for fail-closed startup: with every
+    feed source unreachable and no stored snapshot, the server still starts."""
+    proc, base, _ = _hand_start(
+        pypiron_bin, tmp_path / "data", extra_args, extra_env=_dead_proxy_env()
+    )
+    try:
+        code, _, _ = http_get(f"{base}/simple/index.json")
+        assert code == 200
+    finally:
+        kill_process_tree(proc)
+
+
 def test_ac7_implicit_default_starts_unfed_then_self_arms(pypiron_bin, tmp_path):
     """The always-on default must never brick a box that never asked: with the OSV
     URL unreachable (a dead forward proxy standing in), the server starts, serves,

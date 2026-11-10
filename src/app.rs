@@ -1610,7 +1610,11 @@ async fn run_serve(
     // Fully off only when the feed is empty AND blocking wasn't explicitly asked
     // for: an empty feed disables the whole feature, blocking included.
     let advisory_off = advisory_feed.is_none() && !(explicit_malware_block && malware_block_flag);
-    let advisory_explicit = explicit_advisory_feed || explicit_malware_block;
+    // Fail-closed startup is for an explicit request to *block*: `--malware-block
+    // false` (even beside an explicit feed, which then only powers the audit)
+    // never waits on or requires a snapshot.
+    let advisory_explicit =
+        malware_block_flag && (explicit_advisory_feed || explicit_malware_block);
     let (advisory_state, advisory_loaded) = if advisory_off {
         (advisories::AdvisoryState::default(), false)
     } else if advisory_explicit {

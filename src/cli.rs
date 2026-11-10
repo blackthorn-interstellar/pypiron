@@ -1357,9 +1357,10 @@ pub struct ServeArgs {
     pub(crate) advisory_feed: Option<String>,
 
     /// Refuse to serve or cache artifacts whose (name, version) is in the feed's
-    /// malware block set. Default true. Requires a snapshot source — the feed, or
-    /// a previously delivered `_advisories/` copy. `Option` with no clap default
-    /// so an explicit `--malware-block true` is distinguishable from the default.
+    /// malware block set. Default true. An explicit `true` requires a snapshot
+    /// source at startup — the feed, or a previously delivered `_advisories/`
+    /// copy; `false` never does. `Option` with no clap default so an explicit
+    /// `--malware-block true` is distinguishable from the default.
     #[arg(long, env = "PYPIRON_MALWARE_BLOCK", action = clap::ArgAction::Set)]
     pub(crate) malware_block: Option<bool>,
 

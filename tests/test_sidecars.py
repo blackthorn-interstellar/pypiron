@@ -7,12 +7,14 @@ the disk backend is blackbox testing of that contract.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from .helpers import (
     download_pypi_wheel,
+    make_wheel,
     sha256_file,
     upload_legacy,
     wait_for_file_in_index,
@@ -168,3 +170,32 @@ def test_invalid_package_name_rejected(disk_server, tmp_path):
         expect_status=400,
     )
     assert not (disk_server["data_dir"] / "escape").exists()
+
+
+def test_a_same_length_sidecar_rewrite_within_one_tick_is_re_read(disk_server, tmp_path):
+    """The rebuild memoizes parsed sidecars by the listing's change detector.
+    On disk that was mtime + size, so a same-length rewrite inside one
+    timestamp tick (a whole second on HFS+) kept serving the old parse. Disk
+    rewrites are tmp+rename, so the new inode gives it away."""
+    first = make_wheel("ticksame", "1.0.0", tmp_path)
+    _upload(disk_server, first, fields={"requires_python": ">=3.9"})
+    wait_for_file_in_index(disk_server["simple"], "ticksame", first.name)
+
+    sidecar = disk_server["data_dir"] / "packages" / "ticksame" / f"{first.name}.meta.json"
+    before = sidecar.stat()
+    text = sidecar.read_text()
+    assert ">=3.9" in text, text
+    # Same length, same mtime: only the inode moves, as with a rewrite that
+    # lands within the filesystem's timestamp granularity.
+    tmp = sidecar.with_name(".rewrite.tmp")
+    tmp.write_text(text.replace(">=3.9", ">=3.8"))
+    os.utime(tmp, ns=(before.st_atime_ns, before.st_mtime_ns))
+    os.replace(tmp, sidecar)
+    assert sidecar.stat().st_size == before.st_size
+
+    # A second upload rebuilds the package against the memo.
+    second = make_wheel("ticksame", "1.0.1", tmp_path)
+    _upload(disk_server, second)
+    index = wait_for_file_in_index(disk_server["simple"], "ticksame", second.name)
+    (entry,) = [f for f in index["files"] if f["filename"] == first.name]
+    assert entry.get("requires-python") == ">=3.8", entry

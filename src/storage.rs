@@ -969,7 +969,7 @@ pub struct FileEntry {
     /// RFC 3339 last-modified timestamp (serves as PEP 700 upload-time).
     pub last_modified: Option<String>,
     /// The same listing-only change detector as [`ObjectMeta::etag`] (the
-    /// cloud ETag + version, or nanosecond mtime + size on disk): equal across
+    /// cloud ETag + version, or inode + nanosecond mtime + size on disk): equal across
     /// two listings iff the object was not rewritten between them. `None` when
     /// the backend reported nothing to compare, so a caller memoizing on it
     /// must treat the object as always changed.
@@ -982,7 +982,7 @@ pub struct ObjectMeta {
     pub key: String,
     pub size: u64,
     /// Opaque change detector, compared **against another listing only**: the
-    /// S3 ETag, or mtime+size on disk. Two listings agree on (key, size, etag)
+    /// S3 ETag, or inode+mtime+size on disk. Two listings agree on (key, size, etag)
     /// iff the object hasn't been rewritten between them.
     ///
     /// It is not a conditional-write token and not comparable with one. A
@@ -1837,7 +1837,7 @@ pub struct DiskStorage {
 /// Content-addressed etag for the disk conditional-write path: identical bytes
 /// hash identically (the same ABA caveat object stores carry without
 /// versioning), which is all the origin CAS needs — its transitions all change
-/// the content string. Distinct from list_all's mtime+size etag; the two etag
+/// the content string. Distinct from list_all's inode+mtime+size etag; the two etag
 /// spaces never cross (one drives CAS, the other drives audit fingerprints).
 fn disk_content_etag(bytes: &[u8]) -> String {
     use sha2::{Digest, Sha256};
@@ -2257,9 +2257,12 @@ fn walk_disk(path: &Path, key_base: &str, out: &mut Vec<ObjectMeta>) -> Result<(
     Ok(())
 }
 
-/// mtime (nanos) + size: changes whenever the file is rewritten. Disk writes
-/// go through tmp+rename, so a content change always produces a new inode
-/// with a new mtime.
+/// inode + mtime (nanos) + size, all from the stat the listing already did.
+/// Disk writes go through tmp+rename, so every rewrite lands on a new inode
+/// (the tmp file exists while the old one is still linked, so the two can't
+/// share a number). mtime alone misses a same-length rewrite within one
+/// timestamp tick — a whole second on HFS+ — and the sidecar memo would keep
+/// serving the old parse.
 fn disk_etag(md: &std::fs::Metadata) -> String {
     let mtime = md
         .modified()
@@ -2267,7 +2270,11 @@ fn disk_etag(md: &std::fs::Metadata) -> String {
         .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    format!("{mtime}-{}", md.len())
+    #[cfg(unix)]
+    let ino = std::os::unix::fs::MetadataExt::ino(md);
+    #[cfg(not(unix))]
+    let ino = 0u64;
+    format!("{ino}-{mtime}-{}", md.len())
 }
 
 /// ------------------------------ ObjectStorage -----------------------------

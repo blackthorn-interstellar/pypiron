@@ -15,7 +15,7 @@
 //!   memoized.
 //! - **Per bucket**: one node serves several buckets from one memo, and a
 //!   detector is only a change detector *within* its store — two buckets can
-//!   list the same etag (or mtime+size) over different bytes. Each memo is
+//!   list the same etag (or inode+mtime+size) over different bytes. Each memo is
 //!   keyed by the storage handle it was filled from, so one bucket's listing
 //!   can never validate another bucket's parse.
 //! - **Per package, replaced wholesale**: a rebuild takes its package's memo

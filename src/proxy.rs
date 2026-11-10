@@ -68,6 +68,16 @@ const LISTING_MAX_STALE: Duration = Duration::from_secs(3600);
 /// there are unbounded distinct normalized names, so without a cap a stream of
 /// nonexistent-package requests grows the map until OOM.
 const MAX_LISTINGS: usize = 8192;
+
+/// The yank reason a mirror project's cached files carry while upstream
+/// answers 404 for the whole project (often a malware takedown). Display only:
+/// nothing is written, and the files list unyanked again once upstream
+/// lists the project.
+pub const REMOVED_UPSTREAM: &str = "removed upstream";
+
+/// The local pages of a project upstream no longer has, with every cached
+/// file yanked: `(html, json)`.
+type RemovedViews = Arc<(RenderedIndex, RenderedIndex)>;
 /// Listing and metadata fetches are small; bound them hard.
 const SMALL_FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// With `include-dependencies`: how often the dependency scope is re-read with
@@ -140,6 +150,34 @@ static DETACHED_FILLS: tokio::sync::Semaphore =
 pub struct RenderedIndex {
     pub body: bytes::Bytes,
     pub etag: Arc<str>,
+}
+
+/// Render [`Proxy::removed_upstream_index`]'s pages: read-only, from the
+/// local sidecars, through the stored index's own denylist, malware, and
+/// PEP 792 rules, with each not-yet-yanked file marked [`REMOVED_UPSTREAM`].
+async fn removed_upstream_views(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+) -> Result<Option<RemovedViews>> {
+    if origin::read_origin_claim(storage, pkg).await? != Some(origin::OriginState::Mirror) {
+        return Ok(None);
+    }
+    let (mut files, _) =
+        crate::worker::list_artifacts_readonly(storage, &state.sidecar_cache, pkg).await?;
+    if let Some(denylist) = state.denylist.as_ref() {
+        files.retain(|f| !denylist.file_denied(pkg, &f.filename));
+    }
+    if files.is_empty() {
+        return Ok(None);
+    }
+    for file in &mut files {
+        if !is_yanked(&file.yanked) {
+            file.yanked = crate::sidecar::Yanked::Reason(REMOVED_UPSTREAM.to_string());
+        }
+    }
+    let (html, json, _) = crate::worker::render_pkg_views(state, storage, pkg, &files).await?;
+    Ok(Some(Arc::new((rendered(html), rendered(json)))))
 }
 
 fn rendered(body: String) -> RenderedIndex {
@@ -243,6 +281,11 @@ pub struct Proxy {
     /// literal check in [`ssrf::guarded_get`].
     guard: Arc<Guard>,
     listings: Mutex<HashMap<String, CacheEntry>>,
+    /// [`Proxy::removed_upstream_index`] results, held as long as the upstream
+    /// 404 they answer: `(expires, views)`, `None` for a name with no cached
+    /// mirror files (so a typo'd name costs one origin read per TTL, not one
+    /// per request).
+    removed: Mutex<HashMap<String, (Instant, Option<RemovedViews>)>>,
     /// Single-flight guard: at most one in-flight download per artifact key.
     /// Without it, N concurrent GETs for the same uncached wheel each stream a
     /// full copy into N separate spool files — an anonymous client could
@@ -936,6 +979,7 @@ impl Proxy {
             .build()?,
             guard,
             listings: Mutex::new(HashMap::new()),
+            removed: Mutex::new(HashMap::new()),
             inflight: Arc::new(Mutex::new(HashMap::new())),
             presence: PresenceCache::new(PRESENCE_TTL, MAX_PRESENCE),
         })
@@ -1118,6 +1162,48 @@ impl Proxy {
                 &found.status,
             ))
         }))
+    }
+
+    /// The local index of a mirror project upstream answers 404 for, with every
+    /// cached file shown yanked ([`REMOVED_UPSTREAM`]) — PyPI deleting a whole
+    /// project is usually a takedown, so resolvers should stop picking it while
+    /// an exact pin still installs the bytes already here. `None` when the
+    /// name is not a mirror claim with cached files (the caller falls through
+    /// to the plain local index). Rendered from the same truth and rules as
+    /// the stored index, and cached for the upstream 404's own TTL.
+    pub async fn removed_upstream_index(
+        &self,
+        state: &AppState,
+        storage: &dyn Storage,
+        pkg: &str,
+        json: bool,
+    ) -> Result<Option<RenderedIndex>> {
+        let pick = |views: &RemovedViews| {
+            if json {
+                views.1.clone()
+            } else {
+                views.0.clone()
+            }
+        };
+        let now = Instant::now();
+        {
+            let map = self.removed.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((expires, views)) = map.get(pkg) {
+                if now < *expires {
+                    return Ok(views.as_ref().map(pick));
+                }
+            }
+        }
+        let views = removed_upstream_views(state, storage, pkg).await?;
+        let mut map = self.removed.lock().unwrap_or_else(|e| e.into_inner());
+        if map.len() >= MAX_LISTINGS && !map.contains_key(pkg) {
+            map.retain(|_, (expires, _)| now < *expires);
+            if map.len() >= MAX_LISTINGS {
+                map.clear();
+            }
+        }
+        map.insert(pkg.to_string(), (now + LISTING_TTL, views.clone()));
+        Ok(views.as_ref().map(pick))
     }
 
     /// Warm-hit fast path for a proxied artifact download. `Ok(true)` means the

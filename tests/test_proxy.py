@@ -198,6 +198,66 @@ def test_yanked_upstream_file_stays_listed_and_serves_a_pin(
         gen.close()
 
 
+def test_project_removed_upstream_lists_cached_files_yanked(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """Upstream deleting a whole project (404, usually a takedown) is a signal:
+    the cached files stay installable by exact pin but show yanked "removed
+    upstream", so resolvers stop picking them. Nothing is deleted, and the yank
+    goes away once upstream lists the project again."""
+    gen = _start_proxy_pair(tmp_path_factory, pypiron_bin)
+    pair = next(gen)
+    try:
+        upstream, proxy = pair["upstream"], pair["proxy"]
+        wheel = make_wheel("takendown", "1.0", tmp_path)
+        _upload(upstream, wheel, "takendown")
+        assert http_get(f"{proxy['base_url']}/files/takendown/{wheel.name}")[0] == 200
+        local_index = proxy["data_dir"] / "simple" / "takendown" / "index.json"
+        deadline = time.time() + 20
+        while not local_index.exists() and time.time() < deadline:
+            time.sleep(0.2)
+        assert local_index.exists(), "the cached package never got a local index"
+        kill_process_tree(proxy["proc"])
+
+        # Upstream removes the project entirely.
+        code, _, _ = http_request_auth(
+            "DELETE",
+            f"{upstream['base_url']}/files/takendown/{wheel.name}",
+            username=upstream["admin_user"],
+            password=upstream["admin_password"],
+        )
+        assert code == 204
+        deadline = time.time() + 20
+        while http_get(f"{upstream['simple']}takendown/")[0] != 404:
+            assert time.time() < deadline, "upstream never dropped the project"
+            time.sleep(0.2)
+
+        with _relaunched_proxy(pypiron_bin, proxy["data_dir"], upstream["base_url"]) as relaunched:
+            doc = get_index_json(relaunched["simple"], "takendown")
+            entry = next(f for f in doc["files"] if f["filename"] == wheel.name)
+            assert entry["yanked"] == "removed upstream"
+            code, html, _ = http_get(f"{relaunched['simple']}takendown/")
+            assert code == 200
+            assert b'data-yanked="removed upstream"' in html
+            # An exact pin still installs the bytes already here.
+            code, served, _ = http_get(f"{relaunched['base_url']}/files/takendown/{wheel.name}")
+            assert code == 200
+            assert hashlib.sha256(served).hexdigest() == sha256_file(wheel)
+            # A name never cached keeps its plain 404.
+            assert http_get(f"{relaunched['simple']}nevercached/")[0] == 404
+        assert (proxy["data_dir"] / "packages" / "takendown" / wheel.name).exists()
+
+        # The project comes back upstream: no more "removed upstream".
+        newer = make_wheel("takendown", "1.1", tmp_path)
+        _upload(upstream, newer, "takendown")
+        with _relaunched_proxy(pypiron_bin, proxy["data_dir"], upstream["base_url"]) as relaunched:
+            doc = get_index_json(relaunched["simple"], "takendown")
+            assert all(f["yanked"] is False for f in doc["files"]), doc["files"]
+            assert newer.name in {f["filename"] for f in doc["files"]}
+    finally:
+        gen.close()
+
+
 def test_yanked_upstream_file_is_not_newly_cached(tmp_path_factory, pypiron_bin, tmp_path):
     """The other half of the split: listing a yanked file does not mirror it.
     A file yanked before anyone asked for it is advertised but never fetched —

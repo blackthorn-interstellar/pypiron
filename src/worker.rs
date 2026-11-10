@@ -4677,6 +4677,31 @@ async fn write_pkg_indexes(
     pkg: &str,
     files: &[FileMetadata],
 ) -> Result<(Vec<(String, Vec<u8>)>, bool)> {
+    let (html, json, blocks_downloads) = render_pkg_views(state, storage, pkg, files).await?;
+    let base = format!("{SIMPLE_PREFIX}{pkg}/");
+    let views = vec![
+        (format!("{base}index.html"), html.into_bytes()),
+        (format!("{base}index.json"), json.into_bytes()),
+    ];
+    for ((key, bytes), ct) in views
+        .iter()
+        .zip([SIMPLE_HTML_CONTENT_TYPE, SIMPLE_JSON_CONTENT_TYPE])
+    {
+        put_if_changed(state, storage, key, bytes.clone(), ct).await?;
+    }
+    Ok((views, blocks_downloads))
+}
+
+/// A package's PEP 503 HTML and PEP 691 JSON pages, rendered from `files`
+/// exactly as the index rebuild stores them, plus whether its PEP 792 status
+/// blocks downloads. Shared with the proxy's removed-upstream view so the two
+/// can't drift.
+pub(crate) async fn render_pkg_views(
+    state: &AppState,
+    storage: &dyn Storage,
+    pkg: &str,
+    files: &[FileMetadata],
+) -> Result<(String, String, bool)> {
     // Status is per-project truth (PEP 792). A read error propagates — we
     // re-render against the prior index rather than assume `active` and, say,
     // re-expose links for a project that should be quarantined.
@@ -4696,21 +4721,11 @@ async fn write_pkg_indexes(
     } else {
         files
     };
-    let html = pep503_project_html(pkg, render_files, &status);
-    let json = pep691_project_json(pkg, render_files, &status);
-
-    let base = format!("{SIMPLE_PREFIX}{pkg}/");
-    let views = vec![
-        (format!("{base}index.html"), html.into_bytes()),
-        (format!("{base}index.json"), json.into_bytes()),
-    ];
-    for ((key, bytes), ct) in views
-        .iter()
-        .zip([SIMPLE_HTML_CONTENT_TYPE, SIMPLE_JSON_CONTENT_TYPE])
-    {
-        put_if_changed(state, storage, key, bytes.clone(), ct).await?;
-    }
-    Ok((views, status.status.blocks_downloads()))
+    Ok((
+        pep503_project_html(pkg, render_files, &status),
+        pep691_project_json(pkg, render_files, &status),
+        status.status.blocks_downloads(),
+    ))
 }
 
 async fn write_global_indexes(

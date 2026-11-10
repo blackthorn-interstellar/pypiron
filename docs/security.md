@@ -85,6 +85,11 @@ A quarantined project has no resolvable files, and direct artifact requests are
 refused. A freeze takes effect immediately on the server that receives it and
 within `--quarantine-poll-secs` on other nodes; the default is 30 seconds.
 
+When the upstream index removes a whole project that the proxy has cached,
+pypiron keeps the cached files but lists them as yanked with the reason
+"removed upstream". Installers stop choosing them, while an exact pin in a
+lockfile still installs. If the project returns upstream, the yank goes away.
+
 With object-storage redirects, a signed download URL already issued can remain
 valid for up to one hour. Use `--artifact-delivery stream` when every download
 must pass through the live server decision, or remove the object to invalidate

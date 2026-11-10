@@ -629,7 +629,19 @@ async fn proxy_package_index(
         .await
     {
         Ok(proxy::Listing::Found(rendered)) => rendered,
-        Ok(proxy::Listing::Missing) => return ControlFlow::Continue(false),
+        // Upstream has no such project. A mirror claim with cached files gets
+        // its local page with those files shown yanked; anything else falls
+        // through to the plain local index.
+        Ok(proxy::Listing::Missing) => {
+            match proxy
+                .removed_upstream_index(state, storage, pkg, format.is_json())
+                .await
+            {
+                Ok(Some(rendered)) => rendered,
+                Ok(None) => return ControlFlow::Continue(false),
+                Err(error) => return ControlFlow::Break(read_error(error)),
+            }
+        }
         Ok(proxy::Listing::Unreachable) => return ControlFlow::Continue(true),
         Err(error) => return ControlFlow::Break(read_error(error)),
     };

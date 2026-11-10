@@ -1,6 +1,6 @@
 //! Authentication and authorization: the credential-pairing and Basic-auth
 //! decoders behind [`crate::app::AppState`]'s role checks, the admin request
-//! guard, the project-attribution tag, and the failed-login throttle. Split
+//! guard, the client tags in the username, and the failed-login throttle. Split
 //! out of `app.rs`; the role predicates themselves stay methods on `AppState`.
 
 use std::collections::HashMap;
@@ -125,7 +125,7 @@ pub(crate) fn require_admin(
 pub(crate) fn check_basic_auth(headers: &HeaderMap, user: &str, pass: &str) -> Result<()> {
     let (u, p) = basic_credentials(headers).ok_or_else(|| anyhow!("missing basic auth"))?;
     // Gmail-style subaddressing: `ci+billing-api` authenticates as `ci`; the
-    // suffix is a project attribution tag, not part of the identity.
+    // suffix is client tags, not part of the identity.
     let base = u.split_once('+').map_or(u.as_str(), |(b, _)| b);
     // Username is not a secret; the password is — compare it in constant time.
     if (u == user || base == user) && token::ct_eq(&p, pass) {
@@ -146,39 +146,102 @@ pub(crate) fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)>
     Some((u.to_string(), p.to_string()))
 }
 
-/// Project attribution tag from the Basic-auth username. The username is
-/// `user[+project][+key=value]...`: the first `+` segment without an `=` is the
-/// tag (`ci+billing-api` → `billing-api`), and an untagged username is its own
-/// tag (`ci`, `ci+delivery=stream` → `ci`). Segments with an `=` are client
-/// settings (see [`client_wants_stream`]); `=` is outside the tag charset, so
-/// the two can never be confused.
-/// Deliberately works without any credential check — open servers still get
-/// attribution from whatever username the client volunteers. The value is
-/// client-supplied, so it is held to a label-safe charset and length; anything
-/// else is dropped rather than escaped.
-pub(crate) fn project_tag(headers: &HeaderMap) -> Option<String> {
+/// What a client says about itself. The Basic-auth username is
+/// `user+key=value,key=value`: `user` is the identity, everything after the
+/// first `+` is a comma list of tags (`ci+repo=org/repo,delivery=stream`).
+/// A username is the one channel an installer carries to every request without
+/// writing it into a lockfile, so it is where a client names its repo and asks
+/// for how it wants to be served.
+///
+/// The keys are `repo` (attribution), `commit` (logged; the same names an
+/// install token's claims use), `delivery=stream` (see
+/// [`client_wants_stream`]) and anything starting `x-`, which is the client's
+/// own metadata and only ever logged. Nothing else is accepted: a misspelt
+/// setting that was quietly ignored would fail exactly as if it had never been
+/// set, so [`check_client_tags`] refuses the request instead. Keys are
+/// `[A-Za-z0-9_-]`, values `[A-Za-z0-9._/-]` — safe to log and to use as a
+/// metric label unescaped. No `:` is possible (it ends a Basic username), so
+/// URLs are written without a scheme.
+///
+/// Returns the tag list as sent, or None when there is none or it is invalid.
+/// Deliberately works without any credential check — an open server still
+/// learns what the client volunteers.
+pub(crate) fn client_tags(headers: &HeaderMap) -> Option<String> {
     let (user, _) = basic_credentials(headers)?;
-    let mut parts = user.split('+');
-    let base = parts.next().unwrap_or_default();
-    let tag = parts.find(|s| !s.contains('=')).unwrap_or(base);
-    let ok = !tag.is_empty()
-        && tag.len() <= 64
-        && tag
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
-    ok.then(|| tag.to_string())
+    let (_, tags) = user.split_once('+')?;
+    parse_tags(tags).is_ok().then(|| tags.to_string())
+}
+
+/// Refuse a username whose tags are malformed, with a one-line reason fit for
+/// an HTTP status line. A username with no `+` carries no tags and passes.
+pub(crate) fn check_client_tags(headers: &HeaderMap) -> Result<(), String> {
+    match basic_credentials(headers) {
+        Some((user, _)) => match user.split_once('+') {
+            Some((_, tags)) => parse_tags(tags).map(|_| ()),
+            None => Ok(()),
+        },
+        None => Ok(()),
+    }
+}
+
+/// Longest tag list accepted, in bytes.
+const MAX_TAGS_BYTES: usize = 256;
+
+fn parse_tags(tags: &str) -> Result<Vec<(&str, &str)>, String> {
+    if tags.len() > MAX_TAGS_BYTES {
+        return Err(format!("tags are longer than {MAX_TAGS_BYTES} bytes"));
+    }
+    let word = |s: &str, extra: &[u8]| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_' || extra.contains(&b))
+    };
+    let mut out: Vec<(&str, &str)> = Vec::new();
+    for item in tags.split(',') {
+        let Some((key, value)) = item.split_once('=').filter(|(k, _)| word(k, b"")) else {
+            return Err("tags must be key=value, separated by commas".into());
+        };
+        if !word(value, b"./") {
+            return Err(format!(
+                "bad value for {key} (use letters, digits and . _ / -)"
+            ));
+        }
+        match key {
+            // `repo=https://host/…` reaches us cut at the colon, as `repo=https`.
+            "repo" if matches!(value, "http" | "https") => {
+                return Err("write the repo without https://".into())
+            }
+            "repo" | "commit" => {}
+            "delivery" if value == "stream" => {}
+            "delivery" => return Err("delivery must be stream".into()),
+            _ if key.len() > 2 && key.starts_with("x-") => {}
+            _ => return Err(format!("unknown key {key} (custom keys start with x-)")),
+        }
+        if out.iter().any(|(k, _)| *k == key) {
+            return Err(format!("{key} is set twice"));
+        }
+        out.push((key, value));
+    }
+    Ok(out)
+}
+
+fn tag(headers: &HeaderMap, key: &str) -> Option<String> {
+    let tags = client_tags(headers)?;
+    let found = parse_tags(&tags).ok()?.into_iter().find(|(k, _)| *k == key);
+    found.map(|(_, v)| v.to_string())
+}
+
+/// The repo a client attributes its traffic to (`ci+repo=org/repo`).
+pub(crate) fn client_repo(headers: &HeaderMap) -> Option<String> {
+    tag(headers, "repo")
 }
 
 /// Did the client ask for artifact bytes from this server rather than a
-/// redirect to object storage? It says so with a `+delivery=stream` segment in
-/// its Basic-auth username (`ci+billing-api+delivery=stream`), which is the one
-/// channel an installer carries to every request without writing it into a
-/// lockfile. For clients on a network that reaches this server but not the
-/// bucket. Like the tag, it needs no credential check: streaming is what any
-/// client the server does not recognize gets anyway.
+/// redirect to object storage (`ci+delivery=stream`)? For clients on a network
+/// that reaches this server but not the bucket. Needs no credential check:
+/// streaming is what any client the server does not recognize gets anyway.
 pub(crate) fn client_wants_stream(headers: &HeaderMap) -> bool {
-    basic_credentials(headers)
-        .is_some_and(|(user, _)| user.split('+').skip(1).any(|s| s == "delivery=stream"))
+    tag(headers, "delivery").is_some()
 }
 
 /// Default `--login-cooldown-secs`: five minutes, the fail2ban/Grafana-order
@@ -320,7 +383,7 @@ impl LoginThrottle {
     }
 
     /// The identity a credential is checked as: the Basic username without its
-    /// `+tag` attribution suffix, plus the password — so `ci+a:pw` and
+    /// `+tags` suffix, plus the password — so `ci+a:pw` and
     /// `ci+b:pw` are one guess. Any other scheme hashes the raw header.
     pub(crate) fn fingerprint(&self, headers: &HeaderMap) -> u64 {
         match basic_credentials(headers) {
@@ -879,44 +942,68 @@ mod tests {
     }
 
     #[test]
-    fn project_tag_extraction() {
+    fn client_tags_are_the_username_suffix() {
+        let tags = |u: &str| client_tags(&basic_headers(u, ""));
         assert_eq!(
-            project_tag(&basic_headers("ci+billing-api", "tok")).as_deref(),
-            Some("billing-api")
+            tags("ci+repo=org/repo,commit=eb35ed7").as_deref(),
+            Some("repo=org/repo,commit=eb35ed7")
         );
-        // Untagged username: the username itself is the attribution.
-        assert_eq!(
-            project_tag(&basic_headers("etl", "tok")).as_deref(),
-            Some("etl")
-        );
-        // No credentials, empty tags, oversized or label-unsafe tags: dropped.
-        assert_eq!(project_tag(&HeaderMap::new()), None);
-        assert_eq!(project_tag(&basic_headers("ci+", "tok")), None);
-        assert_eq!(project_tag(&basic_headers("ci+bad\"label", "tok")), None);
-        // Settings segments are not tags, wherever they sit.
-        for (user, tag) in [
-            ("ci+billing-api+delivery=stream", "billing-api"),
-            ("ci+delivery=stream+billing-api", "billing-api"),
-            ("ci+delivery=stream", "ci"),
-        ] {
-            assert_eq!(project_tag(&basic_headers(user, "")).as_deref(), Some(tag));
-        }
-        assert_eq!(
-            project_tag(&basic_headers(&format!("ci+{}", "x".repeat(65)), "tok")),
-            None
-        );
+        assert_eq!(client_tags(&HeaderMap::new()), None);
+        assert_eq!(tags("ci"), None);
+        assert_eq!(tags("ci+repo=bad\"label"), None);
     }
 
     #[test]
-    fn stream_request_is_a_username_setting() {
-        let wants = |u| client_wants_stream(&basic_headers(u, ""));
+    fn malformed_tags_are_refused_with_a_reason() {
+        let check = |u: &str| check_client_tags(&basic_headers(u, ""));
+        for ok in [
+            "ci",
+            "ci+repo=org/repo",
+            "ci+repo=github.com/org/repo,delivery=stream,commit=eb35ed7",
+            "__token__+x-team=data_eng",
+        ] {
+            assert_eq!(check(ok), Ok(()), "{ok}");
+        }
+        assert_eq!(check_client_tags(&HeaderMap::new()), Ok(()));
+        for (bad, why) in [
+            ("ci+", "key=value"),
+            ("ci+billing-api", "key=value"),
+            ("ci+repo=a,", "key=value"),
+            ("ci+re po=a", "key=value"),
+            ("ci+repo=", "bad value for repo"),
+            ("ci+repo=https://github.com/org/repo", "without https://"),
+            ("ci+repo=a+delivery=stream", "bad value for repo"),
+            ("ci+delivery=redirect", "delivery must be stream"),
+            ("ci+delivry=stream", "unknown key delivry"),
+            ("ci+team=data", "custom keys start with x-"),
+            ("ci+x-=1", "unknown key x-"),
+            ("ci+repo=a,repo=b", "repo is set twice"),
+        ] {
+            let err = check(bad).expect_err(bad);
+            assert!(err.contains(why), "{bad}: {err}");
+        }
+        let long = format!("ci+repo={}", "x".repeat(MAX_TAGS_BYTES));
+        assert!(check(&long).expect_err("too long").contains("longer than"));
+    }
+
+    #[test]
+    fn repo_and_delivery_are_read_from_the_tags() {
+        let repo = |u: &str| client_repo(&basic_headers(u, ""));
+        assert_eq!(repo("ci+repo=org/repo").as_deref(), Some("org/repo"));
+        assert_eq!(
+            repo("ci+delivery=stream,repo=github.com/org/repo").as_deref(),
+            Some("github.com/org/repo")
+        );
+        assert_eq!(repo("ci+x-repo=org/repo"), None);
+        assert_eq!(repo("repo=org/repo"), None);
+
+        let wants = |u: &str| client_wants_stream(&basic_headers(u, ""));
         assert!(wants("ci+delivery=stream"));
-        assert!(wants("ci+billing-api+delivery=stream"));
+        assert!(wants("ci+repo=org/repo,delivery=stream"));
         assert!(wants("__token__+delivery=stream"));
-        // A project or a user that happens to be named like the setting is not one.
-        assert!(!wants("ci+stream"));
         assert!(!wants("delivery=stream"));
-        assert!(!wants("ci+delivery=redirect"));
-        assert!(!client_wants_stream(&HeaderMap::new()));
+        assert!(!wants("ci+x-delivery=stream"));
+        // An invalid list sets nothing; the request is refused before it matters.
+        assert!(!wants("ci+delivery=stream,oops"));
     }
 }

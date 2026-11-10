@@ -36,7 +36,7 @@ const PREFIX: &str = "pypiron-";
 pub const MAX_CLOCK_SKEW_SECS: i64 = 60;
 
 /// Does this Basic-auth username select token mode? `__token__` itself or
-/// `__token__+tag` (the tag is attribution only).
+/// `__token__+key=value,...` (the tags never change the identity).
 pub fn is_token_username(user: &str) -> bool {
     user.split_once('+').map_or(user, |(base, _)| base) == TOKEN_USERNAME
 }

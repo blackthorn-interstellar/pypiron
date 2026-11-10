@@ -439,19 +439,26 @@ behavior, not popularity. Index pages always embed the stable `/files/` URLs;
 anything else would bake expiring signatures into lockfiles and cached index
 pages.
 
-One client-side override: a `+delivery=stream` segment in the Basic-auth
-username (`ci+billing-api+delivery=stream`) streams that request in every
-mode, for clients on a network that reaches the node but not the bucket. The
-node cannot detect that case itself — the client retries the signed URL and
-never comes back — so the client has to say it. The username is the channel
-because it is the only one uv offers that reaches `/files/` and stays out of
-`uv.lock` (no custom headers, no User-Agent control; a different index URL
-or path is recorded in the lock and fails `--locked` for everyone else). uv
-carries it reliably only from `UV_INDEX_<NAME>_USERNAME`; a username embedded
-in the index URL is not sent on file requests unless the server challenges.
-Username grammar: `user[+project][+key=value]...` — `=` is outside the
-project-tag charset, so settings and tags cannot collide, and older servers
-authenticate the same `user` and simply ignore the rest.
+One client-side override: a `delivery=stream` tag in the Basic-auth username
+(`ci+repo=org/repo,delivery=stream`) streams that request in every mode, for
+clients on a network that reaches the node but not the bucket. The node cannot
+detect that case itself — the client retries the signed URL and never comes
+back — so the client has to say it.
+
+**Username tags.** The username is `user+key=value,key=value`. It is the
+channel because it is the only one uv offers that reaches `/files/` and stays
+out of `uv.lock`: no custom headers, no User-Agent control, and a different
+index URL or path is recorded in the lock and fails `--locked` for everyone
+else. uv carries it unprompted only from `UV_INDEX_<NAME>_USERNAME`; a
+username embedded in the index URL is sent on file requests only after the
+server refuses one. Keys are a closed set — `repo`, `commit`, `delivery` —
+plus `x-*` for a client's own metadata, and a malformed list is refused with
+400 on every route, the reason in the HTTP/1.1 status line (the one part of a
+refusal uv prints). Strictness is the point: a misspelt `delivery` that was
+ignored would fail late and look exactly like the setting was never there.
+It also means every bare key is reserved, so adding one later breaks nobody.
+The whole list goes to the access log as `tags`; only `repo` may become a
+metrics label, because the others are unbounded.
 
 The redirect path does no artifact-existence check — presigning is local HMAC
 math. In single-bucket mode, the visibility hardening adds zero storage calls.

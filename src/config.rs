@@ -129,7 +129,7 @@ pub struct ServeConfig {
     pub advisory_feed: Option<String>,
     pub malware_block: Option<bool>,
     pub malware_probe_secs: Option<u64>,
-    pub metrics_project_labels: Option<bool>,
+    pub metrics_repo_labels: Option<bool>,
     pub spool_dir: Option<PathBuf>,
     pub wait_on_upload: Option<bool>,
     pub wait_on_upload_secs: Option<u64>,

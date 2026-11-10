@@ -159,7 +159,7 @@ def test_auto_mode_dispatches_on_client(auto_server):
     assert body.startswith(b"Metadata-Version:")
 
 
-STREAM_ME = {"Authorization": _encode_basic_auth("ci+billing-api+delivery=stream", "")}
+STREAM_ME = {"Authorization": _encode_basic_auth("ci+repo=acme/billing-api,delivery=stream", "")}
 
 
 @pytest.mark.parametrize("fixture", ["auto_server", "presigned_server"])
@@ -201,7 +201,7 @@ url = "{server["simple"]}"
 default = true
 """
     )
-    env = {**os.environ, "UV_INDEX_CORP_USERNAME": "ci+billing-api+delivery=stream"}
+    env = {**os.environ, "UV_INDEX_CORP_USERNAME": "ci+repo=acme/billing-api,delivery=stream"}
     run_checked([uv_path, "sync", "--no-cache"], cwd=project, env=env, timeout=180)
 
     wheel_gets = [

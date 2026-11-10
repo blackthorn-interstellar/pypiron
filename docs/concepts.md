@@ -88,7 +88,7 @@ Credentials grant cumulative roles:
 `--admin-pass` enables the default `admin` user. Uploader and reader
 credentials require both a username and password; an incomplete pair makes
 startup fail. For CI, a signing key enables five-minute install tokens. Username tags such as
-`reader+billing-api` can attribute traffic to a project in access logs and,
+`reader+repo=org/repo` can attribute traffic to a repo in access logs and,
 when enabled, Prometheus metrics.
 
 [Authentication options](reference/configuration.md#server) ·

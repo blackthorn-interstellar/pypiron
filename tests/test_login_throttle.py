@@ -206,7 +206,7 @@ def test_stale_credential_on_public_reads_is_never_refused(disk_server):
     """A public-read server ignores the credential on reads; a client with a
     stale one fetching in parallel is never throttled."""
     url = f"{disk_server['simple']}index.json"
-    stale = _auth_header("ci+billing", "stale")
+    stale = _auth_header("ci+repo=acme/billing", "stale")
     with ThreadPoolExecutor(max_workers=20) as pool:
         codes = list(pool.map(lambda _: http_get(url, headers=stale)[0], range(20)))
     assert codes == [200] * 20

@@ -101,16 +101,16 @@
 # malware-block = true                      # refuse to serve/cache files in the feed's malware block set
 # malware-probe-secs = 120                  # block new OSV malware within minutes, ahead of the daily feed; 0 disables
 
-# Attach per-client project labels to /metrics (pypiron_project_requests_total).
-# Off by default: /metrics is unauthenticated and the label is the basic-auth
-# username subaddress, so enabling it lets any scraper enumerate project names.
-# metrics-project-labels = false
+# Attach per-client repo labels to /metrics (pypiron_repo_requests_total).
+# Off by default: /metrics is unauthenticated and the label is the repo a
+# client names in its username, so enabling it lets any scraper enumerate them.
+# metrics-repo-labels = false
 
 # How artifact bytes reach clients: auto | redirect | stream. auto redirects
 # cache-immune clients (uv) to presigned URLs and streams the rest; redirect
 # always 302s so this node never touches bytes; stream always proxies them.
 # A client that cannot reach the bucket can ask to be streamed in any mode with
-# a `+delivery=stream` username segment (UV_INDEX_<NAME>_USERNAME=ci+delivery=stream).
+# a `delivery=stream` username tag (UV_INDEX_<NAME>_USERNAME=ci+delivery=stream).
 # artifact-delivery = "auto"
 
 # Publishing / CI. Wait for an upload to appear in the index before returning

@@ -220,7 +220,7 @@ backends are supported. With more than one bucket:
 | `--advisory-feed URL\|PATH` | `PYPIRON_ADVISORY_FEED` | OSV PyPI export | Feed for malware blocking and the org audit: a URL or local path to the [OSV](https://osv.dev) PyPI advisory export. Defaults to `https://osv-vulnerabilities.storage.googleapis.com/PyPI/all.zip` (named in the startup log); a URL fetch honors `HTTP(S)_PROXY`. `""` disables both features. |
 | `--malware-block true\|false` | `PYPIRON_MALWARE_BLOCK` | `true` | Refuse public files named by OSV `MAL-*` advisories. The binary includes a first-boot block set; a live or synced snapshot replaces it. An explicit `true`, or an explicit `--advisory-feed` with blocking on, refuses startup until a live or stored snapshot loads; `false` never waits on one. Does not control PEP 792 quarantine. |
 | `--malware-probe-secs N` | `PYPIRON_MALWARE_PROBE_SECS` | `120` | Check OSV for new malware between daily snapshots. `0` disables. Requires malware blocking and the standard OSV `all.zip` feed. |
-| `--metrics-project-labels` | `PYPIRON_METRICS_PROJECT_LABELS` | `false` | Attach per-client `project` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label derives from the username tag, so exposing it lets any scraper list internal project names. |
+| `--metrics-repo-labels` | `PYPIRON_METRICS_REPO_LABELS` | `false` | Attach per-client `repo` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label is the repo from the [username tags](#username-tags), so exposing it lets any scraper list internal repo names. |
 | `--spool-dir PATH` | `PYPIRON_SPOOL_DIR` | system temp | Upload/proxy spool directory. Spool files a crash left behind are removed once they are a day old. A first proxy download that would leave less than 1 GiB free here (5% on a disk under 20 GiB), counting downloads already running, gets a `503` with `Retry-After`, which pip and uv retry. |
 | `--artifact-delivery auto\|redirect\|stream` | `PYPIRON_ARTIFACT_DELIVERY` | `auto` | Redirect object-store downloads for compatible clients or stream through the server. A first uncached proxy download may stream under `--proxy-stream-threshold`. A client can [ask to be streamed](#clients-that-cannot-reach-the-bucket). |
 | `--wait-on-upload` | `PYPIRON_WAIT_ON_UPLOAD` | `false` | Wait for index visibility before upload returns. |
@@ -254,29 +254,64 @@ backends are supported. With more than one bucket:
 No write credential means read-only. No read credential means installs are open
 to the network. Half-configured credentials refuse startup.
 
-Username tags are for attribution: `reader+billing-api` authenticates as
-`reader` and records `billing-api` in the access log and, with
-`--metrics-project-labels`, in `/metrics`. Tags are capped and restricted to
-`[A-Za-z0-9._-]`. When reads require a credential, `/metrics` counts a tag
-only on requests whose credential is accepted.
+### Username tags
+
+A client can tell pypiron about itself in the index username. Everything after
+a `+` is a comma-separated list of `key=value` tags; the part before it is the
+username that authenticates.
+
+```sh
+export UV_INDEX_CORP_USERNAME="ci+repo=acme/billing-api,delivery=stream"
+```
+
+`CORP` is the index's `name` in `pyproject.toml`, upper-cased. No password is
+needed on a server with open reads. The tags reach every request and never
+appear in `uv.lock`, so a shared lockfile keeps working with
+`uv sync --locked`.
+
+| Tag | Effect |
+|---|---|
+| `repo=acme/billing-api` | Attributes the traffic to a repo: in the access log and, with `--metrics-repo-labels`, in `/metrics`. |
+| `commit=eb35ed7` | Recorded in the access log. |
+| `delivery=stream` | Downloads come from pypiron instead of a redirect to object storage. |
+| `x-<name>=<value>` | Your own metadata, recorded in the access log. |
+
+Keys use letters, digits, `-` and `_`; values also allow `.` and `/`. A
+username cannot contain `:`, so write a repo URL without its scheme:
+`repo=github.com/acme/billing-api`. The whole list is limited to 256 bytes.
+
+A misspelt key, a key that is neither listed above nor starts with `x-`, or a
+bad value is refused with `400` and the reason in the status line, which uv
+prints:
+
+```text
+HTTP status client error (400 Bad index username: unknown key delivry (custom keys start with x-))
+```
+
+Behind a proxy that speaks HTTP/2 to clients the reason is not shown; it is
+always in the response body.
+
+In CI, fill the tags from the job's environment:
+
+```sh
+export UV_INDEX_CORP_USERNAME="ci+repo=github.com/$GITHUB_REPOSITORY,commit=$GITHUB_SHA"
+```
+
+When reads require a credential, `/metrics` counts a repo only on requests
+whose credential is accepted.
 
 ### Clients that cannot reach the bucket
 
 With `auto` or `redirect` delivery, uv downloads wheels straight from object
 storage. A machine that can reach pypiron but not the bucket resolves
-dependencies and then fails on the first download. Set the index username on
-that machine to ask pypiron for the bytes instead:
+dependencies and then fails on the first download. Add `delivery=stream` to
+the index username on that machine to get the bytes from pypiron instead:
 
 ```sh
 export UV_INDEX_CORP_USERNAME="ci+delivery=stream"
 ```
 
-`CORP` is the index's `name` in `pyproject.toml`, upper-cased. No password is
-needed on a server with open reads; on a gated one, add `+delivery=stream` to
-the username you already use. It combines with a project tag in either order:
-`ci+billing-api+delivery=stream`. Every other client keeps downloading from
-the bucket, and `uv.lock` is unchanged, so `uv sync --locked` works for
-everyone sharing it.
+Every other client keeps downloading from the bucket.
 
 Use the environment variable, not a username inside the index URL: uv does not
 send a URL's username on wheel downloads from a server with open reads.

@@ -21,6 +21,8 @@ clap = { version = "4", features = ["derive", "env"] }
 flate2 = { version = "1", default-features = false, features = ["zlib-rs"] }
 futures = "0.3"
 http = "1"
+# Already in the tree under axum; named for `ext::ReasonPhrase` alone.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 # Already in the tree via hyper-util; used directly for --proxy-allow-cidr.
 ipnet = "2"
 percent-encoding = "2"

@@ -265,11 +265,11 @@ def disk_server(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
 
 
 @pytest.fixture()
-def disk_server_project_labels(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
+def disk_server_repo_labels(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]:
     """Disk server that attributes /metrics to per-client projects. Opt-in:
     /metrics is unauthenticated, so the labels leak project names by default."""
     yield from _start_disk_server(
-        tmp_path_factory, pypiron_bin, extra_args=["--metrics-project-labels"]
+        tmp_path_factory, pypiron_bin, extra_args=["--metrics-repo-labels"]
     )
 
 
@@ -440,7 +440,7 @@ def disk_server_read_auth(tmp_path_factory, pypiron_bin: Path) -> Iterator[Dict]
             "--read-pass",
             "readersecret",
             # This fixture's tests assert on per-project /metrics attribution.
-            "--metrics-project-labels",
+            "--metrics-repo-labels",
         ],
     ):
         server["read_user"] = "reader"

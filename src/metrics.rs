@@ -165,7 +165,7 @@ pub struct Metrics {
     /// requests by project attribution tag and route group. A mutex, not
     /// atomics: only requests that carry credentials touch it, and the
     /// critical section is one map bump.
-    project_requests: Mutex<HashMap<String, [u64; ROUTES.len()]>>,
+    repo_requests: Mutex<HashMap<String, [u64; ROUTES.len()]>>,
 
     /// True once more than one bucket is configured. The replication metrics
     /// below are dormant machinery on a single-bucket node, so they are omitted
@@ -265,11 +265,8 @@ impl Metrics {
 
     /// Count a request against a project attribution tag. The tag must
     /// already be sanitized (label-safe charset) by the caller.
-    pub fn record_project(&self, tag: &str, route: usize) {
-        let mut map = self
-            .project_requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+    pub fn record_repo(&self, tag: &str, route: usize) {
+        let mut map = self.repo_requests.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(counts) = map.get_mut(tag) {
             counts[route] += 1;
             return;
@@ -715,13 +712,10 @@ impl Metrics {
             drop(by_source);
             self.render_bucket_health(&mut out);
         }
-        let map = self
-            .project_requests
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let map = self.repo_requests.lock().unwrap_or_else(|e| e.into_inner());
         if !map.is_empty() {
-            out.push_str("# HELP pypiron_project_requests_total Requests by client project tag (basic-auth username subaddress) and route group.\n");
-            out.push_str("# TYPE pypiron_project_requests_total counter\n");
+            out.push_str("# HELP pypiron_repo_requests_total Requests by the repo a client names in its basic-auth username (`user+repo=org/repo`) and route group.\n");
+            out.push_str("# TYPE pypiron_repo_requests_total counter\n");
             let mut tags: Vec<&String> = map.keys().collect();
             tags.sort();
             for tag in tags {
@@ -729,7 +723,7 @@ impl Metrics {
                     let v = map[tag][r];
                     if v > 0 {
                         out.push_str(&format!(
-                            "pypiron_project_requests_total{{project=\"{tag}\",route=\"{route}\"}} {v}\n"
+                            "pypiron_repo_requests_total{{repo=\"{tag}\",route=\"{route}\"}} {v}\n"
                         ));
                     }
                 }
@@ -996,7 +990,7 @@ mod tests {
         assert!(text.contains("# TYPE pypiron_audit_last_duration_seconds gauge"));
         assert!(text.contains("pypiron_audit_last_duration_seconds 0"));
         // No project traffic recorded: the family is omitted entirely.
-        assert!(!text.contains("pypiron_project_requests_total"));
+        assert!(!text.contains("pypiron_repo_requests_total"));
     }
 
     #[test]
@@ -1160,41 +1154,39 @@ mod tests {
     #[test]
     fn records_project_attribution() {
         let m = Metrics::new();
-        m.record_project("billing-api", route_group(&Method::GET, "/simple/"));
-        m.record_project("billing-api", route_group(&Method::GET, "/simple/"));
-        m.record_project(
+        m.record_repo("billing-api", route_group(&Method::GET, "/simple/"));
+        m.record_repo("billing-api", route_group(&Method::GET, "/simple/"));
+        m.record_repo(
             "billing-api",
             route_group(&Method::GET, "/files/six/six.whl"),
         );
-        m.record_project("etl", route_group(&Method::GET, "/simple/"));
+        m.record_repo("etl", route_group(&Method::GET, "/simple/"));
         let text = m.render();
-        assert!(text.contains(
-            "pypiron_project_requests_total{project=\"billing-api\",route=\"simple\"} 2"
-        ));
-        assert!(text
-            .contains("pypiron_project_requests_total{project=\"billing-api\",route=\"files\"} 1"));
-        assert!(text.contains("pypiron_project_requests_total{project=\"etl\",route=\"simple\"} 1"));
+        assert!(
+            text.contains("pypiron_repo_requests_total{repo=\"billing-api\",route=\"simple\"} 2")
+        );
+        assert!(
+            text.contains("pypiron_repo_requests_total{repo=\"billing-api\",route=\"files\"} 1")
+        );
+        assert!(text.contains("pypiron_repo_requests_total{repo=\"etl\",route=\"simple\"} 1"));
         // Zero cells are omitted.
-        assert!(!text.contains("project=\"etl\",route=\"files\""));
+        assert!(!text.contains("repo=\"etl\",route=\"files\""));
     }
 
     #[test]
     fn project_tags_cap_into_overflow() {
         let m = Metrics::new();
         for i in 0..MAX_PROJECT_TAGS {
-            m.record_project(&format!("tag{i}"), 0);
+            m.record_repo(&format!("tag{i}"), 0);
         }
-        m.record_project("one-too-many", 0);
-        m.record_project("and-another", 0);
+        m.record_repo("one-too-many", 0);
+        m.record_repo("and-another", 0);
         // Known tags still count past the cap.
-        m.record_project("tag0", 0);
+        m.record_repo("tag0", 0);
         let text = m.render();
         assert!(!text.contains("one-too-many"));
         assert!(!text.contains("and-another"));
-        assert!(text
-            .contains("pypiron_project_requests_total{project=\"_overflow\",route=\"simple\"} 2"));
-        assert!(
-            text.contains("pypiron_project_requests_total{project=\"tag0\",route=\"simple\"} 2")
-        );
+        assert!(text.contains("pypiron_repo_requests_total{repo=\"_overflow\",route=\"simple\"} 2"));
+        assert!(text.contains("pypiron_repo_requests_total{repo=\"tag0\",route=\"simple\"} 2"));
     }
 }

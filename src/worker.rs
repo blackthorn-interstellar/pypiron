@@ -4890,7 +4890,7 @@ mod tests {
             token_signing_key: None,
             private: PrivateNames::default(),
             artifact_delivery: ArtifactDelivery::Auto,
-            metrics_project_labels: false,
+            metrics_repo_labels: false,
             access_log: false,
             access_log_format: AccessLogFormat::Structured,
             trusted_proxy: false,

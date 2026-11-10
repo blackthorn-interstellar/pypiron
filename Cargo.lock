@@ -1841,6 +1841,7 @@ dependencies = [
  "futures",
  "html-escape",
  "http",
+ "hyper",
  "ipnet",
  "md-5",
  "mimalloc",

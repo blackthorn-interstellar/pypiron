@@ -63,25 +63,27 @@ def test_health_and_metrics_bypass_read_auth(disk_server_read_auth):
 
 
 def test_subaddressed_username_reads_and_attributes(disk_server_read_auth):
-    """Gmail-style subaddressing: `reader+proj` authenticates as `reader`
-    (password still validated) and `proj` shows up as a project tag in
-    /metrics. A wrong password is a 401 and is never attributed."""
+    """`reader+repo=org/repo` authenticates as `reader` (password still
+    validated) and the repo shows up as a label in /metrics. A wrong password is a 401 and is never attributed."""
     server = disk_server_read_auth
     url = f"{server['simple']}index.json"
 
     code, _, _ = http_get(
-        url, headers=_auth_header(f"{server['read_user']}+billing-api", server["read_password"])
+        url,
+        headers=_auth_header(
+            f"{server['read_user']}+repo=acme/billing-api", server["read_password"]
+        ),
     )
     assert code == 200
 
     code, _, _ = http_get(
-        url, headers=_auth_header(f"{server['read_user']}+stolen-tag", "wrongpassword")
+        url, headers=_auth_header(f"{server['read_user']}+repo=acme/stolen-tag", "wrongpassword")
     )
     assert code == 401
 
     _, body, _ = http_get(f"{server['base_url']}/metrics")
     text = body.decode()
-    assert 'pypiron_project_requests_total{project="billing-api",route="simple"} 1' in text
+    assert 'pypiron_repo_requests_total{repo="acme/billing-api",route="simple"} 1' in text
     assert "stolen-tag" not in text
 
 
@@ -117,11 +119,13 @@ def test_publish_then_install_flow_with_read_auth(disk_server_read_auth, tmp_pat
 def test_unvalidated_credentials_are_never_attributed(disk_server_read_auth):
     """Some routes answer without checking the credential (the favicon, an
     unknown path). A tag sent there with a wrong password never validated, so
-    it must not take one of the capped project-tag slots in /metrics."""
+    it must not take one of the capped repo slots in /metrics."""
     server = disk_server_read_auth
     base = server["base_url"]
     for i, path in enumerate(("/favicon.ico", "/no-such-route")):
-        code, _, _ = http_get(f"{base}{path}", headers=_auth_header(f"x+bogus-tag-{i}", "wrong"))
+        code, _, _ = http_get(
+            f"{base}{path}", headers=_auth_header(f"x+repo=bogus-tag-{i}", "wrong")
+        )
         assert code in (200, 404), path
 
     _, body, _ = http_get(f"{base}/metrics")

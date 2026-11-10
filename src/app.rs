@@ -46,7 +46,7 @@ use crate::admin::{
     sync_local_index,
 };
 use crate::auth::{
-    basic_credentials, check_basic_auth, cred_pair, credential_pair_error, nonempty, project_tag,
+    basic_credentials, check_basic_auth, cred_pair, credential_pair_error, nonempty,
     resolve_admin_user, signing_key_error, LoginThrottle,
 };
 use crate::pages::{downloads_page, project_page, project_version_page, projects_page, root};
@@ -319,7 +319,7 @@ pub struct AppState {
     pub artifact_delivery: ArtifactDelivery,
     /// Attach per-client `project` labels to `/metrics`. Off by default because
     /// `/metrics` carries no auth; see the flag of the same name.
-    pub metrics_project_labels: bool,
+    pub metrics_repo_labels: bool,
     /// Widen the access log from mutations-only (the default) to every request.
     /// See `log_requests`.
     pub access_log: bool,
@@ -649,7 +649,7 @@ impl AppState {
             token_signing_key: None,
             private: PrivateNames::default(),
             artifact_delivery: ArtifactDelivery::Auto,
-            metrics_project_labels: false,
+            metrics_repo_labels: false,
             access_log: false,
             access_log_format: AccessLogFormat::Structured,
             trusted_proxy: false,
@@ -734,7 +734,7 @@ impl AppState {
     /// The role granted by a valid `__token__` bearer token, if token auth is
     /// configured and the presented token verifies and is unexpired. Returns
     /// None otherwise (no key, not a token request, bad/expired token) — fail
-    /// closed. The `+tag` overlay is ignored here (`__token__+commit=…` still
+    /// closed. The `+tags` suffix is ignored here (`__token__+commit=…` still
     /// resolves to token mode); the token itself carries its attribution. A
     /// token minted with no credential grants nothing where reads need one:
     /// it proves only that some public-read peer sharing the key was asked.
@@ -1738,7 +1738,7 @@ async fn run_serve(
         token_signing_key: cli.token_signing_key,
         private,
         artifact_delivery: cli.artifact_delivery,
-        metrics_project_labels: cli.metrics_project_labels,
+        metrics_repo_labels: cli.metrics_repo_labels,
         access_log: cli.access_log,
         access_log_format: cli.access_log_format,
         trusted_proxy: cli.trusted_proxy,
@@ -1928,6 +1928,7 @@ async fn run_serve(
         // response. Both sit *after* `.merge(streaming)` so they wrap /legacy and
         // the /files DELETE too, and *inside* log_requests so a blocked cross-site
         // attempt still lands in the audit log.
+        .layer(middleware::from_fn(reject_bad_client_tags))
         .layer(middleware::from_fn(csrf_guard))
         .layer(middleware::from_fn(security_headers))
         .layer(middleware::from_fn_with_state(state.clone(), log_requests))
@@ -2190,7 +2191,7 @@ async fn log_requests(
 
     // Captured before `next.run` consumes the request.
     let target = req.uri().to_string();
-    let project = project_tag(req.headers());
+    let tags = crate::auth::client_tags(req.headers());
     let ua = header_str(req.headers(), header::USER_AGENT);
     let host = client_ip(req.headers(), peer, state.trusted_proxy);
     // CLF-only fields: skip the work for the structured path.
@@ -2249,7 +2250,7 @@ async fn log_requests(
                 status = status.as_u16(),
                 latency_ms,
                 bytes = %bytes,
-                project = project.as_deref(),
+                tags = tags.as_deref(),
                 client = %host,
                 ua = ua.as_deref(),
                 "request"
@@ -2528,6 +2529,35 @@ async fn add_www_authenticate(req: Request, next: Next) -> Response<Body> {
     resp
 }
 
+/// Refuse a request whose username carries malformed tags (see
+/// `auth::client_tags`), on every route. The reason rides in the HTTP/1.1
+/// status line because that is the one part of a refusal uv and pip print; the
+/// body repeats it for anything that reads bodies, and for HTTP/2, which has no
+/// reason phrase.
+async fn reject_bad_client_tags(req: Request, next: Next) -> Response<Body> {
+    match crate::auth::check_client_tags(req.headers()) {
+        Ok(()) => next.run(req).await,
+        Err(why) => refuse_with_reason(
+            StatusCode::BAD_REQUEST,
+            &format!("Bad index username: {why}"),
+            "The part of the index username after `+` must be a comma-separated list of \
+             key=value tags, such as ci+repo=org/repo,delivery=stream. Keys: repo, \
+             commit, delivery=stream, and x-<name> for your own.",
+        ),
+    }
+}
+
+/// A refusal whose one-line `reason` replaces the standard status text.
+/// `reason` must be printable ASCII; one that is not falls back to the
+/// standard text rather than failing the response.
+pub(crate) fn refuse_with_reason(status: StatusCode, reason: &str, help: &str) -> Response<Body> {
+    let mut resp = (status, format!("{reason}\n{help}\n")).into_response();
+    if let Ok(phrase) = hyper::ext::ReasonPhrase::try_from(reason.as_bytes().to_vec()) {
+        resp.extensions_mut().insert(phrase);
+    }
+    resp
+}
+
 /// Count every request by route group and status class (see metrics.rs).
 async fn track_metrics(
     State(state): State<Arc<AppState>>,
@@ -2542,27 +2572,27 @@ async fn track_metrics(
     if group != 3 && group != 4 {
         state.note_request();
     }
-    // Only read the project tag when labels are enabled; otherwise the
-    // unauthenticated /metrics endpoint would expose internal project names.
+    // Only read the client's repo when labels are enabled; otherwise the
+    // unauthenticated /metrics endpoint would expose internal repo names.
     // Where reads need a credential, only one that validates is attributed:
     // routes that never check it (the favicon, an unknown path) would let any
     // made-up tag fill the capped tag set. Public reads attribute any tag.
-    let project = state
-        .metrics_project_labels
-        .then(|| project_tag(req.headers()))
+    let repo = state
+        .metrics_repo_labels
+        .then(|| crate::auth::client_repo(req.headers()))
         .flatten()
         .filter(|_| state.is_reader(req.headers()));
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_request(group, status);
-    // Attribute traffic to the client's project tag — except on auth failures
+    // Attribute traffic to the client's repo — except on auth failures
     // and login-throttled refusals, where the tag never validated against
     // anything, and except on /health and /metrics (groups 3 and 4), which
-    // bypass read-auth and return 200: a spoofed project header there would
+    // bypass read-auth and return 200: a spoofed repo there would
     // otherwise poison the tag set. Mirrors the note_request guard above.
-    if let Some(tag) = project {
+    if let Some(tag) = repo {
         if group != 3 && group != 4 && !matches!(status, 401 | 403 | 429) {
-            state.metrics.record_project(&tag, group);
+            state.metrics.record_repo(&tag, group);
         }
     }
     resp

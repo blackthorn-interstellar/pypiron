@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import http.client
 import json
 import re
 
@@ -99,27 +100,27 @@ def test_audit_counters_populate_across_passes(disk_server_fast_reconcile):
 
 def test_metrics_omit_project_labels_by_default(disk_server):
     """/metrics is unauthenticated, so project attribution stays off until it is
-    asked for: the label carries the client's basic-auth username subaddress,
-    and any scraper could otherwise enumerate internal project names."""
-    headers = {"Authorization": _encode_basic_auth("ci+secret-project", "ignored")}
+    asked for: the label carries the repo the client names in its username, and
+    any scraper could otherwise enumerate internal repo names."""
+    headers = {"Authorization": _encode_basic_auth("ci+repo=acme/secret-project", "ignored")}
     code, _, _ = http_get(f"{disk_server['simple']}index.json", headers=headers)
     assert code == 200
 
     _, body, _ = http_get(f"{disk_server['base_url']}/metrics")
     text = body.decode()
-    assert "pypiron_project_requests_total" not in text, text
+    assert "pypiron_repo_requests_total" not in text, text
     assert "secret-project" not in text, text
 
 
-def test_metrics_attribute_project_without_read_auth(disk_server_project_labels):
-    """Open server: any volunteered basic-auth username is parsed for
-    attribution — the password is never validated in this mode."""
-    disk_server = disk_server_project_labels
-    headers = {"Authorization": _encode_basic_auth("ci+attrib-open", "ignored")}
+def test_metrics_attribute_project_without_read_auth(disk_server_repo_labels):
+    """Open server: the repo a client volunteers in its username is counted —
+    the password is never validated in this mode."""
+    disk_server = disk_server_repo_labels
+    headers = {"Authorization": _encode_basic_auth("ci+repo=acme/attrib-open", "ignored")}
     code, _, _ = http_get(f"{disk_server['simple']}index.json", headers=headers)
     assert code == 200
 
-    # An untagged username attributes as itself.
+    # A username that names no repo is not attributed.
     headers = {"Authorization": _encode_basic_auth("plain-attrib", "ignored")}
     code, _, _ = http_get(f"{disk_server['simple']}index.json", headers=headers)
     assert code == 200
@@ -127,10 +128,10 @@ def test_metrics_attribute_project_without_read_auth(disk_server_project_labels)
     _, body, _ = http_get(f"{disk_server['base_url']}/metrics")
     text = body.decode()
     assert re.search(
-        r'pypiron_project_requests_total\{project="attrib-open",route="simple"\} \d+',
+        r'pypiron_repo_requests_total\{repo="acme/attrib-open",route="simple"\} \d+',
         text,
     ), text
-    assert 'project="plain-attrib"' in text
+    assert "plain-attrib" not in text
 
 
 def test_json_log_format_emits_json_lines(disk_server_json_logs):
@@ -210,7 +211,9 @@ def test_health_and_metrics_excluded_from_access_log(disk_server_access_log_info
 def test_access_log_structured_json_fields(disk_server_access_log_json):
     server = disk_server_access_log_json
     headers = {
-        "Authorization": _encode_basic_auth("ci+obs-access", "ignored"),
+        "Authorization": _encode_basic_auth(
+            "ci+repo=acme/obs,commit=eb35ed7,x-team=data", "ignored"
+        ),
         "User-Agent": "pytest-acceslog/1.0",
     }
     code, _, _ = http_get(f"{server['simple']}index.json", headers=headers)
@@ -230,7 +233,7 @@ def test_access_log_structured_json_fields(disk_server_access_log_json):
     assert fields["method"] == "GET"
     assert fields["path"] == "/simple/index.json"
     assert fields["status"] == 200
-    assert fields["project"] == "obs-access"
+    assert fields["tags"] == "repo=acme/obs,commit=eb35ed7,x-team=data"
     assert fields["ua"] == "pytest-acceslog/1.0"
     assert fields["client"].startswith("127.0.0.1")  # ConnectInfo peer
     assert isinstance(fields["latency_ms"], (int, float))
@@ -346,3 +349,28 @@ def test_responses_carry_nosniff(disk_server):
     for path in ("/health", "/simple/index.json"):
         _, _, headers = http_get(f"{disk_server['base_url']}{path}")
         assert headers.get("x-content-type-options") == "nosniff", path
+
+
+@pytest.mark.parametrize(
+    ("username", "reason"),
+    [
+        ("ci+delivry=stream", "unknown key delivry (custom keys start with x-)"),
+        ("ci+team=data", "unknown key team (custom keys start with x-)"),
+        ("ci+billing-api", "tags must be key=value, separated by commas"),
+        ("ci+delivery=redirect", "delivery must be stream"),
+    ],
+)
+def test_malformed_username_tags_are_refused_in_the_status_line(disk_server, username, reason):
+    """A mistyped setting must not fail the way an unset one does. The reason is
+    in the HTTP status line — the only part of a refusal uv and pip print."""
+    host, port = disk_server["base_url"].removeprefix("http://").split(":")
+    conn = http.client.HTTPConnection(host, int(port), timeout=10)
+    try:
+        conn.request("GET", "/simple/", headers={"Authorization": _encode_basic_auth(username, "")})
+        resp = conn.getresponse()
+        body = resp.read().decode()
+    finally:
+        conn.close()
+    assert resp.status == 400
+    assert resp.reason == f"Bad index username: {reason}"
+    assert reason in body and "ci+repo=org/repo,delivery=stream" in body

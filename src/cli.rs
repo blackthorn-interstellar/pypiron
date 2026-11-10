@@ -1273,9 +1273,9 @@ pub struct ServeArgs {
 
     /// Read credential username — when set, the simple indexes and artifact
     /// downloads require basic auth (this credential, the uploader, or the
-    /// admin all work). When unset, reads are public. Usernames support
-    /// `+tag` subaddressing (e.g. `reader+billing-api`) for per-project
-    /// traffic attribution in /metrics and the request logs.
+    /// admin all work). When unset, reads are public. A username may carry
+    /// tags after a `+` (e.g. `reader+repo=org/repo`) that attribute traffic
+    /// in /metrics and the request logs.
     #[arg(long, env = "PYPIRON_READ_USER")]
     pub(crate) read_user: Option<String>,
 
@@ -1330,13 +1330,13 @@ pub struct ServeArgs {
     )]
     pub(crate) upstream_ca_cert: Option<std::path::PathBuf>,
 
-    /// Emit per-client `project` attribution labels on `/metrics`
-    /// (`pypiron_project_requests_total`). Off by default: `/metrics` is
-    /// unauthenticated, and the label is derived from the basic-auth username
-    /// subaddress, so exposing it lets any scraper enumerate internal project
+    /// Emit per-client `repo` attribution labels on `/metrics`
+    /// (`pypiron_repo_requests_total`). Off by default: `/metrics` is
+    /// unauthenticated, and the label is the repo a client names in its basic-auth
+    /// username, so exposing it lets any scraper enumerate internal repo
     /// names.
-    #[arg(long, env = "PYPIRON_METRICS_PROJECT_LABELS")]
-    pub(crate) metrics_project_labels: bool,
+    #[arg(long, env = "PYPIRON_METRICS_REPO_LABELS")]
+    pub(crate) metrics_repo_labels: bool,
 
     /// Permit the proxy to fetch listing-derived URLs (artifact, `.metadata`,
     /// `.provenance`, redirect targets) whose host matches this exact value, even
@@ -1509,9 +1509,9 @@ pub fn merge_serve_file(
         f.proxy_stream_threshold.clone()
     );
     fill!(
-        cli.metrics_project_labels,
-        "metrics_project_labels",
-        f.metrics_project_labels
+        cli.metrics_repo_labels,
+        "metrics_repo_labels",
+        f.metrics_repo_labels
     );
     fill!(
         cli.reconcile_interval_secs,

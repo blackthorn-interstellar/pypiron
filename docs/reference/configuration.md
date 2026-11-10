@@ -570,7 +570,7 @@ pending repairs, not bytes.
 | `/stats/downloads/<pkg>` | read | Per-package download stats. |
 | `/audit` | admin | Org audit: hosted packages a known advisory affects, ranked by downloads over the last 30 days (HTML). |
 | `/audit.json` | admin | The same audit report as JSON. |
-| `/advisories/feed` | read (GET), admin (PUT) | Advisory snapshot: readers pull it (etag-conditioned); an admin pushes a delivered one. |
+| `/advisories/feed` | read (GET), admin (PUT) | Advisory snapshot: readers pull it (etag-conditioned); an admin pushes a delivered one. A zip that names no PyPI advisory (empty, or another ecosystem's export) is refused with 400 and the current snapshot stays. |
 | `/tokens` | read/uploader/admin, or open reader token | Mint install tokens. |
 | `/files/.../yank` | admin | Yank a file. `404` if there is no such file. `409` if the file exists but no index lists it: deleted, frozen, quarantined, or a cached upstream copy under a name that is now private. `409` also while a replication repair is rewriting the file's details, and `503` if storage could not be read; retry both. |
 | `DELETE /files/<pkg>/<file>` | admin | Delete a file. Refused for mirrored files — anything that came from an upstream, cached on demand or pulled by `sync` — when you run more than one bucket. |

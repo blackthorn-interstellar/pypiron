@@ -478,7 +478,7 @@ pub(crate) async fn advisories_feed_put(
     // a garbage PUT must never overwrite a good snapshot. Parse off the runtime.
     let bytes = body.to_vec();
     let for_parse = bytes.clone();
-    match tokio::task::spawn_blocking(move || advisories::parse_feed(&for_parse)).await {
+    match tokio::task::spawn_blocking(move || advisories::parse_snapshot(&for_parse)).await {
         Ok(Ok(_)) => {}
         Ok(Err(e)) => {
             return Err((

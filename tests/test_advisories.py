@@ -275,6 +275,50 @@ def test_feed_put_persists_and_reloads_without_restart(tmp_path_factory, pypiron
         _wait_log_contains(Path(server["log_path"]), "advisory snapshot loaded")
 
 
+def test_empty_or_wrong_ecosystem_feed_never_replaces_the_snapshot(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """A zip that names no PyPI advisory (empty, or an npm export) parses cleanly
+    but would switch malware blocking off fleet-wide. Neither an admin PUT nor the
+    leader's own source poll may adopt one: the previous snapshot keeps blocking."""
+    feed = make_osv_zip(tmp_path / "osv.zip", canonical_records())
+    with advisory_server(
+        tmp_path_factory, pypiron_bin, feed, extra_args=["--reconcile-interval-secs", "1"]
+    ) as server:
+        base = server["base_url"]
+        stored = _stored_feed_path(server)
+        good = stored.read_bytes()
+        bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+        _mirror_upload(server, bad)
+        file_url = f"{base}/files/{MAL_EXACT_PKG}/{bad.name}"
+        assert http_get(file_url)[0] == 403
+
+        empty = make_osv_zip(tmp_path / "empty.zip", {}).read_bytes()
+        npm = make_osv_zip(
+            tmp_path / "npm.zip",
+            {
+                "MAL-2024-99999": {
+                    "id": "MAL-2024-99999",
+                    "affected": [{"package": {"ecosystem": "npm", "name": "left-pad"}}],
+                }
+            },
+        ).read_bytes()
+        for body in (empty, npm):
+            code, resp, _ = http_request_auth(
+                "PUT", f"{base}/advisories/feed", username="admin", password="secret", data=body
+            )
+            assert code == 400, (code, resp)
+            assert b"no PyPI advisory" in resp, resp
+            assert stored.read_bytes() == good
+
+        # The leader's source turning into an empty export is refused the same way.
+        feed.write_bytes(empty)
+        _wait_log_contains(Path(server["log_path"]), "no PyPI advisory")
+        time.sleep(2)
+        assert stored.read_bytes() == good, "the empty source feed replaced the snapshot"
+        assert http_get(file_url)[0] == 403, "blocking switched off"
+
+
 def test_ac7_explicit_unreachable_source_refuses_start(pypiron_bin, tmp_path):
     """An explicit advisory setting that cannot produce a snapshot fails closed at
     startup — the credential-refusal rule, applied to the feed."""

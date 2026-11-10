@@ -1848,7 +1848,7 @@ async fn push_advisory_feed(
     // Validate before pushing garbage — the stored copy is what every destination
     // node loads. Parse off the runtime (a real export is ~32 MB).
     let to_parse = bytes.clone();
-    let db = match tokio::task::spawn_blocking(move || crate::advisories::parse_feed(&to_parse))
+    let db = match tokio::task::spawn_blocking(move || crate::advisories::parse_snapshot(&to_parse))
         .await
     {
         Ok(Ok(db)) => db,

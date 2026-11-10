@@ -31,6 +31,24 @@ use crate::storage::{self, Storage};
 
 pub use crate::osv::{advisories_for, blocking_advisories, parse_feed, AdvisoryDb};
 
+/// Parse feed bytes for adoption as the fleet's snapshot: [`parse_feed`], then
+/// refuse a zip that names no PyPI advisory. Such a zip (empty, or another
+/// ecosystem's OSV export) parses cleanly but would replace a working snapshot
+/// with an empty block set and switch malware blocking off fleet-wide. Every
+/// path that stores or loads a snapshot goes through here, so the previous
+/// snapshot stays in force.
+pub fn parse_snapshot(zip_bytes: &[u8]) -> Result<AdvisoryDb> {
+    let db = parse_feed(zip_bytes)?;
+    if db.audit_records() == 0 {
+        bail!(
+            "advisory feed names no PyPI advisory (an empty zip, or another ecosystem's OSV \
+             export); refusing it so it cannot replace the current snapshot and switch malware \
+             blocking off. Use the OSV PyPI export (PyPI/all.zip)"
+        );
+    }
+    Ok(db)
+}
+
 /// The verbatim snapshot, written by whichever source delivered it (leader OSV
 /// pull, local-path ferry, or an admin `PUT`). A derived/carried view under the
 /// reserved `_advisories/` prefix — deletable and regenerable, never truth.
@@ -536,7 +554,7 @@ async fn read_path_capped(path: &str) -> Result<Vec<u8>> {
 async fn parse_off_thread(bytes: Arc<Vec<u8>>) -> Result<(AdvisoryDb, String)> {
     tokio::task::spawn_blocking(move || {
         let slice: &[u8] = &bytes;
-        let db = parse_feed(slice)?;
+        let db = parse_snapshot(slice)?;
         Ok((db, sha256_hex(slice)))
     })
     .await
@@ -799,7 +817,7 @@ pub async fn refresh(
                 &mut memo.source_failing,
                 result,
                 "advisory feed: source reachable again",
-                "advisory feed: source unreachable; serving last snapshot",
+                "advisory feed: source poll failed or was refused; serving last snapshot",
             )
             .is_some()
             {

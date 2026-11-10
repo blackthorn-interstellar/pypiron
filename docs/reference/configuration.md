@@ -478,7 +478,9 @@ Tokens live for 5 minutes and cannot outrank the credential that minted them.
 When reads are public, a reader token needs no credential, but a wrong
 credential gets `401` and counts as a failed login.
 A server with no write credential stays read-only for every token, including
-ones minted by another server that shares its signing key.
+ones minted by another server that shares its signing key. Likewise, a server
+that requires a read credential refuses a token minted without one on a
+public-read server that shares its key.
 Keep server clocks in sync (NTP): a server refuses a token issued more than a
 minute in its future, so tokens minted on a server whose clock runs fast fail
 with 401 on the others.

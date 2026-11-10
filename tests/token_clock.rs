@@ -28,6 +28,7 @@ fn token_expiry_follows_the_sim_clock() {
         user: None,
         iat: now,
         exp: now + 60,
+        anon: false,
     };
     let minted = token::mint("sim-signing-key", &claims).unwrap();
     let mut headers = HeaderMap::new();

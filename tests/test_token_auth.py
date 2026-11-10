@@ -310,3 +310,25 @@ def test_a_wrong_password_never_mints_on_a_public_read_server(public_read_token_
     assert _mint(server, auth=(server["uploader_user"], server["uploader_password"]))[0] == 200
     code, body, _ = _mint(server, auth=(server["uploader_user"], "wrong"))
     assert code == 401, body
+
+
+def test_an_anonymous_token_does_not_pass_a_read_gated_peer(
+    public_read_token_server, disk_server_token_auth
+):
+    """Two servers share a signing key; one serves reads publicly, the other
+    requires a read credential. A token anyone could mint on the public one
+    must not get past the other's credential. One minted with a real credential
+    still works on both."""
+    public, gated = public_read_token_server, disk_server_token_auth
+    index = f"{gated['simple']}index.json"
+
+    code, body, _ = _mint(public)
+    assert code == 200, body
+    anonymous = json.loads(body)["token"]
+    assert http_get(f"{public['simple']}index.json", headers=_token_header(anonymous))[0] == 200
+    assert http_get(index, headers=_token_header(anonymous))[0] == 401
+
+    code, body, _ = _mint(public, auth=(public["uploader_user"], public["uploader_password"]))
+    assert code == 200, body
+    credentialed = json.loads(body)["token"]
+    assert http_get(index, headers=_token_header(credentialed))[0] == 200

@@ -92,6 +92,12 @@ pub struct Claims {
     pub iat: i64,
     /// Expiry, unix seconds. Verification rejects `now >= exp`.
     pub exp: i64,
+    /// Minted with no credential, which only a public-read server allows. A
+    /// server that requires a read credential refuses such a token, even one a
+    /// public-read peer sharing its signing key minted. Absent (false) in
+    /// tokens minted with a credential and in those minted before it existed.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub anon: bool,
 }
 
 /// Encode + sign a token. Fails only if the claims can't be serialized (they
@@ -157,6 +163,7 @@ mod tests {
             user: Some("bryce".into()),
             iat: 1000,
             exp,
+            anon: false,
         }
     }
 

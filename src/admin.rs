@@ -772,6 +772,9 @@ pub(crate) async fn mint_token(
         user: clip_meta(req.user),
         iat: now,
         exp: now + TOKEN_TTL_SECS,
+        // Reached with no credential only when reads are public (a wrong one
+        // got 401 above), so mark it: a read-gated peer must not honor it.
+        anon: !state.authenticates(&headers),
     };
     let token = token::mint(key, &claims).map_err(|e| {
         (

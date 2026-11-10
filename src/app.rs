@@ -692,7 +692,9 @@ impl AppState {
     /// configured and the presented token verifies and is unexpired. Returns
     /// None otherwise (no key, not a token request, bad/expired token) — fail
     /// closed. The `+tag` overlay is ignored here (`__token__+commit=…` still
-    /// resolves to token mode); the token itself carries its attribution.
+    /// resolves to token mode); the token itself carries its attribution. A
+    /// token minted with no credential grants nothing where reads need one:
+    /// it proves only that some public-read peer sharing the key was asked.
     pub fn token_role(&self, headers: &HeaderMap) -> Option<token::Role> {
         let key = nonempty(self.token_signing_key.as_deref())?;
         let (user, pass) = basic_credentials(headers)?;
@@ -701,7 +703,9 @@ impl AppState {
         }
         // The protocol clock, so the simulator can drive a token past its expiry.
         let now = crate::clock::now_utc().unix_timestamp();
-        token::verify(key, &pass, now).map(|c| c.role)
+        token::verify(key, &pass, now)
+            .filter(|c| !c.anon || self.read_credential().is_none())
+            .map(|c| c.role)
     }
 
     /// Does the request carry a `__token__` this server's key signed, expired

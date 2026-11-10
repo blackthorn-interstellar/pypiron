@@ -90,8 +90,8 @@ pub enum VersionScope {
     /// An explicit affected-version list. Compared as parsed PEP 440 versions,
     /// falling back to raw string equality when the feed's side won't parse.
     Exact(Vec<String>),
-    /// Half-open `[introduced, fixed)` ranges; `fixed = None` is open-ended.
-    Ranges(Vec<(Version, Option<Version>)>),
+    /// Ranges from `introduced` to an end; `None` is open-ended.
+    Ranges(Vec<(Version, Option<RangeEnd>)>),
 }
 
 impl VersionScope {
@@ -112,9 +112,27 @@ impl VersionScope {
             VersionScope::Ranges(ranges) => match version.parse::<Version>() {
                 Ok(v) => ranges
                     .iter()
-                    .any(|(intro, fixed)| v >= *intro && fixed.as_ref().is_none_or(|f| v < *f)),
+                    .any(|(intro, end)| v >= *intro && end.as_ref().is_none_or(|e| e.admits(&v))),
                 Err(_) => true, // fail closed
             },
+        }
+    }
+}
+
+/// Where an affected range stops.
+#[derive(Debug, Clone)]
+pub enum RangeEnd {
+    /// `fixed` / `limit`: this version and later are unaffected.
+    Before(Version),
+    /// `last_affected`: this version is the last one affected.
+    Through(Version),
+}
+
+impl RangeEnd {
+    fn admits(&self, v: &Version) -> bool {
+        match self {
+            RangeEnd::Before(end) => v < end,
+            RangeEnd::Through(end) => v <= end,
         }
     }
 }
@@ -373,6 +391,12 @@ struct OsvEvent {
     introduced: Option<String>,
     #[serde(default)]
     fixed: Option<String>,
+    /// Inclusive upper bound: this version is still affected, the next is not.
+    #[serde(default)]
+    last_affected: Option<String>,
+    /// Exclusive upper bound that is not a fix (rare outside `GIT` ranges).
+    #[serde(default)]
+    limit: Option<String>,
 }
 
 #[derive(Deserialize, Default)]
@@ -546,25 +570,54 @@ fn scope_for(affected: &OsvAffected) -> VersionScope {
 }
 
 /// True when the clause condemns every version: a lone `introduced: "0"` range
-/// with no fix, or a bare package clause with neither ranges nor versions.
+/// with no end, or a bare package clause with neither ranges nor versions.
 fn is_all_versions(affected: &OsvAffected) -> bool {
     if affected.ranges.is_empty() && affected.versions.is_empty() {
         return true;
     }
-    affected.ranges.iter().any(|range| {
-        range.events.len() == 1
-            && range.events[0].introduced.as_deref() == Some("0")
-            && range.events[0].fixed.is_none()
-    })
+    affected
+        .ranges
+        .iter()
+        .filter(|r| r.is_versioned())
+        .any(|range| {
+            range.events.len() == 1
+                && range.events[0].introduced.as_deref() == Some("0")
+                && range.events[0].end().is_none()
+        })
 }
 
-/// Fold OSV range events into half-open `[introduced, fixed)` pairs. Events are
-/// a flat sequence: each `introduced` opens a range that the next `fixed`
-/// closes. Unparseable `introduced` events drop that range; an unparseable
-/// `fixed` leaves the range open-ended rather than dropping it.
-fn parse_ranges(ranges: &[OsvRange]) -> Vec<(Version, Option<Version>)> {
+impl OsvRange {
+    /// `ECOSYSTEM` and `SEMVER` ranges speak in package versions; `GIT` ranges
+    /// speak in commit hashes, which say nothing about a PEP 440 version (its
+    /// `introduced: "0"` would read as version 0 and its unparseable fix hash
+    /// as "no fix": every release flagged).
+    fn is_versioned(&self) -> bool {
+        !self.kind.eq_ignore_ascii_case("GIT")
+    }
+}
+
+impl OsvEvent {
+    /// The range end this event carries, raw, with whether it is inclusive:
+    /// `fixed` and `limit` exclude it, `last_affected` includes it.
+    fn end(&self) -> Option<(&str, bool)> {
+        if let Some(v) = &self.fixed {
+            return Some((v, false));
+        }
+        if let Some(v) = &self.last_affected {
+            return Some((v, true));
+        }
+        self.limit.as_deref().map(|v| (v, false))
+    }
+}
+
+/// Fold OSV range events into `(introduced, end)` pairs. Events are a flat
+/// sequence: each `introduced` opens a range that the next end event closes.
+/// `GIT` ranges are skipped (see [`OsvRange::is_versioned`]). Unparseable
+/// `introduced` events drop that range; an unparseable end leaves the range
+/// open-ended rather than dropping it (fail-closed).
+fn parse_ranges(ranges: &[OsvRange]) -> Vec<(Version, Option<RangeEnd>)> {
     let mut pairs = Vec::new();
-    for range in ranges {
+    for range in ranges.iter().filter(|r| r.is_versioned()) {
         let mut open: Option<Version> = None;
         for event in &range.events {
             if let Some(intro) = &event.introduced {
@@ -572,9 +625,16 @@ fn parse_ranges(ranges: &[OsvRange]) -> Vec<(Version, Option<Version>)> {
                     pairs.push((prev, None));
                 }
                 open = intro.parse::<Version>().ok();
-            } else if let Some(fixed) = &event.fixed {
+            } else if let Some((end, inclusive)) = event.end() {
                 if let Some(intro) = open.take() {
-                    pairs.push((intro, fixed.parse::<Version>().ok()));
+                    let end = end.parse::<Version>().ok().map(|v| {
+                        if inclusive {
+                            RangeEnd::Through(v)
+                        } else {
+                            RangeEnd::Before(v)
+                        }
+                    });
+                    pairs.push((intro, end));
                 }
             }
         }
@@ -627,11 +687,13 @@ pub(crate) fn fix_rules(adv: &OsvAdvisory) -> Vec<(String, FixRule)> {
         .collect()
 }
 
-/// The fixed-in versions named across a clause's ranges (raw, for display).
+/// The fixed-in versions named across a clause's version ranges (raw, for
+/// display; a `GIT` fix is a commit hash, not a version).
 fn fixed_versions(affected: &OsvAffected) -> Vec<String> {
     affected
         .ranges
         .iter()
+        .filter(|range| range.is_versioned())
         .flat_map(|range| range.events.iter().filter_map(|e| e.fixed.clone()))
         .collect()
 }
@@ -852,6 +914,78 @@ mod tests {
         assert!(advisories_for(&db, "widget", "2.21.0").is_empty());
         // A PYSEC advisory never blocks — it is audit-only.
         assert!(blocking_advisories(&db, "widget", Some("2.19.0")).is_empty());
+    }
+
+    #[test]
+    fn git_ranges_do_not_flag_fixed_versions() {
+        // The shape real GHSA/PYSEC records carry: a GIT range keyed by commit
+        // hashes beside the ECOSYSTEM range. Read as versions, the GIT range's
+        // `introduced: "0"` plus an unparseable fix hash is "every version".
+        let zip = osv_zip(&[(
+            "G.json",
+            serde_json::json!({
+                "id": "GHSA-aaaa-bbbb-cccc",
+                "affected": [{
+                    "package": {"ecosystem": "PyPI", "name": "widget"},
+                    "ranges": [
+                        {"type": "GIT", "repo": "https://example.invalid/w",
+                         "events": [{"introduced": "0"}, {"fixed": "abc123def"}]},
+                        {"type": "ECOSYSTEM",
+                         "events": [{"introduced": "0"}, {"fixed": "2.0"}]},
+                    ],
+                }],
+            }),
+        )]);
+        let db = parse_feed(&zip).unwrap();
+        assert_eq!(advisories_for(&db, "widget", "1.9").len(), 1);
+        assert!(advisories_for(&db, "widget", "2.0").is_empty());
+        assert!(advisories_for(&db, "widget", "3.1").is_empty());
+        // The commit hash is not a fixed-in version.
+        assert_eq!(advisories_for(&db, "widget", "1.9")[0].fixed_in, ["2.0"]);
+
+        // A lone GIT `introduced: "0"` is not an all-versions clause when a
+        // version list says which releases are affected.
+        let zip = osv_zip(&[(
+            "G2.json",
+            serde_json::json!({
+                "id": "GHSA-dddd-eeee-ffff",
+                "affected": [{
+                    "package": {"ecosystem": "PyPI", "name": "gadget"},
+                    "ranges": [{"type": "GIT", "events": [{"introduced": "0"}]}],
+                    "versions": ["1.0"],
+                }],
+            }),
+        )]);
+        let db = parse_feed(&zip).unwrap();
+        assert_eq!(advisories_for(&db, "gadget", "1.0").len(), 1);
+        assert!(advisories_for(&db, "gadget", "1.1").is_empty());
+    }
+
+    #[test]
+    fn last_affected_is_an_inclusive_end_and_limit_an_exclusive_one() {
+        let zip = osv_zip(&[(
+            "L.json",
+            serde_json::json!({
+                "id": "PYSEC-2024-7",
+                "affected": [{
+                    "package": {"ecosystem": "PyPI", "name": "widget"},
+                    "ranges": [
+                        {"type": "ECOSYSTEM",
+                         "events": [{"introduced": "1.0"}, {"last_affected": "1.4"}]},
+                        {"type": "ECOSYSTEM",
+                         "events": [{"introduced": "3.0"}, {"limit": "3.2"}]},
+                    ],
+                }],
+            }),
+        )]);
+        let db = parse_feed(&zip).unwrap();
+        assert!(advisories_for(&db, "widget", "0.9").is_empty());
+        assert_eq!(advisories_for(&db, "widget", "1.0").len(), 1);
+        assert_eq!(advisories_for(&db, "widget", "1.4").len(), 1);
+        assert!(advisories_for(&db, "widget", "1.4.1").is_empty());
+        assert!(advisories_for(&db, "widget", "2.0").is_empty());
+        assert_eq!(advisories_for(&db, "widget", "3.1").len(), 1);
+        assert!(advisories_for(&db, "widget", "3.2").is_empty());
     }
 
     #[test]

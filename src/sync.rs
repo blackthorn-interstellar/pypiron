@@ -2984,7 +2984,10 @@ async fn apply_yank_http(
     filename: &str,
     yanked: &Yanked,
 ) -> Result<()> {
-    let url = format!("{base}/files/{pkg}/{filename}/yank");
+    let url = format!(
+        "{base}/files/{pkg}/{}/yank",
+        crate::render::file_url_segment(filename)
+    );
     let req = with_admin_auth(
         match yanked {
             Yanked::Flag(false) => client.delete(&url),

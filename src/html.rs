@@ -900,7 +900,7 @@ fn files_panel(pkg: &str, files: &[&FileMetadata]) -> String {
         rows.push_str(&format!(
             "<tr><td><a href=\"/files/{pkg_attr}/{href}\">{name}</a>{yank}</td>\
 <td>{size}</td><td>{when}</td></tr>",
-            href = encode_double_quoted_attribute(&f.filename),
+            href = encode_double_quoted_attribute(&crate::render::file_url_segment(&f.filename)),
             name = encode_text(&f.filename),
             size = human_size(f.size),
             when = encode_text(f.upload_time.as_deref().map(date_only).unwrap_or("")),

@@ -140,6 +140,58 @@ def test_filename_past_the_write_cap_is_rejected_and_the_package_still_indexes(
     wait_for_file_in_index(disk_server["simple"], pkg, wheel.name)
 
 
+def test_a_filename_with_url_special_characters_is_reachable_by_its_listed_url(
+    disk_server, tmp_path
+):
+    """`#`, `?`, `%` and a space are legal in an uploaded filename, but raw in a
+    URL they start a fragment, a query or an escape. Every listed URL — PEP 691
+    `url`, PEP 503 `href`, the project page — must percent-encode them so the
+    file (and its `.metadata`) downloads; a plain name stays byte-identical."""
+    import html as htmllib
+    import re
+    from urllib.parse import urljoin
+
+    from .helpers import ACCEPT_PEP691, http_get_json
+
+    pkg = "oddname"
+    wheel = make_wheel(pkg, "1.0", tmp_path)
+    names = [f"{pkg}-1.0-py3-none-any{suffix}.whl" for suffix in ("#1", "?q", "%41", " x")]
+    for name in names:
+        upload_legacy(
+            disk_server["legacy"],
+            wheel,
+            username=disk_server["user"],
+            password=disk_server["password"],
+            filename=name,
+        )
+    plain = make_wheel(pkg, "2.0", tmp_path)
+    upload_legacy(
+        disk_server["legacy"], plain, username=disk_server["user"], password=disk_server["password"]
+    )
+    wait_for_file_in_index(disk_server["simple"], pkg, plain.name)
+
+    index = http_get_json(f"{disk_server['simple']}{pkg}/", headers={"Accept": ACCEPT_PEP691})
+    urls = {f["filename"]: f["url"] for f in index["files"]}
+    assert urls[plain.name] == f"/files/{pkg}/{plain.name}", "a plain name must not change"
+    _, page, _ = http_get(f"{disk_server['simple']}{pkg}/", headers={"Accept": "text/html"})
+    hrefs = [htmllib.unescape(h) for h in re.findall(r'href="([^"]+)"', page.decode())]
+    _, project, _ = http_get(f"{disk_server['base_url']}/project/{pkg}/1.0/")
+    project_hrefs = {
+        htmllib.unescape(h) for h in re.findall(r'href="(/files/[^"]+)"', project.decode())
+    }
+    for name in names:
+        url = urljoin(disk_server["base_url"], urls[name])
+        code, body, _ = http_get(url)
+        assert code == 200, (name, url)
+        assert body == wheel.read_bytes()
+        code, meta, _ = http_get(f"{url}.metadata")
+        assert code == 200, (name, url)
+        assert b"Metadata-Version" in meta
+        # The HTML index and project page carry the same encoded URL.
+        assert any(h.split("#sha256=")[0] == urls[name] for h in hrefs), (name, hrefs)
+        assert urls[name] in project_hrefs, (name, project_hrefs)
+
+
 def test_filename_past_the_servable_cap_is_rejected(disk_server, tmp_path):
     """One byte over what the download path will ever serve, and the upload is
     refused outright rather than stored as bytes no GET can hand back."""

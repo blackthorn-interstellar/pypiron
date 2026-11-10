@@ -23,6 +23,28 @@ const API_VERSION: &str = "1.4";
 /// 3: core metadata publishes its sha256.
 pub const RENDER_VERSION: u32 = 3;
 
+/// A filename as a `/files/` URL path segment: percent-encodes only the ASCII
+/// bytes that would end or restructure the segment (`#` starts a fragment, `?`
+/// a query, `%` an escape; space, `"` and controls are invalid in a URL).
+/// Everything else — `+`, `!`, non-ASCII — stays as is, so a name made of
+/// URL-safe characters renders byte-for-byte as it always has. The `/files/`
+/// route percent-decodes the segment back to the stored name.
+pub fn file_url_segment(filename: &str) -> std::borrow::Cow<'_, str> {
+    let escape = |c: char| c.is_ascii_control() || matches!(c, ' ' | '"' | '#' | '%' | '?');
+    if !filename.chars().any(escape) {
+        return std::borrow::Cow::Borrowed(filename);
+    }
+    let mut out = String::with_capacity(filename.len() + 8);
+    for c in filename.chars() {
+        if escape(c) {
+            out.push_str(&format!("%{:02X}", c as u32));
+        } else {
+            out.push(c);
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 /// PEP 691 JSON simple-API content type (response, outgoing/incoming Accept).
 pub const SIMPLE_JSON_CONTENT_TYPE: &str = "application/vnd.pypi.simple.v1+json";
 /// PEP 503 HTML simple-API content type.
@@ -130,7 +152,8 @@ pub fn pep503_project_html(
         // href attribute (and #sha256 fragment) must escape `"` too, or an
         // uploaded filename like `a" onmouseover=…` breaks out of the attribute.
         let fname_text = encode_text(&f.filename);
-        let fname_attr = encode_double_quoted_attribute(&f.filename);
+        let fname_url = file_url_segment(&f.filename);
+        let fname_attr = encode_double_quoted_attribute(&fname_url);
         let sha_attr = encode_double_quoted_attribute(&f.sha256);
         let mut attrs = String::new();
         if let Some(rp) = &f.requires_python {
@@ -258,7 +281,7 @@ pub fn pep691_project_json(
             hashes.insert("sha256".to_string(), f.sha256.clone());
             Pep691File {
                 filename: f.filename.clone(),
-                url: format!("/files/{package}/{}", f.filename),
+                url: format!("/files/{package}/{}", file_url_segment(&f.filename)),
                 hashes,
                 size: f.size,
                 upload_time: f.upload_time.clone(),
@@ -268,9 +291,12 @@ pub fn pep691_project_json(
                     Some(sha) => serde_json::json!({ "sha256": sha }),
                     None => serde_json::Value::Bool(true),
                 }),
-                provenance: f
-                    .provenance
-                    .then(|| format!("/files/{package}/{}.provenance", f.filename)),
+                provenance: f.provenance.then(|| {
+                    format!(
+                        "/files/{package}/{}.provenance",
+                        file_url_segment(&f.filename)
+                    )
+                }),
             }
         })
         .collect();
@@ -534,6 +560,24 @@ mod tests {
         assert!(doc["files"][0].get("provenance").is_none());
     }
 
+    /// Only the bytes that break a URL path segment are encoded; a name of
+    /// URL-safe characters (including `+`, `!` and non-ASCII) is untouched, so
+    /// existing index bytes never churn.
+    #[test]
+    fn file_url_segment_encodes_only_what_breaks_a_url() {
+        for safe in [
+            "six-1.16.0-py2.py3-none-any.whl",
+            "torch-2.0+cpu-cp311.whl",
+            "café-1!0.tar.gz",
+        ] {
+            assert!(matches!(file_url_segment(safe), std::borrow::Cow::Borrowed(s) if s == safe));
+        }
+        assert_eq!(
+            file_url_segment("a#1?q%41 x\"\u{7f}.whl"),
+            "a%231%3Fq%2541%20x%22%7F.whl"
+        );
+    }
+
     #[test]
     fn filename_and_sha_cannot_break_out_of_href_attribute() {
         // A filename passes upload validation as long as it has no '/'/'\\' and
@@ -543,10 +587,11 @@ mod tests {
         m.filename = r#"a" onmouseover=alert(1) x.whl"#.into();
         m.sha256 = r#"b"><script>"#.into();
         let html = pep503_project_html("six", &[m], &active());
-        // In the href the quote is escaped, so the attribute never terminates
-        // early (the raw `href="/files/six/a"` breakout must not appear).
+        // In the href the quote and spaces are percent-encoded, so the attribute
+        // never terminates early (the raw `href="/files/six/a"` breakout must not
+        // appear).
         assert!(
-            html.contains(r#"href="/files/six/a&quot; onmouseover=alert(1) x.whl#sha256=b&quot;"#)
+            html.contains(r#"href="/files/six/a%22%20onmouseover=alert(1)%20x.whl#sha256=b&quot;"#)
         );
         assert!(!html.contains(r#"href="/files/six/a""#));
         // The link text keeps the literal filename — harmless in text context.

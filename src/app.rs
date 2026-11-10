@@ -83,6 +83,11 @@ pub(crate) const VERSION: &str = concat!(
 /// Malware blocking rides along the same way: with `malware_block` on, the
 /// rebuild scrubs blocked mirror files from listings using the stored
 /// `_advisories/` snapshot (or the embedded floor), as the live worker does.
+///
+/// It appends no transparency-chain link: an offline pass sees one bucket of
+/// a fleet (a link there forks the chain other buckets carry) and re-audits
+/// the whole corpus (a link would re-commit every file). Views are rebuilt
+/// from truth either way, and the next live audit commits any real churn.
 async fn run_rebuild_index(
     args: RebuildIndexArgs,
     fallback: denylist::Denylist,
@@ -97,6 +102,7 @@ async fn run_rebuild_index(
     };
     let mut state = AppState::headless(storage);
     state.denylist = Some(Arc::new(denylist));
+    state.transparency = false;
     if let Some(snapshot) = advisories {
         state.malware_block = true;
         state.advisories = Arc::new(std::sync::RwLock::new(Arc::new(snapshot)));

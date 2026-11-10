@@ -80,6 +80,8 @@ pub enum Commands {
     /// Whole-corpus scan and rewrite: cost scales with corpus, not churn. S3
     /// rule of thumb: ~$1-1.5 and ~20-30 min per million files (single node,
     /// default concurrency). To only check for drift, use read-only `verify-index`.
+    /// Appends no transparency-chain link; the server's next audit commits
+    /// whatever changed.
     RebuildIndex(Box<RebuildIndexArgs>),
     /// Server maintenance: replay the tamper-evident checkpoint chain against
     /// storage and report any artifact that was rewritten or vanished

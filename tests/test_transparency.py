@@ -4,9 +4,10 @@ catch an out-of-band artifact rewrite — the one attack that fools every check
 that trusts the sidecar.
 
 The chain is driven two ways here, both real:
-- `pypiron rebuild-index` runs a one-shot leader audit (a separate process, no
-  laundering audit can slip in behind it) — used where a tamper must be caught
-  before any further audit re-commits it.
+- `_audit` boots a second server on the store for exactly one boot audit and
+  stops it, so no laundering audit can slip in behind it — used where a tamper
+  must be caught before any further audit re-commits it. (`rebuild-index`
+  appends no links, so it can't drive the chain.)
 - a `--reconcile-interval-secs 2` server sweeps on its own — used to show the
   chain appends on churn.
 """
@@ -56,6 +57,16 @@ def _rebuild_index(bin_path: Path, data_dir: Path) -> subprocess.CompletedProces
     return _cli(bin_path, "rebuild-index", "--data-dir", str(data_dir))
 
 
+def _audit(bin_path: Path, data_dir: Path) -> None:
+    """Exactly one live audit: boot a server on the store, wait for its boot
+    audit to commit the churn as a new link, and stop it before any later sweep
+    could re-commit a tamper. A disk store has no lease, so it audits even with
+    the fixture's server still running."""
+    before = len(_chain_links(data_dir))
+    with _serve(bin_path, data_dir, extra_args=[]):
+        _wait_links(data_dir, at_least=before + 1)
+
+
 def _chain_links(data_dir: Path) -> list[Path]:
     chain_dir = data_dir / "_transparency" / "chain"
     if not chain_dir.is_dir():
@@ -80,7 +91,7 @@ def _serve(bin_path: Path, data_dir: Path, extra_args: list[str]):
     fixture but lets a test pass one-off flags (e.g. `--transparency false`)."""
     port = find_free_port()
     bind = f"127.0.0.1:{port}"
-    log_path = data_dir.parent / f"{data_dir.name}-server.log"
+    log_path = data_dir.parent / f"{data_dir.name}-server-{port}.log"
     args = [
         str(bin_path),
         "serve",
@@ -131,17 +142,33 @@ def _pkg_from_wheel(wheel: Path) -> str:
 
 
 def test_verify_chain_passes_after_an_audit(disk_server, pypiron_bin, tmp_path):
-    """Upload, run one leader audit (rebuild-index), verify-chain exits 0."""
+    """Upload, run one leader audit, verify-chain exits 0."""
     server = disk_server
     wheel = make_wheel("transchecka", "1.0.0", tmp_path)
     _upload(server, wheel)
 
-    rebuilt = _rebuild_index(pypiron_bin, server["data_dir"])
-    assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr
-    assert _chain_links(server["data_dir"]), "audit must have written a chain link"
+    _audit(pypiron_bin, server["data_dir"])
 
     cp = _verify_chain(pypiron_bin, server["data_dir"])
     assert cp.returncode == 0, f"expected valid exit 0:\n{cp.stdout}{cp.stderr}"
+
+
+def test_rebuild_index_appends_no_chain_link(pypiron_bin, tmp_path):
+    """The offline tool rebuilds views but commits nothing to the chain: it sees
+    one bucket of a fleet (a link there forks the chain) and re-audits the whole
+    corpus (a link would re-commit every file). The next live audit commits the
+    churn instead."""
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    with _serve(pypiron_bin, data_dir, extra_args=[]) as server:
+        _upload(server, make_wheel("transofflinea", "1.0.0", tmp_path))
+    rebuilt = _rebuild_index(pypiron_bin, data_dir)
+    assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr
+    assert _chain_links(data_dir) == [], "rebuild-index must not append a chain link"
+
+    _audit(pypiron_bin, data_dir)
+    cp = _verify_chain(pypiron_bin, data_dir)
+    assert cp.returncode == 0, cp.stdout + cp.stderr
 
 
 def test_no_chain_exits_0(pypiron_bin, tmp_path):
@@ -161,7 +188,7 @@ def test_consistent_artifact_rewrite_is_caught(disk_server, pypiron_bin, tmp_pat
     server = disk_server
     wheel = make_wheel("transtampa", "2.0.0", tmp_path)
     _upload(server, wheel)
-    assert _rebuild_index(pypiron_bin, server["data_dir"]).returncode == 0
+    _audit(pypiron_bin, server["data_dir"])
     assert _verify_chain(pypiron_bin, server["data_dir"]).returncode == 0
 
     artifact, sidecar = _artifact_and_sidecar(server["data_dir"], _pkg_from_wheel(wheel))
@@ -201,7 +228,7 @@ def test_in_chain_fingerprint_change_is_a_reviewable_finding_not_a_default_fault
     server = disk_server
     wheel = make_wheel("transfingera", "1.0.0", tmp_path)
     _upload(server, wheel)
-    assert _rebuild_index(pypiron_bin, server["data_dir"]).returncode == 0
+    _audit(pypiron_bin, server["data_dir"])
 
     artifact, sidecar = _artifact_and_sidecar(server["data_dir"], _pkg_from_wheel(wheel))
     old_sha = json.loads(sidecar.read_text())["sha256"]
@@ -218,7 +245,7 @@ def test_in_chain_fingerprint_change_is_a_reviewable_finding_not_a_default_fault
 
     # Re-audit: the chain now commits the same filename under the new sha at a later
     # seq, so both shas live in the chain.
-    assert _rebuild_index(pypiron_bin, server["data_dir"]).returncode == 0
+    _audit(pypiron_bin, server["data_dir"])
     assert len(_chain_links(server["data_dir"])) >= 2, "the re-audit must append a link"
 
     # Default: reported + counted on stdout, but non-fatal (exit 0).
@@ -249,7 +276,7 @@ def test_vanished_artifact_is_caught_but_a_real_delete_is_not(disk_server, pypir
     # An out-of-band disk delete: no tombstone, no audit → "vanished".
     victim = make_wheel("transvanisha", "3.0.0", tmp_path)
     _upload(server, victim)
-    assert _rebuild_index(pypiron_bin, server["data_dir"]).returncode == 0
+    _audit(pypiron_bin, server["data_dir"])
     v_art, v_side = _artifact_and_sidecar(server["data_dir"], _pkg_from_wheel(victim))
     v_art.unlink()
     v_side.unlink()
@@ -271,7 +298,7 @@ def test_vanished_artifact_is_caught_but_a_real_delete_is_not(disk_server, pypir
     )
     assert code == 204, code
     # Re-run the audit so the chain reflects the delete.
-    assert _rebuild_index(pypiron_bin, server["data_dir"]).returncode == 0
+    _audit(pypiron_bin, server["data_dir"])
 
     # The vanished victim above still fails; verify only the legit-delete package
     # in isolation by rebuilding a clean store would be overkill — instead assert
@@ -298,7 +325,7 @@ def test_a_demoted_mirror_record_is_not_a_vanish(disk_server, pypiron_bin, tmp_p
     server = disk_server
     wheel = make_wheel("transdemota", "5.0.0", tmp_path)
     _upload(server, wheel)
-    assert _rebuild_index(pypiron_bin, server["data_dir"]).returncode == 0
+    _audit(pypiron_bin, server["data_dir"])
 
     # Snapshot the audited store: everything below is offline, so the chain
     # cannot silently re-commit the package and pass the test vacuously.

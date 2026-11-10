@@ -496,7 +496,7 @@ set a new `--token-signing-key` on every server.
 | --- | --- |
 | `pypiron healthcheck` | Probe `/health`; `--url` / `PYPIRON_HEALTHCHECK_URL` overrides the target. |
 | `pypiron verify-index` | Read-only full index check against the selected storage backend. `--deep` re-hashes every stored file too. |
-| `pypiron rebuild-index` | Rebuild every index from stored files. |
+| `pypiron rebuild-index` | Rebuild every index from stored files. It records no `_transparency/` entry; the server's next audit does. |
 | `pypiron buckets migrate` | Apply a changed `--buckets` list across every reachable bucket. |
 | `pypiron origin release PACKAGE` | Release an empty package name for deliberate private/public repurposing — the only way to flip a mirror-owned name to private; there is no in-place reclaim. Every configured bucket must be reachable and empty for that package. Safe to run again: it releases only buckets still claimed, and succeeds when all are already released. |
 

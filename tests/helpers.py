@@ -39,6 +39,10 @@ CLIENT_PINS = {
     "hatch": "1.17.0",
     "pipenv": "2026.5.2",
 }
+#: Extras that pin a client's own dependencies. Pinning pdm alone let hishel 2.0
+#: (which dropped `SyncSqliteStorage`) float in under pdm 2.29.5 and crash it;
+#: pdm's `locked` extra installs the exact dependency set its release tested.
+CLIENT_EXTRAS = {"pdm": "[locked]"}
 
 
 @contextmanager
@@ -121,7 +125,14 @@ def uvx_client(client: str) -> list[str]:
     pin = CLIENT_PINS[client]
     if pin in {"venv-seeded", "system", "dev-dependency"}:
         raise ValueError(f"{client} is not run through uv tool")
-    return ["uv", "tool", "run", "--from", f"{client}=={pin}", client]
+    return [
+        "uv",
+        "tool",
+        "run",
+        "--from",
+        f"{client}{CLIENT_EXTRAS.get(client, '')}=={pin}",
+        client,
+    ]
 
 
 # -------------------------- Command / Process helpers -------------------------

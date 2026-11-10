@@ -547,6 +547,7 @@ These series appear only when you configure two or more buckets:
 | `pypiron_replication_objects_total` | Artifact records copied into another bucket. |
 | `pypiron_replication_bytes_total` | Artifact bytes copied into other buckets; companion metadata is not included. |
 | `pypiron_replication_freezes_total` | Same-name, different-byte upload collisions where the loser was quarantined (or both quarantined when the arrival order was too close to call). Needs a human. Any increase needs attention. |
+| `pypiron_replication_conflict_quarantines_total` | The collisions above where the earlier upload was kept and the later one quarantined. An upload that got `200` may be the quarantined one: check the log line naming the file. |
 | `pypiron_replication_marker_backlog{dest}` | Pending cross-bucket repairs (fan-out failures awaiting drain) found on reachable source buckets, including failing ones. During a source outage this is a lower bound. |
 | `pypiron_replication_marker_failures{dest}` | Pending repairs whose last attempt failed for a reason other than an unreachable bucket, such as a damaged file record. These do not clear on their own. Alert when this stays above `0` for two sweeps; see [A repair that keeps failing](../guides/multi-region.md#a-repair-that-keeps-failing). |
 | `pypiron_reconcile_diff_duration_seconds` | Wall time of the last pairwise full comparison. |

@@ -1238,6 +1238,14 @@ def test_byte_conflict_keeps_first_upload_and_quarantines_loser(s3_servers_multi
         ),
         what="byte-conflict alarm counter increments",
     )
+    # The documented alert watches the freezes counter; a quarantine must reach it.
+    assert (
+        max(
+            _counter_value(cluster["left"], "pypiron_replication_freezes_total"),
+            _counter_value(cluster["right"], "pypiron_replication_freezes_total"),
+        )
+        >= 1
+    )
 
 
 def test_follower_with_working_path_drains_leaders_marker(s3_servers_multi, tmp_path):

@@ -350,9 +350,16 @@ pub async fn execute(
                 "byte conflict: first-uploaded kept, loser quarantined; operator review required"
             );
             supersede_record(state, src, dst, pkg, filename, record, source).await?;
+            // A quarantine is a byte conflict too: count it where the
+            // documented alert (`pypiron_replication_freezes_total`) looks, and
+            // in its own subset counter.
             state
                 .metrics
                 .replication_conflict_quarantines
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            state
+                .metrics
+                .replication_freezes
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         Verdict::Freeze => {
@@ -4553,6 +4560,11 @@ mod tests {
                 .replication_conflict_quarantines
                 .load(Ordering::Relaxed),
             1
+        );
+        assert_eq!(
+            state.metrics.replication_freezes.load(Ordering::Relaxed),
+            1,
+            "a quarantine must reach the freeze alarm"
         );
 
         let settled_a = read_record(a.as_ref(), "pkg", filename).await.unwrap();

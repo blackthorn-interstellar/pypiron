@@ -181,11 +181,12 @@ pub struct Metrics {
     /// actually taking the fast path; the microbench asserts it, and the ratio
     /// to `replication_objects` is the copy-vs-stream mix.
     pub replication_server_side_copies: AtomicU64,
-    /// Byte-conflict freezes (§6.3): same filename, different bytes on two
-    /// buckets. Every nonzero value is a human-actionable split-brain.
+    /// Byte conflicts (§6.3): same filename, different bytes on two buckets,
+    /// whether frozen on both or resolved by quarantining the loser. Every
+    /// nonzero value is a human-actionable split-brain.
     pub replication_freezes: AtomicU64,
-    /// Different-byte private/private conflicts resolved by keeping the older
-    /// upload and quarantining the loser. Every event is an operator alarm.
+    /// The subset of `replication_freezes` resolved by keeping the older
+    /// upload and quarantining the loser.
     pub replication_conflict_quarantines: AtomicU64,
     /// Last pairwise reconcile-diff wall duration, seconds, as f64 bits (gauge).
     reconcile_diff_duration_bits: AtomicU64,
@@ -656,7 +657,7 @@ impl Metrics {
                 ),
                 (
                     "pypiron_replication_freezes_total",
-                    "Byte-conflict freezes (same filename, different bytes on two buckets).",
+                    "Byte conflicts (same filename, different bytes on two buckets): frozen or loser quarantined.",
                     &self.replication_freezes,
                 ),
                 (

@@ -169,7 +169,9 @@ gauge returns to `0`, and reads return to the region.
 During a partition, two different files can reach different buckets under the
 same filename. pypiron keeps the earlier one when it can determine an order and
 quarantines the conflict. Alert on `pypiron_replication_freezes_total` and
-publish the corrected artifact under a new filename.
+publish the corrected artifact under a new filename. An upload can get `200`
+and still be the copy that was quarantined; the server log names the file and
+both hashes.
 
 ## Private names during a partition
 

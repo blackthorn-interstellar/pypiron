@@ -249,7 +249,7 @@ backends are supported. With more than one bucket:
 | `--counters-rollup-interval-secs N` | `PYPIRON_COUNTERS_ROLLUP_INTERVAL_SECS` | `3600` | Finished-day compaction cadence. |
 | `--counters-retention-days N` | `PYPIRON_COUNTERS_RETENTION_DAYS` | `90` | Counter retention. |
 | `--index-cache-ttl-secs N` | `PYPIRON_INDEX_CACHE_TTL_SECS` | `1` | Refresh interval for in-memory index/page caches. Local rebuilds clear cached entries. An index read already in progress can restore older results for another TTL, even on a single node; keep this short when new releases must appear promptly. |
-| `--token-signing-key KEY` | `PYPIRON_TOKEN_SIGNING_KEY` | none | Enables 5-minute install tokens. |
+| `--token-signing-key KEY` | `PYPIRON_TOKEN_SIGNING_KEY` | none | Enables 5-minute install tokens. Must be at least 32 bytes, or startup fails; generate one with `openssl rand -hex 32`. |
 
 No write credential means read-only. No read credential means installs are open
 to the network. Half-configured credentials refuse startup.
@@ -449,7 +449,14 @@ credential). Sync reports a larger file as failed without downloading it; add
 
 ## Install tokens
 
-Enable with `--token-signing-key`. Mint with:
+Enable with `--token-signing-key`, using the same key on every server:
+
+```bash
+export PYPIRON_TOKEN_SIGNING_KEY=$(openssl rand -hex 32)
+```
+
+A key shorter than 32 bytes makes startup fail: anyone holding one token could
+recover it offline and sign admin tokens. Mint with:
 
 ```bash
 export UV_INDEX_COMPANY_USERNAME=__token__

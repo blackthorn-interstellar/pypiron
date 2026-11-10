@@ -1281,7 +1281,8 @@ pub struct ServeArgs {
     /// `POST /tokens` to mint a 5-minute bearer token (presented as basic-auth
     /// username `__token__`); when unset, token minting and verification are
     /// disabled. Tokens are stateless — the key must be identical across nodes,
-    /// like the other credentials. Generate with e.g. `openssl rand -hex 32`.
+    /// like the other credentials. At least 32 bytes, or startup refuses;
+    /// generate one with `openssl rand -hex 32`.
     #[arg(long, env = "PYPIRON_TOKEN_SIGNING_KEY", hide_env_values = true)]
     pub(crate) token_signing_key: Option<String>,
 

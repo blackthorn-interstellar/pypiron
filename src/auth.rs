@@ -74,6 +74,26 @@ pub(crate) fn credential_pair_error(
     }
 }
 
+/// Shortest `--token-signing-key` accepted, in bytes. Every token is a
+/// plaintext/HMAC pair anyone can collect (a public-read server mints reader
+/// tokens anonymously), so a short key can be brute-forced offline, and the key
+/// forges admin tokens. 32 bytes is HMAC-SHA256's own output size.
+const MIN_SIGNING_KEY_BYTES: usize = 32;
+
+/// The startup error for a token signing key too short to resist an offline
+/// guess, or None when the key is long enough or unset (an empty key disables
+/// tokens). The message names the length, never the key.
+pub(crate) fn signing_key_error(key: Option<&str>) -> Option<String> {
+    let len = nonempty(key)?.len();
+    (len < MIN_SIGNING_KEY_BYTES).then(|| {
+        format!(
+            "--token-signing-key is {len} bytes; it must be at least {MIN_SIGNING_KEY_BYTES}, \
+             or anyone holding one token can recover it offline and forge admin tokens. \
+             Generate one with `openssl rand -hex 32`."
+        )
+    })
+}
+
 /// Gate the privileged routes (delete, yank, status, feed push, audit) behind the
 /// admin credential, with RFC 7235/7231-correct status codes:
 /// - no admin credential configured at all → 403 (the operation is disabled for
@@ -494,6 +514,18 @@ mod tests {
         assert!(credential_pair_error("read", Some("reader"), Some("secret")).is_none());
         assert!(credential_pair_error("read", None, None).is_none());
         assert!(credential_pair_error("read", Some(""), Some("")).is_none());
+    }
+
+    #[test]
+    fn short_signing_key_is_rejected() {
+        let short = "k".repeat(MIN_SIGNING_KEY_BYTES - 1);
+        let msg = signing_key_error(Some(&short)).expect("31 bytes refused");
+        assert!(msg.contains("openssl rand -hex 32"), "{msg}");
+        assert!(!msg.contains(&short), "the error must not echo the key");
+        assert!(signing_key_error(Some(&"k".repeat(MIN_SIGNING_KEY_BYTES))).is_none());
+        // Unset or empty means tokens are off, not a weak key.
+        assert!(signing_key_error(None).is_none());
+        assert!(signing_key_error(Some("")).is_none());
     }
 
     #[test]

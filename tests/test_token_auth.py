@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import http.client
 import json
+import os
 import subprocess
 import time
 from urllib.parse import urlsplit
@@ -21,7 +22,14 @@ from urllib.parse import urlsplit
 import pytest
 
 from .conftest import _start_disk_server
-from .helpers import _encode_basic_auth, _http_request, http_get, make_wheel, upload_legacy
+from .helpers import (
+    _encode_basic_auth,
+    _http_request,
+    find_free_port,
+    http_get,
+    make_wheel,
+    upload_legacy,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -251,3 +259,30 @@ def test_a_token_that_turns_valid_mid_request_cannot_mint(disk_server_token_auth
         assert resp.status == 403, resp.read()
     finally:
         conn.close()
+
+
+def test_a_short_signing_key_refuses_startup(pypiron_bin, tmp_path):
+    """Anyone can collect a token, so a short key falls to an offline guess and
+    then signs admin tokens. Startup refuses it and says how to make a good one,
+    without echoing the key."""
+    weak = "k" * 31
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYPIRON_")}
+    env["PYPIRON_TOKEN_SIGNING_KEY"] = weak
+    cp = subprocess.run(
+        [
+            str(pypiron_bin),
+            "serve",
+            "--bind-addr",
+            f"127.0.0.1:{find_free_port()}",
+            "--data-dir",
+            str(tmp_path / "data"),
+        ],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        env=env,
+    )
+    out = cp.stdout + cp.stderr
+    assert cp.returncode != 0, out
+    assert "openssl rand -hex 32" in out, out
+    assert weak not in out, out

@@ -47,7 +47,7 @@ use crate::admin::{
 };
 use crate::auth::{
     basic_credentials, check_basic_auth, cred_pair, credential_pair_error, nonempty, project_tag,
-    resolve_admin_user, LoginThrottle,
+    resolve_admin_user, signing_key_error, LoginThrottle,
 };
 use crate::pages::{downloads_page, project_page, project_version_page, projects_page, root};
 use crate::publish::{
@@ -1302,6 +1302,9 @@ async fn run_serve(
                  without authentication."
             );
         }
+    }
+    if let Some(msg) = signing_key_error(cli.token_signing_key.as_deref()) {
+        anyhow::bail!(msg);
     }
 
     // Fail closed on a per-bucket override that names a bucket outside the list

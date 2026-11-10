@@ -178,6 +178,20 @@ pub enum ArtifactDelivery {
     Stream,
 }
 
+/// Whether an install must say which repo it is for (`user+repo=org/repo` in
+/// the index username, or an install token minted with a repo). Staged, because
+/// the day it is switched on nobody is sending one yet.
+#[derive(clap::ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RequireRepo {
+    /// Ask for nothing.
+    Off,
+    /// Serve everyone; count index requests that name no repo
+    /// (`pypiron_repo_missing_total`) so the stragglers can be found first.
+    Report,
+    /// Refuse index and artifact reads that name no repo, with 428.
+    Enforce,
+}
+
 /// Whole-request deadline for ordinary (small, fast) requests. Hyper 1.x has no
 /// default body-read timeout, so without this a trickled or stalled request
 /// (slowloris) pins a connection forever; this bounds it. Generous enough that
@@ -317,7 +331,8 @@ pub struct AppState {
     /// private package may claim.
     pub private: PrivateNames,
     pub artifact_delivery: ArtifactDelivery,
-    /// Attach per-client `project` labels to `/metrics`. Off by default because
+    pub require_repo: RequireRepo,
+    /// Attach per-client `repo` labels to `/metrics`. Off by default because
     /// `/metrics` carries no auth; see the flag of the same name.
     pub metrics_repo_labels: bool,
     /// Widen the access log from mutations-only (the default) to every request.
@@ -649,6 +664,7 @@ impl AppState {
             token_signing_key: None,
             private: PrivateNames::default(),
             artifact_delivery: ArtifactDelivery::Auto,
+            require_repo: RequireRepo::Off,
             metrics_repo_labels: false,
             access_log: false,
             access_log_format: AccessLogFormat::Structured,
@@ -739,6 +755,11 @@ impl AppState {
     /// token minted with no credential grants nothing where reads need one:
     /// it proves only that some public-read peer sharing the key was asked.
     pub fn token_role(&self, headers: &HeaderMap) -> Option<token::Role> {
+        self.token_claims(headers).map(|c| c.role)
+    }
+
+    /// The claims of the valid token a request presents; see `token_role`.
+    fn token_claims(&self, headers: &HeaderMap) -> Option<token::Claims> {
         let key = nonempty(self.token_signing_key.as_deref())?;
         let (user, pass) = basic_credentials(headers)?;
         if !token::is_token_username(&user) {
@@ -746,9 +767,16 @@ impl AppState {
         }
         // The protocol clock, so the simulator can drive a token past its expiry.
         let now = crate::clock::now_utc().unix_timestamp();
-        token::verify(key, &pass, now)
-            .filter(|c| !c.anon || self.read_credential().is_none())
-            .map(|c| c.role)
+        token::verify(key, &pass, now).filter(|c| !c.anon || self.read_credential().is_none())
+    }
+
+    /// Does the request say which repo it is for? Either a `repo=` username
+    /// tag, or a valid install token minted with one.
+    fn names_repo(&self, headers: &HeaderMap) -> bool {
+        crate::auth::client_repo(headers).is_some()
+            || self
+                .token_claims(headers)
+                .is_some_and(|c| nonempty(c.repo.as_deref()).is_some())
     }
 
     /// Does the request carry a `__token__` this server's key signed, expired
@@ -1738,6 +1766,7 @@ async fn run_serve(
         token_signing_key: cli.token_signing_key,
         private,
         artifact_delivery: cli.artifact_delivery,
+        require_repo: cli.require_repo,
         metrics_repo_labels: cli.metrics_repo_labels,
         access_log: cli.access_log,
         access_log_format: cli.access_log_format,
@@ -1928,6 +1957,7 @@ async fn run_serve(
         // response. Both sit *after* `.merge(streaming)` so they wrap /legacy and
         // the /files DELETE too, and *inside* log_requests so a blocked cross-site
         // attempt still lands in the audit log.
+        .layer(middleware::from_fn_with_state(state.clone(), require_repo))
         .layer(middleware::from_fn(reject_bad_client_tags))
         .layer(middleware::from_fn(csrf_guard))
         .layer(middleware::from_fn(security_headers))
@@ -2545,6 +2575,48 @@ async fn reject_bad_client_tags(req: Request, next: Next) -> Response<Body> {
              commit, delivery=stream, and x-<name> for your own.",
         ),
     }
+}
+
+/// `--require-repo`: installs must name the repo they are for. Covers index
+/// and artifact reads only — pages, probes and uploads are not installs.
+///
+/// A request the server would answer 401 anyway is left to do so: a client
+/// that finds its credential only after a challenge must still get one. `report`
+/// judges index requests alone, and so does the counter in both modes, because
+/// uv sends a username from the index URL on artifact requests only after one
+/// was refused — an artifact request without a repo says nothing about the
+/// client. Lockfile installs never touch the index, which is why `enforce` has
+/// to cover artifacts too. 428 rather than 401/403: uv reports those as a
+/// failed resolution and pip prompts for a password, while a 428 is printed
+/// with its reason and still makes uv retry with the URL's username.
+async fn require_repo(
+    State(state): State<Arc<AppState>>,
+    req: Request,
+    next: Next,
+) -> Response<Body> {
+    let group = metrics::route_group(req.method(), req.uri().path());
+    let install = matches!(*req.method(), Method::GET | Method::HEAD) && group <= 1;
+    if state.require_repo == RequireRepo::Off
+        || !install
+        || !state.is_reader(req.headers())
+        || state.names_repo(req.headers())
+    {
+        return next.run(req).await;
+    }
+    if group == 0 {
+        state.metrics.record_repo_missing();
+    }
+    if state.require_repo == RequireRepo::Report {
+        return next.run(req).await;
+    }
+    refuse_with_reason(
+        StatusCode::PRECONDITION_REQUIRED,
+        "Repo required: add repo= to the index username",
+        "This server only serves installs that say which repo they are for. Put it in the \
+         index username, after a `+`: ci+repo=org/repo (no https://). With uv, set \
+         UV_INDEX_<NAME>_USERNAME, or write it into the index URL in pyproject.toml as \
+         https://ci+repo=org%2Frepo@host/simple.",
+    )
 }
 
 /// A refusal whose one-line `reason` replaces the standard status text.

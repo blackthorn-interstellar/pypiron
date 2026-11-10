@@ -223,6 +223,7 @@ backends are supported. With more than one bucket:
 | `--metrics-repo-labels` | `PYPIRON_METRICS_REPO_LABELS` | `false` | Attach per-client `repo` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label is the repo from the [username tags](#username-tags), so exposing it lets any scraper list internal repo names. |
 | `--spool-dir PATH` | `PYPIRON_SPOOL_DIR` | system temp | Upload/proxy spool directory. Spool files a crash left behind are removed once they are a day old. A first proxy download that would leave less than 1 GiB free here (5% on a disk under 20 GiB), counting downloads already running, gets a `503` with `Retry-After`, which pip and uv retry. |
 | `--artifact-delivery auto\|redirect\|stream` | `PYPIRON_ARTIFACT_DELIVERY` | `auto` | Redirect object-store downloads for compatible clients or stream through the server. A first uncached proxy download may stream under `--proxy-stream-threshold`. A client can [ask to be streamed](#clients-that-cannot-reach-the-bucket). |
+| `--require-repo off\|report\|enforce` | `PYPIRON_REQUIRE_REPO` | `off` | Require installs to [name their repo](#requiring-a-repo). `report` counts index requests that name none; `enforce` refuses them with `428`. |
 | `--wait-on-upload` | `PYPIRON_WAIT_ON_UPLOAD` | `false` | Wait for index visibility before upload returns. |
 | `--wait-on-upload-secs N` | `PYPIRON_WAIT_ON_UPLOAD_SECS` | `10` | Bound for that wait. |
 | `--max-concurrent-artifact-writes N` | `PYPIRON_MAX_CONCURRENT_ARTIFACT_WRITES` | `4` | Memory for object-store uploads in progress, in `64MiB` units. The default of `4` caps it at about `256MiB`: four `64MiB` files at once, or about 40 files of `6MiB`. Uploads beyond it wait their turn. Disk storage has no limit; `0` removes it. |
@@ -299,6 +300,47 @@ export UV_INDEX_CORP_USERNAME="ci+repo=github.com/$GITHUB_REPOSITORY,commit=$GIT
 
 When reads require a credential, `/metrics` counts a repo only on requests
 whose credential is accepted.
+
+### Requiring a repo
+
+`--require-repo` makes every install say which repo it is for, so traffic can
+be attributed. Roll it out in three steps.
+
+1. **Add the repo to each project.** One committed line covers every developer
+   and CI job. Write `/` as `%2F` inside a URL:
+
+    ```toml
+    [[tool.uv.index]]
+    name = "corp"
+    url = "https://ci+repo=acme%2Fbilling-api@pypi.example.com/simple"
+    ```
+
+    The `UV_INDEX_CORP_USERNAME` form above works too, and an
+    [install token](#install-tokens) minted inside a repo already carries it.
+
+2. **Run with `--require-repo report`.** Nothing is refused.
+   `pypiron_repo_missing_total` counts index requests that name no repo; with
+   `--access-log`, those are the `/simple/` lines with no `repo=` in `tags`.
+
+3. **Switch to `--require-repo enforce`** once the count stops rising. An
+   install that names no repo now fails at once, and uv prints why:
+
+    ```text
+    HTTP status client error (428 Repo required: add repo= to the index username)
+    ```
+
+Only index and file downloads are checked. Uploads, the web pages, `/health`
+and `/metrics` are not. On a server whose reads need a credential, a request
+without a valid one still gets `401` first.
+
+With the repo in the index URL, uv sends it on a file download only after the
+server has refused that download once, so under `enforce` each one shows up as
+a `428` followed by a `200`. Expect the `4xx` count for `route="files"` in
+`pypiron_http_requests_total` to rise accordingly; clients that use the
+environment variable do not cause it.
+
+The repo is what the client says it is. Only an install token's repo is
+checked by the server.
 
 ### Clients that cannot reach the bucket
 

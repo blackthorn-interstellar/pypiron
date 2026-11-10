@@ -460,6 +460,18 @@ It also means every bare key is reserved, so adding one later breaks nobody.
 The whole list goes to the access log as `tags`; only `repo` may become a
 metrics label, because the others are unbounded.
 
+`--require-repo report|enforce` asks every install to name one, by tag or by
+an install token's `repo` claim. It gates index and artifact reads only, after
+authentication (a request due a 401 still gets it, so challenge-driven clients
+work). `enforce` answers 428 with the instruction as the reason phrase:
+401/403 make uv report a failed resolution and pip prompt for a password,
+while any refusal — 428 included — makes uv retry a file request with the
+index URL's username, which is what lets a repo committed in `pyproject.toml`
+reach `/files/`. Artifacts must be gated because a lockfile install never
+touches the index; `report` and `pypiron_repo_missing_total` judge index
+requests alone because an artifact request without a username says nothing
+about a URL-form client.
+
 The redirect path does no artifact-existence check — presigning is local HMAC
 math. In single-bucket mode, the visibility hardening adds zero storage calls.
 In multi-bucket mode, the request first applies the same origin and visibility

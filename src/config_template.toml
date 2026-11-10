@@ -113,6 +113,12 @@
 # a `delivery=stream` username tag (UV_INDEX_<NAME>_USERNAME=ci+delivery=stream).
 # artifact-delivery = "auto"
 
+# Require installs to say which repo they are for (index username
+# ci+repo=org/repo, or an install token minted with a repo). "report" serves
+# everyone and counts index requests that name none (pypiron_repo_missing_total);
+# "enforce" refuses them with 428. Roll out with "report" first.
+# require-repo = "off"
+
 # Publishing / CI. Wait for an upload to appear in the index before returning
 # 200, so a publish-then-install pipeline is deterministic.
 # wait-on-upload = false

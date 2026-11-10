@@ -40,8 +40,8 @@ pub enum StorageOp {
 const ROUTE_FILES: usize = 1;
 const CLASS_2XX: usize = 0;
 
-/// Cap on distinct project attribution tags. Tags are client-supplied
-/// (basic-auth username subaddresses), so without a cap a hostile or
+/// Cap on distinct repo labels. Repos are client-supplied (the `repo=` tag
+/// in the basic-auth username), so without a cap a hostile or
 /// misconfigured client could grow the scrape payload without bound.
 /// Past the cap, new tags land in [`OVERFLOW_TAG`].
 const MAX_PROJECT_TAGS: usize = 256;
@@ -96,6 +96,8 @@ pub struct Metrics {
     /// low-cardinality. A nonzero rate is the active-remediation signal: some
     /// machine still *asks* for malware — an incident, not a statistic.
     blocked_downloads: AtomicU64,
+    /// Index requests that named no repo while `--require-repo` asked for one.
+    repo_missing: AtomicU64,
     /// storage_ops[StorageOp]: backend calls issued through the Storage trait.
     storage_ops: [AtomicU64; STORAGE_OPS.len()],
     /// Package index rebuilds (worker + reconcile + deletes).
@@ -402,6 +404,11 @@ impl Metrics {
         self.downloads.fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Count one index request that named no repo under `--require-repo`.
+    pub fn record_repo_missing(&self) {
+        self.repo_missing.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Count one download refused by the malware byte gate (advisory-blocked or
     /// quarantined). Called at the single block site in the file handler.
     pub fn record_blocked_download(&self) {
@@ -480,6 +487,11 @@ impl Metrics {
                 "pypiron_blocked_downloads_total",
                 "Artifact downloads refused by the malware byte gate (advisory-blocked or quarantined).",
                 &self.blocked_downloads,
+            ),
+            (
+                "pypiron_repo_missing_total",
+                "Index requests that named no repo while --require-repo was report or enforce.",
+                &self.repo_missing,
             ),
             (
                 "pypiron_malware_probe_skipped_total",

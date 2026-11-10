@@ -11,7 +11,7 @@ use std::time::Duration;
 use anyhow::{anyhow, bail, Context, Result};
 use clap::{Args as ClapArgs, Parser, Subcommand};
 
-use crate::app::{AccessLogFormat, ArtifactDelivery, VERSION};
+use crate::app::{AccessLogFormat, ArtifactDelivery, RequireRepo, VERSION};
 use crate::{
     bucket_health, buckets, config, names, observed_storage, origin, replicate, storage, sync,
     transparency, verify,
@@ -1056,11 +1056,24 @@ pub struct ServeArgs {
     )]
     pub(crate) artifact_delivery: ArtifactDelivery,
 
+    /// Require installs to say which repo they are for: a `repo=` tag in the
+    /// index username (`ci+repo=org/repo`) or an install token minted with a
+    /// repo. `report` serves everyone and counts index requests that name none
+    /// (`pypiron_repo_missing_total`); `enforce` refuses index and artifact
+    /// reads that name none with 428. Roll out with `report` first.
+    #[arg(
+        long,
+        env = "PYPIRON_REQUIRE_REPO",
+        value_enum,
+        default_value_t = RequireRepo::Off
+    )]
+    pub(crate) require_repo: RequireRepo,
+
     /// Also log reads (index listings, downloads) — the full access log. By
     /// default only mutations (uploads, deletes, yanks, status changes) are
     /// logged, since reads can become the workload at high rps. Either way
     /// `/health` and `/metrics` log only at debug. Each line carries method,
-    /// path, status, latency, size, client IP, project tag, and User-Agent on
+    /// path, status, latency, size, client IP, username tags, and User-Agent on
     /// the `pypiron::access` target (tunable via `RUST_LOG`).
     #[arg(long, env = "PYPIRON_ACCESS_LOG")]
     pub(crate) access_log: bool,
@@ -1441,6 +1454,12 @@ pub fn merge_serve_file(
         "artifact_delivery",
         "artifact-delivery",
         &f.artifact_delivery
+    );
+    fill_enum!(
+        cli.require_repo,
+        "require_repo",
+        "require-repo",
+        &f.require_repo
     );
     fill!(cli.access_log, "access_log", f.access_log);
     fill!(cli.trusted_proxy, "trusted_proxy", f.trusted_proxy);

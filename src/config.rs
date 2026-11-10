@@ -109,6 +109,7 @@ pub struct UpstreamConfig {
 pub struct ServeConfig {
     pub bind_addr: Option<String>,
     pub artifact_delivery: Option<String>,
+    pub require_repo: Option<String>,
     pub access_log: Option<bool>,
     pub access_log_format: Option<String>,
     pub trusted_proxy: Option<bool>,

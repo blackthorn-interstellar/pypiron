@@ -2482,6 +2482,27 @@ pub(crate) const STAGING_PREFIX: &str = "_staging/";
 /// generation), so we round-trip both. Compared only for equality.
 const VERSION_SEP: char = '\u{1f}';
 
+/// Whether an ascending listing has moved past every key starting with
+/// `stop`: it sorts after it and no longer starts with it.
+fn past_prefix(location: &str, stop: &str) -> bool {
+    location > stop && !location.starts_with(stop)
+}
+
+/// A key strictly below every key starting with `prefix`, yet above every
+/// key of the shard before it: the last (ASCII) byte stepped down one, then a
+/// run of 'z' — the highest byte object_store leaves unescaped — as long as
+/// the longest project name, so "packages/b" starts past every "packages/a…"
+/// directory. `None` when there is no ASCII byte to step.
+fn step_below(prefix: &str) -> Option<String> {
+    let (&last, head) = prefix.as_bytes().split_last()?;
+    if !last.is_ascii() || last == 0 {
+        return None;
+    }
+    let head = &prefix[..head.len()];
+    let run = "z".repeat(crate::names::MAX_PKG_NAME_BYTES);
+    Some(format!("{head}{}{run}", char::from(last - 1)))
+}
+
 impl ObjectStorage {
     pub fn new(
         store: Arc<dyn ObjectStore>,
@@ -2852,12 +2873,14 @@ impl ObjectStorage {
     /// Drain a listing `stream`, keeping objects whose logical key starts with
     /// the exact byte `prefix` (object_store lists by directory; the byte-prefix
     /// filter is ours). Stops after `limit` matches — pass `usize::MAX` for an
-    /// unbounded listing. Objects arrive in ascending key order; callers wanting
-    /// a total order sort the result themselves.
+    /// unbounded listing — or at the first location past `stop` (see
+    /// [`Self::list_window`]). Objects arrive in ascending key order; callers
+    /// wanting a total order sort the result themselves.
     async fn list_matching(
         &self,
         mut stream: impl futures::Stream<Item = object_store::Result<object_store::ObjectMeta>> + Unpin,
         prefix: &str,
+        stop: Option<&str>,
         op: &str,
         limit: usize,
     ) -> Result<Vec<ObjectMeta>> {
@@ -2867,6 +2890,9 @@ impl ObjectStorage {
                 Ok(meta) => meta,
                 Err(error) => return Err(self.store_err(error, op, prefix)),
             };
+            if stop.is_some_and(|s| past_prefix(m.location.as_ref(), s)) {
+                break;
+            }
             let Some(key) = self.unkey(m.location.as_ref()) else {
                 continue;
             };
@@ -2901,6 +2927,37 @@ impl ObjectStorage {
             None => "",
         };
         (!dir.is_empty() || self.prefix.is_some()).then(|| self.oskey(dir))
+    }
+
+    /// Where on the wire a byte-prefix listing of `prefix` may start and stop:
+    /// `(stop, offset)`. Without it a sharded prefix ("packages/b") lists the
+    /// whole enclosing directory, so the audit's 36 shards cost 36 scans of
+    /// the tree instead of one.
+    ///
+    /// Both bounds need `prefix` to reach the wire verbatim (no object_store
+    /// escaping, no trailing-slash collapse); only then is store order the
+    /// same byte order our prefix test uses. `stop` is that wire prefix: once
+    /// a location sorts past it without starting with it, no later one can.
+    /// `offset` is a key just below every match — the last byte stepped down
+    /// one, then a run of 'z' (see [`step_below`]), so "packages/b" starts
+    /// after "packages/azzz…" and skips the whole a-shard.
+    /// It is `None` when that stepped key would itself be escaped ("packages/`"
+    /// for shard 'a') or collapse ("packages//" for shard '0'); the listing
+    /// then starts at the directory, as before.
+    fn list_window(&self, prefix: &str) -> (Option<String>, Option<OsPath>) {
+        let verbatim = |key: &str| {
+            let path = self.oskey(key);
+            let wire = match &self.prefix {
+                Some(p) => format!("{p}/{key}"),
+                None => key.to_string(),
+            };
+            (path.as_ref() == wire).then_some((wire, path))
+        };
+        let Some((stop, _)) = verbatim(prefix) else {
+            return (None, None);
+        };
+        let offset = step_below(prefix).and_then(|below| verbatim(&below).map(|(_, path)| path));
+        (Some(stop), offset)
     }
 
     /// GET the whole object as a 200 response.
@@ -3247,9 +3304,13 @@ impl Storage for ObjectStorage {
 
     async fn list_all(&self, prefix: &str) -> Result<Vec<ObjectMeta>> {
         let list_prefix = self.list_dir_prefix(prefix);
-        let stream = self.store.list(list_prefix.as_ref());
+        let (stop, offset) = self.list_window(prefix);
+        let stream = match &offset {
+            Some(offset) => self.store.list_with_offset(list_prefix.as_ref(), offset),
+            None => self.store.list(list_prefix.as_ref()),
+        };
         let mut out = self
-            .list_matching(stream, prefix, "list_all", usize::MAX)
+            .list_matching(stream, prefix, stop.as_deref(), "list_all", usize::MAX)
             .await?;
         out.sort_by(|a, b| a.key.cmp(&b.key));
         Ok(out)
@@ -3265,12 +3326,14 @@ impl Storage for ObjectStorage {
         // Native start-after: the client passes `offset` to ListObjectsV2, so a
         // later page never re-lists earlier keys. Objects arrive in ascending
         // key order, so the first `limit` matches are exactly the next page.
-        let offset = after.map(|a| self.oskey(a));
+        let (stop, below) = self.list_window(prefix);
+        let offset = after.map(|a| self.oskey(a)).or(below);
         let stream = match &offset {
             Some(offset) => self.store.list_with_offset(list_prefix.as_ref(), offset),
             None => self.store.list(list_prefix.as_ref()),
         };
-        self.list_matching(stream, prefix, "list_page", limit).await
+        self.list_matching(stream, prefix, stop.as_deref(), "list_page", limit)
+            .await
     }
 
     async fn delete_keys(&self, keys: &[String]) -> Result<()> {
@@ -4455,6 +4518,105 @@ mod tests {
     /// and every provider's request line must percent-decode back to exactly it
     /// — decoded once, since the request-line pass is transport escaping over an
     /// already-escaped name (`%` → `%25`), not a second naming pass.
+    /// A shard listing starts just below its shard and stops right after it,
+    /// instead of scanning the whole enclosing directory once per shard.
+    #[test]
+    fn a_shard_listing_is_windowed_to_its_shard() {
+        let run = "z".repeat(crate::names::MAX_PKG_NAME_BYTES);
+        assert_eq!(step_below("packages/b"), Some(format!("packages/a{run}")));
+        assert_eq!(step_below(""), None);
+        assert_eq!(step_below("caf\u{e9}"), None);
+        assert!(past_prefix("packages/c/x", "packages/b"));
+        assert!(!past_prefix("packages/b/x", "packages/b"));
+        assert!(!past_prefix("packages/a/x", "packages/b"));
+
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let keyed =
+            |p: Option<&str>| ObjectStorage::new(store.clone(), None, p.map(String::from), "mem");
+        let window = |st: &ObjectStorage, prefix: &str| {
+            let (stop, offset) = st.list_window(prefix);
+            (stop, offset.map(|o| o.as_ref().to_string()))
+        };
+        let (plain, pfx) = (keyed(None), keyed(Some("pypi")));
+        assert_eq!(
+            window(&plain, "packages/b"),
+            (Some("packages/b".into()), Some(format!("packages/a{run}")))
+        );
+        assert_eq!(
+            window(&pfx, "simple/z"),
+            (
+                Some("pypi/simple/z".into()),
+                Some(format!("pypi/simple/y{run}"))
+            )
+        );
+        // The stepped key would be escaped ('`') or collapse ('/'): start at
+        // the directory, but still stop after the shard.
+        assert_eq!(
+            window(&plain, "packages/a"),
+            (Some("packages/a".into()), None)
+        );
+        assert_eq!(
+            window(&plain, "packages/0"),
+            (Some("packages/0".into()), None)
+        );
+        // A prefix that is itself escaped or slash-terminated gets no window.
+        assert_eq!(window(&plain, "packages/a~"), (None, None));
+        assert_eq!(window(&plain, "packages/"), (None, None));
+    }
+
+    /// The window is an optimization only: every shard still lists exactly the
+    /// keys a naive byte-prefix filter over the whole tree would.
+    #[tokio::test]
+    async fn a_windowed_shard_listing_misses_nothing() {
+        let store = Arc::new(object_store::memory::InMemory::new());
+        let keys = [
+            "packages/0pkg/0pkg-1.whl",
+            "packages/9z/9z-1.whl",
+            "packages/a/a-1.whl",
+            "packages/a~b/x.whl",
+            "packages/a`b/x.whl",
+            "packages/alpha/alpha-1.whl",
+            "packages/b/b-1.whl",
+            "packages/beta/beta-1.whl",
+            "packages/zz/zz-1.whl",
+            "simple/alpha/index.html",
+        ];
+        for st in [
+            ObjectStorage::new(store.clone(), None, None, "mem"),
+            ObjectStorage::new(store.clone(), None, Some("pypi".into()), "mem"),
+        ] {
+            for k in keys {
+                st.put_bytes(k, b"x".to_vec(), None).await.unwrap();
+            }
+            for c in SHARD_CHARS {
+                let prefix = format!("packages/{c}");
+                let got: Vec<String> = st
+                    .list_all(&prefix)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| m.key)
+                    .collect();
+                let mut want: Vec<&str> = keys
+                    .iter()
+                    .copied()
+                    .filter(|k| k.starts_with(&prefix))
+                    .collect();
+                want.sort_unstable();
+                assert_eq!(got, want, "shard {prefix}");
+                let mut page: Vec<String> = st
+                    .list_page(&prefix, None, 100)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|m| m.key)
+                    .collect();
+                page.sort_unstable();
+                assert_eq!(page, want, "page of shard {prefix}");
+            }
+        }
+    }
+
     #[test]
     fn copy_request_lines_address_the_object_that_object_store_wrote() {
         let store = Arc::new(object_store::memory::InMemory::new());

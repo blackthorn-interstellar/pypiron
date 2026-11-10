@@ -73,7 +73,7 @@ pub fn infer_package_from_filename(filename: &str) -> String {
 /// Upper bound on a name we will accept. PyPI itself caps project names at 100
 /// characters and PEP 503 sets no limit, so 256 clears anything real while
 /// keeping a request-controlled name from sizing a path segment or a map key.
-const MAX_PKG_NAME_BYTES: usize = 256;
+pub(crate) const MAX_PKG_NAME_BYTES: usize = 256;
 
 /// Longest artifact `filename` path segment the read path serves. Real wheel
 /// and sdist names run far under this; the cap keeps a request-controlled

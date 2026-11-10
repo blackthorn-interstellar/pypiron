@@ -134,7 +134,9 @@ synced to S3. Full procedure and conditional-write validation in
 | upload → visible *during* a running audit | **0.55 s** (steady) / **0.59 s** (cold) — event path never starved |
 
 The `rebuilt=0` steady audit and the per-object LIST cost both hold on the real
-thing. Scaling the measured LIST count linearly by object count lands at ~46k
+thing. (The ~293 figure predates a 2026-06-18 regression, fixed 2026-11-09,
+under which every shard listed its whole directory — about 36x the LISTs. It has
+not been re-measured since the fix.) Scaling the measured LIST count linearly by object count lands at ~46k
 LISTs ≈ **$0.23** for full PyPI — the projection above, now anchored to a
 measurement rather than arithmetic. Conditional writes (`If-None-Match` lease
 acquire, `If-Match` lease steal + global-index CAS conflict) were exercised on

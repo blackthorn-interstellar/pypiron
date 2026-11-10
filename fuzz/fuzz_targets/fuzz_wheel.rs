@@ -15,7 +15,9 @@ use std::io::Cursor;
 mod wheel;
 
 fuzz_target!(|data: &[u8]| {
-    let out = wheel::extract_metadata_from_reader(Cursor::new(data)).ok();
+    let out =
+        wheel::extract_metadata_from_reader(Cursor::new(data), Some("demo-1.0-py3-none-any.whl"))
+            .ok();
     // Whatever it returns, the 16 MiB size guard must hold.
     if let Some(md) = out {
         assert!(

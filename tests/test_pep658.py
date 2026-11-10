@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import hashlib
 import re
+import zipfile
 
 import pytest
 
@@ -108,3 +109,27 @@ def test_uv_resolves_without_downloading_the_wheel(metadata_server, tmp_path, uv
     # selects bare-wheel fetches only.
     wheel_fetches = re.findall(rf"path=/files/{re.escape(PACKAGE)}/{re.escape(wheel_name)} ", log)
     assert not wheel_fetches, "resolution must not download the wheel itself"
+
+
+def test_metadata_comes_from_the_dist_info_the_filename_names(disk_server, tmp_path):
+    """A wheel can carry more than one top-level `*.dist-info` (vendored, or a
+    decoy listed first). PEP 658 metadata must be the one for the distribution
+    the filename names, or uv/pip resolve against someone else's dependencies."""
+    wheel = tmp_path / "twodist-1.0-py3-none-any.whl"
+    own = "Metadata-Version: 2.1\nName: twodist\nVersion: 1.0\nRequires-Dist: six\n"
+    with zipfile.ZipFile(wheel, "w") as zf:
+        zf.writestr("aaa_decoy-9.9.dist-info/METADATA", "Metadata-Version: 2.1\nName: decoy\n")
+        zf.writestr("twodist/__init__.py", "")
+        zf.writestr("twodist-1.0.dist-info/METADATA", own)
+        zf.writestr("twodist-1.0.dist-info/WHEEL", "Wheel-Version: 1.0\nTag: py3-none-any\n")
+        zf.writestr("twodist-1.0.dist-info/RECORD", "")
+    upload_legacy(
+        disk_server["legacy"],
+        wheel,
+        username=disk_server["user"],
+        password=disk_server["password"],
+    )
+    wait_for_file_in_index(disk_server["simple"], "twodist", wheel.name)
+    code, body, _ = http_get(f"{disk_server['base_url']}/files/twodist/{wheel.name}.metadata")
+    assert code == 200, code
+    assert body.decode() == own

@@ -11,7 +11,9 @@
 //!
 //!   `extract_metadata_from_reader` returns exactly the bytes of the FIRST
 //!   member, in central-directory order, whose name ends in `.dist-info/METADATA`
-//!   with exactly one `/` — and nothing when there is no such member.
+//!   with exactly one `/` — and nothing when there is no such member — when it
+//!   is not told the wheel's filename (with one, the matching dist-info wins;
+//!   that preference is unit-tested in src/wheel.rs).
 //!
 //! A wheel that smuggles its payload into `evil/…dist-info/METADATA` or a second
 //! dist-info dir must not be able to get those bytes chosen.
@@ -80,7 +82,7 @@ fuzz_target!(|data: &[u8]| {
         .find(|(matches, _)| *matches)
         .map(|(_, content)| content.clone());
 
-    let got = wheel::extract_metadata_from_reader(Cursor::new(bytes)).ok();
+    let got = wheel::extract_metadata_from_reader(Cursor::new(bytes), None).ok();
     assert_eq!(
         got, expected,
         "wheel METADATA selection diverged from first-matching-member"

@@ -34,27 +34,58 @@ pub enum WheelError {
 
 /// Extract `METADATA` from a wheel on disk without loading the wheel into
 /// memory — zip needs only the central directory plus the one entry.
-pub fn extract_metadata_from_file(path: &Path) -> Result<Vec<u8>, WheelError> {
-    extract_metadata_from_reader(std::fs::File::open(path).map_err(|_| WheelError::Invalid)?)
+/// `filename` is the wheel's name, which says which dist-info is its own.
+pub fn extract_metadata_from_file(path: &Path, filename: &str) -> Result<Vec<u8>, WheelError> {
+    extract_metadata_from_reader(
+        std::fs::File::open(path).map_err(|_| WheelError::Invalid)?,
+        Some(filename),
+    )
 }
 
+/// The `METADATA` of the top-level `*.dist-info` whose name and version match
+/// the wheel `filename`'s, else of the first top-level `*.dist-info` in
+/// central-directory order (also the rule when `filename` is `None` or is not
+/// a wheel name). A wheel carrying a second dist-info — vendored, or a decoy
+/// listed first — still serves the metadata of the distribution it names.
 pub(crate) fn extract_metadata_from_reader<R: Read + Seek>(
     reader: R,
+    filename: Option<&str>,
 ) -> Result<Vec<u8>, WheelError> {
     let mut zip = ZipArchive::new(reader).map_err(|_| WheelError::Invalid)?;
     if zip.len() > MAX_WHEEL_ENTRIES {
         return Err(WheelError::TooLarge);
     }
-    let name = zip
-        .file_names()
-        .find_map(|name| match name {
-            Ok(n) if n.ends_with(".dist-info/METADATA") && n.matches('/').count() == 1 => {
-                Some(Ok(n.into_owned()))
+    let wanted = filename.and_then(wheel_name_version);
+    let mut first = None;
+    for name in zip.file_names() {
+        let Ok(n) = name else {
+            // An unreadable name: the first match stands if one came before
+            // it, as when the scan stopped there.
+            if first.is_some() {
+                break;
             }
-            Ok(_) => None,
-            Err(_) => Some(Err(WheelError::Invalid)),
-        })
-        .ok_or(WheelError::Invalid)??;
+            return Err(WheelError::Invalid);
+        };
+        let Some(dir) = n
+            .strip_suffix(".dist-info/METADATA")
+            .filter(|dir| !dir.contains('/'))
+        else {
+            continue;
+        };
+        let own = wanted.as_ref().is_some_and(|(want_name, want_version)| {
+            dir.rsplit_once('-').is_some_and(|(name, version)| {
+                canonical_name(name) == *want_name && version.eq_ignore_ascii_case(want_version)
+            })
+        });
+        if own || wanted.is_none() {
+            first = Some(n.into_owned());
+            break;
+        }
+        if first.is_none() {
+            first = Some(n.into_owned());
+        }
+    }
+    let name = first.ok_or(WheelError::Invalid)?;
     let entry = zip.by_name(&name).map_err(|_| WheelError::Invalid)?;
     if entry.size() > MAX_METADATA_BYTES {
         return Err(WheelError::TooLarge);
@@ -69,6 +100,20 @@ pub(crate) fn extract_metadata_from_reader<R: Read + Seek>(
         return Err(WheelError::TooLarge);
     }
     Ok(out)
+}
+
+/// A wheel filename's `(distribution, version)`, the distribution canonicalized
+/// for comparison with a dist-info directory's name.
+fn wheel_name_version(filename: &str) -> Option<(String, String)> {
+    let stem = filename.strip_suffix(".whl")?;
+    let mut parts = stem.split('-');
+    let (name, version) = (parts.next()?, parts.next()?);
+    (parts.count() >= 3).then(|| (canonical_name(name), version.to_string()))
+}
+
+/// Case-folded, with `-` and `.` read as the `_` wheel names escape them to.
+fn canonical_name(name: &str) -> String {
+    name.to_ascii_lowercase().replace(['-', '.'], "_")
 }
 
 #[cfg(test)]
@@ -94,7 +139,7 @@ mod tests {
         let md = b"Metadata-Version: 2.1\nName: demo\nVersion: 1.0\n";
         let wheel = fake_wheel(Some(md));
         assert_eq!(
-            extract_metadata_from_reader(Cursor::new(&wheel)).as_deref(),
+            extract_metadata_from_reader(Cursor::new(&wheel), None).as_deref(),
             Ok(md.as_slice())
         );
     }
@@ -117,11 +162,46 @@ mod tests {
                 zip.write_all(bytes).unwrap();
             }
             assert_eq!(
-                extract_metadata_from_reader(zip.finish().unwrap()),
+                extract_metadata_from_reader(zip.finish().unwrap(), None),
                 Ok(b"first".to_vec()),
                 "{method:?}"
             );
         }
+    }
+
+    /// With the filename known, the dist-info it names wins over one listed
+    /// first; with none matching, the first still does.
+    #[test]
+    fn the_filenames_own_dist_info_wins() {
+        let mut zip = zip::ZipWriter::new(Cursor::new(Vec::new()));
+        let opts = SimpleFileOptions::default().compression_method(zip::CompressionMethod::Stored);
+        for (name, bytes) in [
+            ("zzz-9.9.dist-info/METADATA", b"decoy".as_slice()),
+            ("Zope.Interface-6.0.dist-info/METADATA", b"own".as_slice()),
+        ] {
+            zip.start_file(name, opts).unwrap();
+            zip.write_all(bytes).unwrap();
+        }
+        let wheel = zip.finish().unwrap().into_inner();
+        let pick = |filename| extract_metadata_from_reader(Cursor::new(&wheel), filename);
+        assert_eq!(
+            pick(Some("zope_interface-6.0-py3-none-any.whl")),
+            Ok(b"own".to_vec())
+        );
+        assert_eq!(
+            pick(Some("other-1.0-py3-none-any.whl")),
+            Ok(b"decoy".to_vec())
+        );
+        assert_eq!(
+            pick(Some("zope_interface-6.1-py3-none-any.whl")),
+            Ok(b"decoy".to_vec())
+        );
+        assert_eq!(pick(None), Ok(b"decoy".to_vec()));
+        assert_eq!(
+            wheel_name_version("zope.interface-6.0-1-cp312-cp312-linux_x86_64.whl"),
+            Some(("zope_interface".into(), "6.0".into()))
+        );
+        assert_eq!(wheel_name_version("demo-1.0.tar.gz"), None);
     }
 
     #[test]
@@ -133,7 +213,7 @@ mod tests {
             .unwrap();
         wheel[offset] ^= 1;
         assert_eq!(
-            extract_metadata_from_reader(Cursor::new(wheel)),
+            extract_metadata_from_reader(Cursor::new(wheel), None),
             Err(WheelError::Invalid)
         );
     }
@@ -154,7 +234,7 @@ mod tests {
         }
         let wheel = zip.finish().unwrap().into_inner();
         assert_eq!(
-            extract_metadata_from_reader(Cursor::new(&wheel)),
+            extract_metadata_from_reader(Cursor::new(&wheel), None),
             Err(WheelError::TooLarge)
         );
     }
@@ -162,11 +242,11 @@ mod tests {
     #[test]
     fn missing_metadata_and_garbage_are_invalid() {
         assert_eq!(
-            extract_metadata_from_reader(Cursor::new(&fake_wheel(None))),
+            extract_metadata_from_reader(Cursor::new(&fake_wheel(None)), None),
             Err(WheelError::Invalid)
         );
         assert_eq!(
-            extract_metadata_from_reader(Cursor::new(b"not a zip" as &[u8])),
+            extract_metadata_from_reader(Cursor::new(b"not a zip" as &[u8]), None),
             Err(WheelError::Invalid)
         );
     }
@@ -180,12 +260,15 @@ mod tests {
         let path = dir.join("demo-1.0-py3-none-any.whl");
         std::fs::write(&path, &wheel).unwrap();
         assert_eq!(
-            extract_metadata_from_file(&path),
-            extract_metadata_from_reader(Cursor::new(&wheel)),
+            extract_metadata_from_file(&path, "demo-1.0-py3-none-any.whl"),
+            extract_metadata_from_reader(Cursor::new(&wheel), None),
             "spooled-file extraction must match in-memory extraction"
         );
         assert_eq!(
-            extract_metadata_from_file(Path::new("/nonexistent.whl")),
+            extract_metadata_from_file(
+                Path::new("/nonexistent.whl"),
+                "nonexistent-1.0-py3-none-any.whl"
+            ),
             Err(WheelError::Invalid)
         );
         let _ = std::fs::remove_dir_all(&dir);

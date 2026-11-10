@@ -360,13 +360,14 @@ pub(crate) async fn legacy_upload(
     let sha256 = spooled.sha256.clone();
     let wheel_parse = if is_wheel {
         let path = spooled.path.path().to_path_buf();
+        let wheel_name = filename.clone();
         // Bound how many central directories are resident at once (see
         // PARSE_SLOTS). Held across the parse, and taken here rather than
         // inside the closure so waiting parks the task instead of a blocking
         // thread. A closed semaphore is no reason to refuse a publish: degrade
         // to the old unbounded behaviour rather than fail the upload.
         let _permit = PARSE_SLOTS.acquire().await.ok();
-        tokio::task::spawn_blocking(move || wheel::extract_metadata_from_file(&path))
+        tokio::task::spawn_blocking(move || wheel::extract_metadata_from_file(&path, &wheel_name))
             .await
             .map_err(|_| {
                 (

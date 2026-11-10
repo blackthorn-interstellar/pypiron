@@ -257,7 +257,8 @@ to the network. Half-configured credentials refuse startup.
 Username tags are for attribution: `reader+billing-api` authenticates as
 `reader` and records `billing-api` in the access log and, with
 `--metrics-project-labels`, in `/metrics`. Tags are capped and restricted to
-`[A-Za-z0-9._-]`.
+`[A-Za-z0-9._-]`. When reads require a credential, `/metrics` counts a tag
+only on requests whose credential is accepted.
 
 `pypiron_storage_ops_total` reports backend reads, writes, lists, and deletes.
 With the advisory feed enabled, use

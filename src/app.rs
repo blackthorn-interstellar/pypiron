@@ -2495,10 +2495,14 @@ async fn track_metrics(
     }
     // Only read the project tag when labels are enabled; otherwise the
     // unauthenticated /metrics endpoint would expose internal project names.
+    // Where reads need a credential, only one that validates is attributed:
+    // routes that never check it (the favicon, an unknown path) would let any
+    // made-up tag fill the capped tag set. Public reads attribute any tag.
     let project = state
         .metrics_project_labels
         .then(|| project_tag(req.headers()))
-        .flatten();
+        .flatten()
+        .filter(|_| state.is_reader(req.headers()));
     let resp = next.run(req).await;
     let status = resp.status().as_u16();
     state.metrics.record_request(group, status);

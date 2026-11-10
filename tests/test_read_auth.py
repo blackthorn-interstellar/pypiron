@@ -112,3 +112,17 @@ def test_publish_then_install_flow_with_read_auth(disk_server_read_auth, tmp_pat
     code, body, _ = http_get(f"{server['base_url']}/files/authpkg/{wheel.name}", headers=auth)
     assert code == 200
     assert body == wheel.read_bytes()
+
+
+def test_unvalidated_credentials_are_never_attributed(disk_server_read_auth):
+    """Some routes answer without checking the credential (the favicon, an
+    unknown path). A tag sent there with a wrong password never validated, so
+    it must not take one of the capped project-tag slots in /metrics."""
+    server = disk_server_read_auth
+    base = server["base_url"]
+    for i, path in enumerate(("/favicon.ico", "/no-such-route")):
+        code, _, _ = http_get(f"{base}{path}", headers=_auth_header(f"x+bogus-tag-{i}", "wrong"))
+        assert code in (200, 404), path
+
+    _, body, _ = http_get(f"{base}/metrics")
+    assert "bogus-tag" not in body.decode()

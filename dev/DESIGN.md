@@ -439,6 +439,20 @@ behavior, not popularity. Index pages always embed the stable `/files/` URLs;
 anything else would bake expiring signatures into lockfiles and cached index
 pages.
 
+One client-side override: a `+delivery=stream` segment in the Basic-auth
+username (`ci+billing-api+delivery=stream`) streams that request in every
+mode, for clients on a network that reaches the node but not the bucket. The
+node cannot detect that case itself — the client retries the signed URL and
+never comes back — so the client has to say it. The username is the channel
+because it is the only one uv offers that reaches `/files/` and stays out of
+`uv.lock` (no custom headers, no User-Agent control; a different index URL
+or path is recorded in the lock and fails `--locked` for everyone else). uv
+carries it reliably only from `UV_INDEX_<NAME>_USERNAME`; a username embedded
+in the index URL is not sent on file requests unless the server challenges.
+Username grammar: `user[+project][+key=value]...` — `=` is outside the
+project-tag charset, so settings and tags cannot collide, and older servers
+authenticate the same `user` and simply ignore the rest.
+
 The redirect path does no artifact-existence check — presigning is local HMAC
 math. In single-bucket mode, the visibility hardening adds zero storage calls.
 In multi-bucket mode, the request first applies the same origin and visibility

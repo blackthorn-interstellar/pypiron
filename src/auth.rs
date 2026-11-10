@@ -146,21 +146,39 @@ pub(crate) fn basic_credentials(headers: &HeaderMap) -> Option<(String, String)>
     Some((u.to_string(), p.to_string()))
 }
 
-/// Project attribution tag from the Basic-auth username: the part after `+`
-/// (`ci+billing-api` → `billing-api`), or the whole username when untagged.
+/// Project attribution tag from the Basic-auth username. The username is
+/// `user[+project][+key=value]...`: the first `+` segment without an `=` is the
+/// tag (`ci+billing-api` → `billing-api`), and an untagged username is its own
+/// tag (`ci`, `ci+delivery=stream` → `ci`). Segments with an `=` are client
+/// settings (see [`client_wants_stream`]); `=` is outside the tag charset, so
+/// the two can never be confused.
 /// Deliberately works without any credential check — open servers still get
 /// attribution from whatever username the client volunteers. The value is
 /// client-supplied, so it is held to a label-safe charset and length; anything
 /// else is dropped rather than escaped.
 pub(crate) fn project_tag(headers: &HeaderMap) -> Option<String> {
     let (user, _) = basic_credentials(headers)?;
-    let tag = user.split_once('+').map_or(user.as_str(), |(_, t)| t);
+    let mut parts = user.split('+');
+    let base = parts.next().unwrap_or_default();
+    let tag = parts.find(|s| !s.contains('=')).unwrap_or(base);
     let ok = !tag.is_empty()
         && tag.len() <= 64
         && tag
             .bytes()
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'));
     ok.then(|| tag.to_string())
+}
+
+/// Did the client ask for artifact bytes from this server rather than a
+/// redirect to object storage? It says so with a `+delivery=stream` segment in
+/// its Basic-auth username (`ci+billing-api+delivery=stream`), which is the one
+/// channel an installer carries to every request without writing it into a
+/// lockfile. For clients on a network that reaches this server but not the
+/// bucket. Like the tag, it needs no credential check: streaming is what any
+/// client the server does not recognize gets anyway.
+pub(crate) fn client_wants_stream(headers: &HeaderMap) -> bool {
+    basic_credentials(headers)
+        .is_some_and(|(user, _)| user.split('+').skip(1).any(|s| s == "delivery=stream"))
 }
 
 /// Default `--login-cooldown-secs`: five minutes, the fail2ban/Grafana-order
@@ -875,9 +893,30 @@ mod tests {
         assert_eq!(project_tag(&HeaderMap::new()), None);
         assert_eq!(project_tag(&basic_headers("ci+", "tok")), None);
         assert_eq!(project_tag(&basic_headers("ci+bad\"label", "tok")), None);
+        // Settings segments are not tags, wherever they sit.
+        for (user, tag) in [
+            ("ci+billing-api+delivery=stream", "billing-api"),
+            ("ci+delivery=stream+billing-api", "billing-api"),
+            ("ci+delivery=stream", "ci"),
+        ] {
+            assert_eq!(project_tag(&basic_headers(user, "")).as_deref(), Some(tag));
+        }
         assert_eq!(
             project_tag(&basic_headers(&format!("ci+{}", "x".repeat(65)), "tok")),
             None
         );
+    }
+
+    #[test]
+    fn stream_request_is_a_username_setting() {
+        let wants = |u| client_wants_stream(&basic_headers(u, ""));
+        assert!(wants("ci+delivery=stream"));
+        assert!(wants("ci+billing-api+delivery=stream"));
+        assert!(wants("__token__+delivery=stream"));
+        // A project or a user that happens to be named like the setting is not one.
+        assert!(!wants("ci+stream"));
+        assert!(!wants("delivery=stream"));
+        assert!(!wants("ci+delivery=redirect"));
+        assert!(!client_wants_stream(&HeaderMap::new()));
     }
 }

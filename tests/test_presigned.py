@@ -9,9 +9,12 @@ under the stable /files/ URL with immutable cache headers.
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 from .helpers import (
+    _encode_basic_auth,
     download_pypi_wheel,
     http_get,
     http_get_bytes,
@@ -154,3 +157,58 @@ def test_auto_mode_dispatches_on_client(auto_server):
     code, body, _ = http_get_no_redirect(f"{url}.metadata", headers={"User-Agent": "uv/0.7.0"})
     assert code == 200
     assert body.startswith(b"Metadata-Version:")
+
+
+STREAM_ME = {"Authorization": _encode_basic_auth("ci+billing-api+delivery=stream", "")}
+
+
+@pytest.mark.parametrize("fixture", ["auto_server", "presigned_server"])
+def test_client_can_ask_to_be_streamed(fixture, request):
+    """A client that reaches the server but not the bucket asks for streamed
+    bytes in its username; it gets them in every delivery mode, while the same
+    client without the setting is still redirected."""
+    server = request.getfixturevalue(fixture)
+    url = f"{server['base_url']}/files/{PACKAGE}/{server['wheel_path'].name}"
+    uv = {"User-Agent": "uv/0.7.0"}
+
+    code, body, headers = http_get_no_redirect(url, headers={**uv, **STREAM_ME})
+    assert code == 200
+    assert headers["cache-control"] == IMMUTABLE
+    assert len(body) == server["wheel_path"].stat().st_size
+
+    code, _, _ = http_get_no_redirect(url, headers=uv)
+    assert code == 302
+
+
+def test_uv_streams_when_its_index_username_asks(presigned_server, uv_path, tmp_path):
+    """The real thing: uv carries the setting from an environment variable to
+    every request, wheel downloads included, and keeps it out of uv.lock — so
+    one machine opts in without touching the project it shares. Run against
+    `redirect` mode, where nothing else would ever stream."""
+    server = presigned_server
+    project = tmp_path / "proj"
+    project.mkdir()
+    (project / "pyproject.toml").write_text(
+        f"""[project]
+name = "proj"
+version = "0"
+requires-python = ">=3.9"
+dependencies = ["{PACKAGE}=={VERSION}"]
+
+[[tool.uv.index]]
+name = "corp"
+url = "{server["simple"]}"
+default = true
+"""
+    )
+    env = {**os.environ, "UV_INDEX_CORP_USERNAME": "ci+billing-api+delivery=stream"}
+    run_checked([uv_path, "sync", "--no-cache"], cwd=project, env=env, timeout=180)
+
+    wheel_gets = [
+        line
+        for line in server["log_path"].read_text().splitlines()
+        if "method=GET" in line and f"path=/files/{PACKAGE}/" in line and ".metadata" not in line
+    ]
+    assert wheel_gets, "uv must have downloaded the wheel from the node"
+    assert all("status=200" in line for line in wheel_gets), wheel_gets
+    assert "delivery" not in (project / "uv.lock").read_text()

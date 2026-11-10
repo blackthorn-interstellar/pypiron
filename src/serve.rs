@@ -1051,11 +1051,14 @@ pub(crate) async fn files_get(
     // caches survive URL churn (see ArtifactDelivery). Metadata companions
     // are tiny and resolution-critical, so they always stream. The redirect
     // itself must not be cached — the signature expires.
-    let redirect = match state.artifact_delivery {
-        ArtifactDelivery::Stream => false,
-        ArtifactDelivery::Redirect => true,
-        ArtifactDelivery::Auto => redirect_safe_client(&headers),
-    };
+    // A client that cannot reach the bucket says so in its username and is
+    // streamed in every mode: a redirect it cannot follow is a failed install.
+    let redirect = !crate::auth::client_wants_stream(&headers)
+        && match state.artifact_delivery {
+            ArtifactDelivery::Stream => false,
+            ArtifactDelivery::Redirect => true,
+            ArtifactDelivery::Auto => redirect_safe_client(&headers),
+        };
     if redirect && !filename.ends_with(METADATA_SUFFIX) && !filename.ends_with(PROVENANCE_SUFFIX) {
         // No artifact-existence check: presigning itself is local HMAC math.
         // Both modes have already paid for visibility above — multi-bucket on

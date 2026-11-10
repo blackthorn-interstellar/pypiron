@@ -222,7 +222,7 @@ backends are supported. With more than one bucket:
 | `--malware-probe-secs N` | `PYPIRON_MALWARE_PROBE_SECS` | `120` | Check OSV for new malware between daily snapshots. `0` disables. Requires malware blocking and the standard OSV `all.zip` feed. |
 | `--metrics-project-labels` | `PYPIRON_METRICS_PROJECT_LABELS` | `false` | Attach per-client `project` labels to `/metrics`. Off by default: `/metrics` is unauthenticated and the label derives from the username tag, so exposing it lets any scraper list internal project names. |
 | `--spool-dir PATH` | `PYPIRON_SPOOL_DIR` | system temp | Upload/proxy spool directory. Spool files a crash left behind are removed once they are a day old. A first proxy download that would leave less than 1 GiB free here (5% on a disk under 20 GiB), counting downloads already running, gets a `503` with `Retry-After`, which pip and uv retry. |
-| `--artifact-delivery auto\|redirect\|stream` | `PYPIRON_ARTIFACT_DELIVERY` | `auto` | Redirect object-store downloads for compatible clients or stream through the server. A first uncached proxy download may stream under `--proxy-stream-threshold`. |
+| `--artifact-delivery auto\|redirect\|stream` | `PYPIRON_ARTIFACT_DELIVERY` | `auto` | Redirect object-store downloads for compatible clients or stream through the server. A first uncached proxy download may stream under `--proxy-stream-threshold`. A client can [ask to be streamed](#clients-that-cannot-reach-the-bucket). |
 | `--wait-on-upload` | `PYPIRON_WAIT_ON_UPLOAD` | `false` | Wait for index visibility before upload returns. |
 | `--wait-on-upload-secs N` | `PYPIRON_WAIT_ON_UPLOAD_SECS` | `10` | Bound for that wait. |
 | `--max-concurrent-artifact-writes N` | `PYPIRON_MAX_CONCURRENT_ARTIFACT_WRITES` | `4` | Memory for object-store uploads in progress, in `64MiB` units. The default of `4` caps it at about `256MiB`: four `64MiB` files at once, or about 40 files of `6MiB`. Uploads beyond it wait their turn. Disk storage has no limit; `0` removes it. |
@@ -259,6 +259,27 @@ Username tags are for attribution: `reader+billing-api` authenticates as
 `--metrics-project-labels`, in `/metrics`. Tags are capped and restricted to
 `[A-Za-z0-9._-]`. When reads require a credential, `/metrics` counts a tag
 only on requests whose credential is accepted.
+
+### Clients that cannot reach the bucket
+
+With `auto` or `redirect` delivery, uv downloads wheels straight from object
+storage. A machine that can reach pypiron but not the bucket resolves
+dependencies and then fails on the first download. Set the index username on
+that machine to ask pypiron for the bytes instead:
+
+```sh
+export UV_INDEX_CORP_USERNAME="ci+delivery=stream"
+```
+
+`CORP` is the index's `name` in `pyproject.toml`, upper-cased. No password is
+needed on a server with open reads; on a gated one, add `+delivery=stream` to
+the username you already use. It combines with a project tag in either order:
+`ci+billing-api+delivery=stream`. Every other client keeps downloading from
+the bucket, and `uv.lock` is unchanged, so `uv sync --locked` works for
+everyone sharing it.
+
+Use the environment variable, not a username inside the index URL: uv does not
+send a URL's username on wheel downloads from a server with open reads.
 
 `pypiron_storage_ops_total` reports backend reads, writes, lists, and deletes.
 With the advisory feed enabled, use

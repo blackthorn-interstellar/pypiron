@@ -80,7 +80,7 @@ impl Reservation {
             return Ok(Self { remaining: 0 });
         };
         RESERVED
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |reserved| {
+            .try_update(Ordering::SeqCst, Ordering::SeqCst, |reserved| {
                 admits(free, total, reserved, need).then(|| reserved.saturating_add(need))
             })
             .map(|_| Self { remaining: need })

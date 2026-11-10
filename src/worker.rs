@@ -2188,6 +2188,9 @@ async fn audit_shard(
                         // commit them (an empty map = the package became
                         // dead). Even an uncertified pass's map is a real
                         // past state; the next pass commits the newer one.
+                        if collect_deltas {
+                            report_hash_changes(state, &pkg, &rebuilt);
+                        }
                         let delta = collect_deltas.then_some(rebuilt.file_shas);
                         match certify_audit_rebuild(storage, &pkg, &truth_fp, &rebuilt.views).await {
                             Some(new_fp) => {
@@ -2420,6 +2423,53 @@ pub fn fingerprint(truth: &[&ObjectMeta], views: &[&ObjectMeta]) -> String {
         hasher.update([0]);
     }
     format!("{:x}", hasher.finalize())
+}
+
+/// Files whose sha256 the old `index.json` named differently from `now`:
+/// `(filename, old, new)`. A file only one side lists is not a change.
+/// Unparsable old bytes name nothing.
+fn hash_changes(old_index_json: &[u8], now: &FileShas) -> Vec<(String, String, String)> {
+    #[derive(serde::Deserialize)]
+    struct Index {
+        files: Vec<File>,
+    }
+    #[derive(serde::Deserialize)]
+    struct File {
+        filename: String,
+        hashes: std::collections::HashMap<String, String>,
+    }
+    let Ok(old) = serde_json::from_slice::<Index>(old_index_json) else {
+        return Vec::new();
+    };
+    old.files
+        .into_iter()
+        .filter_map(|f| {
+            let was = f.hashes.get("sha256")?;
+            let is = now.get(&f.filename)?;
+            (was != is).then(|| (f.filename, was.clone(), is.clone()))
+        })
+        .collect()
+}
+
+/// An audit rebuild that had to change a file's sha256 in the index is
+/// re-committing that file under a hash no pypiron write rendered first: the
+/// write path re-renders the index itself, so a legitimate supersede reaches
+/// the audit with the index already current. Stays non-fatal (verify-chain's
+/// `fingerprint-changed` has the same shape as a supersede whose rebuild never
+/// ran), but says so loudly. Costs no I/O: the old index is the one the
+/// rebuild already read to skip an unchanged PUT.
+fn report_hash_changes(state: &AppState, pkg: &str, rebuilt: &RebuiltPackage) {
+    let Some(old) = rebuilt.replaced_json.as_deref() else {
+        return;
+    };
+    let changes = hash_changes(old, &rebuilt.file_shas);
+    for (file, was, is) in &changes {
+        error!(package=%pkg, file=%file, old_sha256=%was, new_sha256=%is, "audit: a stored file changed hash outside pypiron's write path; the transparency chain re-commits it under the new hash (run verify-chain)");
+    }
+    state
+        .metrics
+        .audit_hash_changes
+        .fetch_add(changes.len() as u64, std::sync::atomic::Ordering::Relaxed);
 }
 
 /// The fingerprint an audit rebuild may store for `pkg`, or `None` when the
@@ -2822,6 +2872,8 @@ pub(crate) struct RebuiltPackage {
     /// The package views this rebuild left: key → rendered bytes, empty when
     /// it removed them. The audit reads them back before trusting a listing.
     views: Vec<(String, Vec<u8>)>,
+    /// The `index.json` this rebuild overwrote, when it changed one.
+    replaced_json: Option<Vec<u8>>,
     /// Whether the status the views were rendered from blocks downloads. `None`
     /// when the package had nothing to render (all delisted, or no bytes at all),
     /// so no status was read.
@@ -2926,10 +2978,12 @@ async fn rebuild_package_indexes_inner(
     let live = !files.is_empty();
     let mut views = Vec::new();
     let mut quarantined = None;
+    let mut replaced_json = None;
     if live {
-        let (written, blocked) = write_pkg_indexes(state, storage, pkg, &files).await?;
+        let (written, blocked, replaced) = write_pkg_indexes(state, storage, pkg, &files).await?;
         views = written;
         quarantined = Some(blocked);
+        replaced_json = replaced;
     } else {
         let keys = [
             format!("{SIMPLE_PREFIX}{pkg}/index.html"),
@@ -2950,6 +3004,7 @@ async fn rebuild_package_indexes_inner(
         raw_artifacts: raw,
         file_shas: shas,
         views,
+        replaced_json,
         quarantined,
         newest,
     })
@@ -3148,7 +3203,8 @@ pub(crate) async fn write_enforced_excludes(
         bytes,
         "application/json",
     )
-    .await
+    .await?;
+    Ok(())
 }
 
 /// One package's contribution to the registry inventory: artifact files in
@@ -4548,21 +4604,22 @@ async fn backfill_sidecar(
 /// touch storage (or bump mtimes/ETags) when nothing changed. A real write
 /// invalidates the in-process index cache so same-node reads are fresh
 /// immediately (other nodes are bounded by the cache TTL).
+/// PUT `bytes` unless `key` already holds them. Returns the bytes it replaced,
+/// if any — the audit reads a package's old `index.json` from it for free.
 async fn put_if_changed(
     state: &AppState,
     storage: &dyn Storage,
     key: &str,
     bytes: Vec<u8>,
     ct: &str,
-) -> Result<()> {
-    if let Ok(current) = storage.get_bytes(key).await {
-        if current == bytes {
-            return Ok(());
-        }
+) -> Result<Option<Vec<u8>>> {
+    let previous = storage.get_bytes(key).await.ok();
+    if previous.as_deref() == Some(bytes.as_slice()) {
+        return Ok(None);
     }
     storage.put_bytes(key, bytes, Some(ct)).await?;
     state.index_cache.invalidate(key);
-    Ok(())
+    Ok(previous)
 }
 
 /// `files` minus the ones malware blocking refuses, or `None` when none is
@@ -4676,20 +4733,24 @@ async fn write_pkg_indexes(
     storage: &dyn Storage,
     pkg: &str,
     files: &[FileMetadata],
-) -> Result<(Vec<(String, Vec<u8>)>, bool)> {
+) -> Result<(Vec<(String, Vec<u8>)>, bool, Option<Vec<u8>>)> {
     let (html, json, blocks_downloads) = render_pkg_views(state, storage, pkg, files).await?;
     let base = format!("{SIMPLE_PREFIX}{pkg}/");
     let views = vec![
         (format!("{base}index.html"), html.into_bytes()),
         (format!("{base}index.json"), json.into_bytes()),
     ];
+    let mut replaced_json = None;
     for ((key, bytes), ct) in views
         .iter()
         .zip([SIMPLE_HTML_CONTENT_TYPE, SIMPLE_JSON_CONTENT_TYPE])
     {
-        put_if_changed(state, storage, key, bytes.clone(), ct).await?;
+        let replaced = put_if_changed(state, storage, key, bytes.clone(), ct).await?;
+        if ct == SIMPLE_JSON_CONTENT_TYPE {
+            replaced_json = replaced;
+        }
     }
-    Ok((views, blocks_downloads))
+    Ok((views, blocks_downloads, replaced_json))
 }
 
 /// A package's PEP 503 HTML and PEP 691 JSON pages, rendered from `files`
@@ -4771,6 +4832,25 @@ mod tests {
 
     fn raw(items: &[(&str, u64)]) -> Vec<(String, u64)> {
         items.iter().map(|(n, s)| (n.to_string(), *s)).collect()
+    }
+
+    /// Only a file both indexes list under different shas is a change: a new
+    /// file, a removed one, or an unreadable old index is not.
+    #[test]
+    fn hash_changes_names_only_files_whose_sha_moved() {
+        let old = br#"{"meta":{"api-version":"1.1"},"name":"demo","files":[
+            {"filename":"a.whl","hashes":{"sha256":"aaa"}},
+            {"filename":"b.whl","hashes":{"sha256":"bbb"}},
+            {"filename":"gone.whl","hashes":{"sha256":"ggg"}}]}"#;
+        let now: FileShas = [("a.whl", "aaa"), ("b.whl", "BBB"), ("new.whl", "nnn")]
+            .into_iter()
+            .map(|(f, s)| (f.to_string(), s.to_string()))
+            .collect();
+        assert_eq!(
+            hash_changes(old, &now),
+            vec![("b.whl".to_string(), "bbb".to_string(), "BBB".to_string())]
+        );
+        assert!(hash_changes(b"not json", &now).is_empty());
     }
 
     /// A minimal private/mirror sidecar for a seeded artifact — only the fields

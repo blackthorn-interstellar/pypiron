@@ -138,6 +138,12 @@ pub struct Metrics {
     /// blip; a value that climbs every audit means the chain has stopped
     /// advancing and some bucket needs looking at.
     pub chain_checkpoint_deferrals: AtomicU64,
+    /// Files the audit found under a new sha256 that no pypiron write had
+    /// rendered into the index first — an out-of-band rewrite of the bytes and
+    /// sidecar, or a write whose index rebuild never ran. The chain re-commits
+    /// them under the new hash (verify-chain reports `fingerprint-changed`), so
+    /// every increase deserves a look.
+    pub audit_hash_changes: AtomicU64,
     /// Unpaired intents consumed after the grace period: a writer dropped an
     /// intent and died before committing. A rising rate means writers crash.
     pub stale_intents_healed: AtomicU64,
@@ -511,6 +517,11 @@ impl Metrics {
                 "pypiron_chain_checkpoint_deferrals_total",
                 "Transparency checkpoints deferred to a later audit (chain not appended).",
                 &self.chain_checkpoint_deferrals,
+            ),
+            (
+                "pypiron_audit_hash_changes_total",
+                "Files the audit re-committed under a new sha256 no pypiron write rendered first.",
+                &self.audit_hash_changes,
             ),
             (
                 "pypiron_stale_intents_healed_total",

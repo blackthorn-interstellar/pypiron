@@ -427,6 +427,47 @@ def test_a_restarted_server_commits_a_checkpoint_its_predecessor_deferred(pypiro
     assert artifact.name in cp.stdout, cp.stdout
 
 
+def _metric(base_url: str, name: str) -> int:
+    code, body, _ = http_get(f"{base_url}/metrics")
+    assert code == 200, code
+    m = re.search(rf"^{name} (\d+)$", body.decode(), re.MULTILINE)
+    assert m, f"{name} missing from /metrics"
+    return int(m.group(1))
+
+
+def test_an_audit_that_recommits_a_rewritten_sha_says_so(pypiron_bin, tmp_path):
+    """A consistent out-of-band rewrite is `hash-changed` only until the next
+    audit re-commits the new sha; from then on the chain holds the benign-looking
+    `fingerprint-changed` shape. That audit must not do it quietly: it counts
+    `pypiron_audit_hash_changes_total`. An ordinary upload re-commits nothing
+    under a new sha and counts nothing."""
+    name = "pypiron_audit_hash_changes_total"
+    data_dir = tmp_path / "data"
+    data_dir.mkdir()
+    with _serve(pypiron_bin, data_dir, extra_args=["--reconcile-interval-secs", "2"]) as server:
+        wheel = make_wheel("transrecommita", "1.0.0", tmp_path)
+        _upload(server, wheel)
+        _wait_links(data_dir, at_least=1)
+        _upload(server, make_wheel("transrecommita", "1.0.1", tmp_path))
+        _wait_links(data_dir, at_least=2)
+        assert _metric(server["base_url"], name) == 0, "an upload is not a hash change"
+
+        artifact, sidecar = _artifact_and_sidecar_named(data_dir, wheel.name)
+        rewritten = artifact.read_bytes() + b"rewritten-out-of-band"
+        artifact.write_bytes(rewritten)
+        meta = json.loads(sidecar.read_text())
+        meta["sha256"] = sha256_file(artifact)
+        meta["size"] = len(rewritten)
+        sidecar.write_text(json.dumps(meta))
+        _wait_links(data_dir, at_least=3)
+        assert _metric(server["base_url"], name) == 1
+
+
+def _artifact_and_sidecar_named(data_dir: Path, filename: str) -> tuple[Path, Path]:
+    artifact = data_dir / "packages" / filename.split("-")[0].lower() / filename
+    return artifact, artifact.with_name(f"{filename}.meta.json")
+
+
 def test_transparency_false_writes_no_links(pypiron_bin, tmp_path):
     """`--transparency false` stops the audit writing links; the namespace stays
     empty even after churn and repeated sweeps."""

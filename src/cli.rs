@@ -89,10 +89,14 @@ pub enum Commands {
     ///
     /// Run on a server node against the same storage backend `serve` uses (it
     /// reads the `[serve]` storage config from --config / pypiron.toml). Catches
-    /// the one attack every other check misses: an attacker with your storage
-    /// credentials rewriting an artifact and its recorded sha256 together. Files
-    /// present in storage but not yet committed to the chain are fine — the
-    /// chain lags truth by at most one audit.
+    /// an attacker with your storage credentials rewriting an artifact and its
+    /// recorded sha256 together — as `hash-changed` (fatal) until the next
+    /// audit, which re-commits the new sha; after that it is a
+    /// `fingerprint-changed` finding (non-fatal unless --strict), the same shape
+    /// as a legitimate supersede, and the audit logs an error and counts
+    /// `pypiron_audit_hash_changes_total` as it re-commits. Files present in
+    /// storage but not yet committed to the chain are fine — the chain lags
+    /// truth by at most one audit.
     VerifyChain(Box<transparency::VerifyChainArgs>),
     /// Probe a running server's `/health` and exit 0 (healthy) or 1
     /// (unreachable / unhealthy).

@@ -514,7 +514,10 @@ not complete, so no clean verdict is reported.
 `verify-chain` checks the `_transparency/` records against storage. Changed or
 missing content exits `1`. A filename recorded under two hashes is reported as
 `fingerprint-changed` but is non-fatal because a deliberate public-to-private
-replacement has the same shape. `--strict` makes it fatal. Preventing rollback
+replacement has the same shape. `--strict` makes it fatal. A file rewritten
+directly in storage shows as changed only until the server's next audit records
+the new hash; that audit logs an error and counts
+`pypiron_audit_hash_changes_total`, so alert on any increase. Preventing rollback
 of the log itself requires Object Lock in COMPLIANCE mode.
 
 `buckets migrate` refuses to drop the only copy of a file or run while repairs

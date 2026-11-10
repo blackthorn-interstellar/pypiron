@@ -209,7 +209,18 @@ storage is. In-bucket and unsigned, it catches the *naive* content-rewrite — a
 attacker who rewrites an artifact's bytes and its sidecar sha but leaves the
 sealed checkpoint alone is caught by the replay-vs-storage diff (`hash-changed`),
 because the historical checkpoint still commits the original hash and cannot be
-*consistently* rewritten without breaking a link below it.
+*consistently* rewritten without breaking a link below it — **but only until the
+next audit**. The chain commits what the audit observes: the rewrite changed the
+package's listing, so the server's own next audit rebuilds it and re-commits the
+filename under the new sha, and from then on the tamper reads exactly like the
+forged append below. That audit does flag it as it goes: when the index it is
+replacing named a different sha for the file — no pypiron write rendered the
+change first, as a legitimate supersede's own rebuild does — it logs at error and
+counts `pypiron_audit_hash_changes_total`. Alert on that counter. It costs no
+I/O (the old index is the one the rebuild already reads to skip an unchanged
+PUT), and an attacker who also rewrites the index views evades it, which is why
+verify-chain stays the authority. Files the `--exclude-package` denylist delists
+are not committed at all: the chain covers what the index lists.
 
 What it does **not** auto-defeat is a forged *append*. An attacker holding
 storage credentials can add a new link that re-commits an already-committed

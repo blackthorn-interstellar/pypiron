@@ -1762,8 +1762,14 @@ impl Proxy {
             }
         };
         // No listing-supplied digest exists for provenance (PEP 740), so it stays
-        // trust-on-fetch; the SSRF guard above is what bounds where it came from.
-        read_capped(resp, crate::wheel::MAX_METADATA_BYTES, url.as_str()).await
+        // trust-on-fetch; the SSRF guard above bounds where it came from, and
+        // the shape check keeps another service's response from passing as it.
+        let body = read_capped(resp, crate::wheel::MAX_METADATA_BYTES, url.as_str()).await?;
+        if !crate::provenance::is_provenance(&body) {
+            warn!(%url, "proxy: upstream provenance is not a PEP 740 object; refusing");
+            return None;
+        }
+        Some(body)
     }
 
     /// The filtered upstream listing for `pkg`, served from cache within

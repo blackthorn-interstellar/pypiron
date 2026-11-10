@@ -23,6 +23,7 @@ import http.server
 import json
 import threading
 from typing import Dict, Iterator, Tuple
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -83,6 +84,11 @@ class _IndexHandler(http.server.BaseHTTPRequestHandler):
             for info in registry.values():
                 if info.get("metadata") and path == info["metadata_path"]:
                     self._send_bytes(info["metadata"], "text/plain; charset=utf-8")
+                    return
+        if path.endswith(".provenance"):
+            for info in registry.values():
+                if info.get("provenance_body") and path == info["provenance_path"]:
+                    self._send_bytes(info["provenance_body"], "application/json")
                     return
 
         self.send_error(404)
@@ -172,6 +178,17 @@ class _Servers:
         }
         return wheel.name
 
+    def register_provenance(self, pkg: str, wheel, provenance_url: str, body=None) -> str:
+        """A benign listing whose provenance URL is `provenance_url`; when
+        `body` is given, the upstream serves it at that path."""
+        name = self.register_good(pkg, wheel)
+        info = self.index.registry[pkg]  # type: ignore[attr-defined]
+        info["provenance"] = provenance_url
+        info["provenance_path"] = urlsplit(provenance_url).path
+        if body is not None:
+            info["provenance_body"] = body
+        return name
+
     def register_hash_mismatch(self, pkg: str, wheel) -> str:
         """Benign host, but the listing's core-metadata digest does not match the
         bytes served — the hash-gate must refuse it."""
@@ -253,3 +270,34 @@ def test_metadata_hash_mismatch_is_refused(ssrf_proxy, tmp_path):
     code, body, _ = http_get(f"{proxy['base_url']}/files/mismatchpkg/{name}.metadata")
     assert code == 404, f"a mismatched core-metadata digest must be refused (got {code})"
     assert b"Metadata-Version" not in body
+
+
+def test_provenance_from_another_port_on_the_upstream_host_is_not_relayed(ssrf_proxy, tmp_path):
+    """The upstream host is trusted by name, on every port, so a listing can
+    point a provenance URL at another service on that host (here the sink,
+    reached as `localhost`). Its response is not provenance and must never be
+    served back as this file's `.provenance`."""
+    proxy, servers = ssrf_proxy
+    sink_port = servers.sink_base.rsplit(":", 1)[1]
+    wheel = make_wheel("portpkg", "1.0", tmp_path)
+    name = servers.register_provenance(
+        "portpkg", wheel, f"http://localhost:{sink_port}/internal/{wheel.name}.provenance"
+    )
+    code, body, _ = http_get(f"{proxy['base_url']}/files/portpkg/{name}.provenance")
+    assert code == 404, f"a non-provenance body was relayed (got {code})"
+    assert SINK_SECRET not in body
+
+
+def test_real_provenance_from_the_upstream_is_relayed(ssrf_proxy, tmp_path):
+    proxy, servers = ssrf_proxy
+    wheel = make_wheel("provpkg", "1.0", tmp_path)
+    prov = json.dumps({"version": 1, "attestation_bundles": []}).encode()
+    name = servers.register_provenance(
+        "provpkg",
+        wheel,
+        f"{servers.index_base}/simple/provpkg/{wheel.name}.provenance",
+        body=prov,
+    )
+    code, body, _ = http_get(f"{proxy['base_url']}/files/provpkg/{name}.provenance")
+    assert code == 200, code
+    assert json.loads(body) == json.loads(prov)

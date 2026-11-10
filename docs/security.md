@@ -135,7 +135,10 @@ pypiron verifies each upstream file against the SHA-256 hash in the upstream
 index. A truncated, corrupt, or mismatched response fails and leaves no usable
 cache entry. Listing-provided artifact, metadata, provenance, and redirect URLs
 are also blocked from private, loopback, link-local, and cloud-metadata
-addresses unless you explicitly allow a host or network.
+addresses unless you explicitly allow a host or network. The configured
+upstream host is trusted on every port, so keep other internal services off
+that host or behind their own authentication. A fetched provenance file that
+isn't a PEP 740 provenance object is discarded.
 
 A corporate forward proxy changes where hostname filtering happens: pypiron
 still blocks literal private IP addresses, while the proxy's egress policy must

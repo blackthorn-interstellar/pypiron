@@ -86,6 +86,17 @@ pub async fn parse_offloaded(bytes: Vec<u8>, artifact_sha256: String) -> Option<
         .flatten()
 }
 
+/// Is this body shaped like a PEP 740 provenance object — JSON with an
+/// `attestation_bundles` array? Checked before a fetched companion is stored
+/// or relayed: the URL comes from the upstream listing, and the upstream host
+/// is trusted on every port, so without it a listing could point the URL at
+/// another service on that host and have its response served back as this
+/// file's provenance.
+pub fn is_provenance(bytes: &[u8]) -> bool {
+    serde_json::from_slice::<Value>(bytes)
+        .is_ok_and(|v| v.get("attestation_bundles").is_some_and(Value::is_array))
+}
+
 /// Parse provenance JSON bytes, returning the first bundle's publisher if one
 /// with a non-empty `kind` is present.
 pub fn parse_publisher(bytes: &[u8]) -> Option<Publisher> {
@@ -175,6 +186,15 @@ fn get_str(v: &Value, key: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_provenance_object_counts_as_one() {
+        assert!(is_provenance(br#"{"version":1,"attestation_bundles":[]}"#));
+        assert!(!is_provenance(br#"{"cluster_name":"internal"}"#));
+        assert!(!is_provenance(br#"{"attestation_bundles":"x"}"#));
+        assert!(!is_provenance(b"ami-id\nhostname\n"));
+        assert!(!is_provenance(b""));
+    }
 
     #[test]
     fn parses_github_style_publisher() {

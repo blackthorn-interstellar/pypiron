@@ -3336,6 +3336,12 @@ async fn download_provenance(
         }
         buf.extend_from_slice(&chunk);
     }
+    // The URL comes from the source listing; only relay what is shaped like
+    // provenance (see `provenance::is_provenance`).
+    if !crate::provenance::is_provenance(&buf) {
+        warn!(%url, "sync: provenance is not a PEP 740 object; skipping");
+        return None;
+    }
     Some(buf)
 }
 

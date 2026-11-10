@@ -685,6 +685,7 @@ pub async fn run_worker_until(
         crate::advisories::ProbeMemo::default(),
     ));
     let probe_running = Arc::new(AtomicBool::new(false));
+    let mut block_memo = BlockMemo::default();
     let mut last_reconcile: Option<Instant> = if state.audit_on_boot {
         None
     } else {
@@ -887,6 +888,21 @@ pub async fn run_worker_until(
                     });
                 }
             }
+        }
+
+        // Malware listing scrub upkeep (leader): re-render listings whose block
+        // rules changed. Skipped entirely when blocking is off (nothing scrubs).
+        if is_leader && state.malware_block {
+            tokio::select! {
+                result = dirty_changed_block_names(&state, selected.storage.as_ref(), &mut block_memo) => {
+                    if let Err(e) = result {
+                        warn!(error = ?e, "malware listing scrub: marking changed packages failed; will retry");
+                    }
+                }
+                _ = wait_until_generation_changes(&state, selected.generation) => {}
+            }
+        } else {
+            block_memo = BlockMemo::default();
         }
 
         // Replication is correctness work, not selected-bucket leader work.
@@ -4549,8 +4565,30 @@ async fn put_if_changed(
     Ok(())
 }
 
+/// `files` minus the ones malware blocking refuses, or `None` when none is
+/// blocked. Pure, and shared with `verify` so the oracle renders exactly what
+/// the worker does. The predicate is the byte gate's own block set (baseline ∪
+/// probe overlay, or the embedded floor before a live snapshot), so a listing
+/// hides a file exactly when its download would 403.
+pub(crate) fn scrub_blocked_files(
+    snap: &crate::advisories::AdvisoryState,
+    pkg: &str,
+    files: &[FileMetadata],
+) -> Option<Vec<FileMetadata>> {
+    if !files.iter().any(|f| snap.blocks_file(pkg, &f.filename)) {
+        return None;
+    }
+    Some(
+        files
+            .iter()
+            .filter(|f| !snap.blocks_file(pkg, &f.filename))
+            .cloned()
+            .collect(),
+    )
+}
+
 /// The renderable files with MAL-blocked ones removed, or `None` when no scrub
-/// applies — blocking disarmed/unfed, no file blocked, or a package that isn't
+/// applies — blocking off, no file blocked, or a package that isn't
 /// mirror-origin (a private package sharing a MAL name keeps listing, and the
 /// byte gate is the guarantee either way). The origin read is paid only on a
 /// blocked-file hit; the common package is a pure hash probe. Fail-open on the
@@ -4565,25 +4603,72 @@ async fn malware_scrubbed_files(
     if !state.malware_block {
         return None;
     }
-    let snap = state.advisory_snapshot();
-    let db = snap.db.as_ref()?;
-    let is_blocked = |file: &FileMetadata| {
-        let version = infer_version_from_filename(&file.filename);
-        !crate::advisories::blocking_advisories(db, pkg, version.as_deref()).is_empty()
-    };
-    if !files.iter().any(&is_blocked) {
-        return None; // common path: no hit, no origin read
-    }
+    let scrubbed = scrub_blocked_files(&state.advisory_snapshot(), pkg, files)?;
     match crate::origin::read_origin_claim(storage, pkg).await {
-        Ok(Some(crate::origin::OriginState::Mirror)) => Some(
-            files
-                .iter()
-                .filter(|file| !is_blocked(file))
-                .cloned()
-                .collect(),
-        ),
+        Ok(Some(crate::origin::OriginState::Mirror)) => Some(scrubbed),
         _ => None,
     }
+}
+
+/// What the stored listings were last scrubbed against, for the leader's
+/// change detection. Holds the snapshot itself, so pointer identity can't be
+/// fooled by a freed-and-reused allocation; reset when this node stops leading
+/// so a follower never pins an old snapshot in memory.
+#[derive(Default)]
+pub(crate) struct BlockMemo {
+    seen: Option<Arc<crate::advisories::AdvisoryState>>,
+}
+
+/// Leader upkeep for the malware listing scrub: when the effective block set
+/// changes (a new snapshot, a probe overlay, the floor at boot), mark dirty
+/// every hosted package whose block rules changed, so its listing re-renders
+/// against the set the byte gate now enforces. Stored views are not keyed by
+/// the block set, so nothing else would re-render them. The unchanged case is a
+/// lock read and two pointer compares; a change costs one diff of the block
+/// map and a marker per affected hosted package (usually none).
+async fn dirty_changed_block_names(
+    state: &AppState,
+    storage: &dyn Storage,
+    memo: &mut BlockMemo,
+) -> Result<()> {
+    let snap = state.advisory_snapshot();
+    if let Some(seen) = &memo.seen {
+        let same_db = match (&seen.db, &snap.db) {
+            (Some(a), Some(b)) => Arc::ptr_eq(a, b),
+            (None, None) => true,
+            _ => false,
+        };
+        if same_db && Arc::ptr_eq(&seen.overlay, &snap.overlay) {
+            return Ok(());
+        }
+    }
+    let changed = snap.block_names_changed_since(memo.seen.as_deref());
+    if !changed.is_empty() {
+        let hosted: Vec<String> = {
+            let mut guard = state.global_names.lock().await;
+            if guard.is_none() {
+                *guard = Some(load_global_names(storage).await?);
+            }
+            let names = guard.as_ref().map(|g| &g.names);
+            changed
+                .into_iter()
+                .filter(|name| names.is_some_and(|n| n.contains(name)))
+                .collect()
+        };
+        for pkg in &hosted {
+            crate::markers::mark_dirty(storage, pkg)
+                .await
+                .with_context(|| format!("marking {pkg} dirty for a malware block change"))?;
+        }
+        if !hosted.is_empty() {
+            info!(
+                packages = hosted.len(),
+                "malware block set changed; re-rendering the affected listings"
+            );
+        }
+    }
+    memo.seen = Some(snap);
+    Ok(())
 }
 
 async fn write_pkg_indexes(

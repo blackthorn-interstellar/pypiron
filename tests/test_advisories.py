@@ -824,6 +824,72 @@ def test_ac4_materialized_listing_scrubs_blocked_file(
         )
 
 
+def test_block_set_change_rescrubs_listing_and_offline_tools_agree(
+    tmp_path_factory, pypiron_bin, tmp_path
+):
+    """A listing rendered before OSV named a version is re-rendered without it
+    once the block set changes — nothing about the package's own files moved, so
+    only the block-set change can trigger that. `verify-index` then agrees with
+    the scrubbed view, and `rebuild-index` keeps the file hidden instead of
+    relisting it from truth."""
+    first = {k: v for k, v in canonical_records().items() if k != MAL_EXACT_ID}
+    feed = make_osv_zip(tmp_path / "osv.zip", first)
+    bad = make_wheel(MAL_EXACT_PKG, MAL_EXACT_VERSION, tmp_path)
+    clean = make_wheel(MAL_EXACT_PKG, "1.4.0", tmp_path)
+    with advisory_server(tmp_path_factory, pypiron_bin, feed) as server:
+        for dist in (bad, clean):
+            _mirror_upload(server, dist)
+        wait_for_file_in_index(server["simple"], MAL_EXACT_PKG, bad.name)
+        wait_for_file_in_index(server["simple"], MAL_EXACT_PKG, clean.name)
+
+        full = make_osv_zip(tmp_path / "full.zip", canonical_records()).read_bytes()
+        code, _, _ = http_request_auth(
+            "PUT",
+            f"{server['base_url']}/advisories/feed",
+            username="admin",
+            password="secret",
+            data=full,
+        )
+        assert code == 204
+        deadline = time.time() + 20
+        names: set = set()
+        while time.time() < deadline:
+            names = {
+                f["filename"] for f in get_index_json(server["simple"], MAL_EXACT_PKG)["files"]
+            }
+            if bad.name not in names:
+                break
+            time.sleep(0.2)
+        assert bad.name not in names, "the newly blocked file is still listed"
+        assert clean.name in names
+        data_dir = Path(server["data_dir"])
+
+    # The maintenance commands run with the defaults (blocking on), as an
+    # operator's shell would, and read the stored snapshot.
+    env = {k: v for k, v in os.environ.items() if not k.startswith("PYPIRON_")}
+
+    def run(*cmd):
+        return subprocess.run(
+            [str(pypiron_bin), *cmd, "--data-dir", str(data_dir)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            cwd=str(data_dir),
+        )
+
+    cp = run("verify-index")
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    cp = run("rebuild-index")
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+    stored = json.loads((data_dir / "simple" / MAL_EXACT_PKG / "index.json").read_text())
+    names = {f["filename"] for f in stored["files"]}
+    assert bad.name not in names, "rebuild-index relisted a blocked file"
+    assert clean.name in names
+    cp = run("verify-index")
+    assert cp.returncode == 0, cp.stdout + cp.stderr
+
+
 def test_ac4_proxy_listing_scrubs_blocked_file(
     tmp_path_factory, pypiron_bin, tmp_path, uv_path, uv_venv
 ):

@@ -15,7 +15,9 @@ tools with no security plugin of their own.
 pypiron checks public packages against the OSV PyPI advisory feed before it
 serves or caches them. A file marked by an OSV `MAL-*` advisory is refused, and
 the response names the advisory. A cached file that becomes known malware
-stops downloading even when an old lockfile asks for its direct URL.
+stops downloading even when an old lockfile asks for its direct URL. Blocked
+versions also disappear from the package's listing, so installers resolve the
+previous release instead of failing.
 
 The binary includes a block set for first boot. pypiron refreshes the full OSV
 snapshot daily, and each node checks for new malware advisories every two

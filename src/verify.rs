@@ -25,6 +25,7 @@ use std::collections::BTreeMap;
 use anyhow::Result;
 use clap::Args as ClapArgs;
 
+use crate::advisories::AdvisoryState;
 use crate::app::{DIRTY_PREFIX, PACKAGES_PREFIX, SIMPLE_PREFIX};
 use crate::denylist::Denylist;
 use crate::names::normalize_pkg_name;
@@ -84,10 +85,14 @@ pub struct VerifyReport {
 /// The truth counts come back with the diff because enumerating `packages/` is
 /// the expensive part on a real mirror — a caller that wants totals must not
 /// pay for a second listing pass.
+///
+/// `blocks` is the malware block set the server scrubs listings with (`None`
+/// when blocking is off), so a correctly scrubbed view is not reported stale.
 pub async fn verify_storage(
     storage: &dyn Storage,
     deep: bool,
     denylist: &Denylist,
+    blocks: Option<&AdvisoryState>,
 ) -> Result<VerifyReport> {
     let truth = enumerate_grouped(storage, PACKAGES_PREFIX).await?;
     let views = enumerate_grouped(storage, SIMPLE_PREFIX).await?;
@@ -101,7 +106,7 @@ pub async fn verify_storage(
     for chunk in packages.chunks(PACKAGE_CONCURRENCY) {
         let checks = chunk
             .iter()
-            .map(|(pkg, objects)| check_package(storage, pkg, objects, deep, denylist));
+            .map(|(pkg, objects)| check_package(storage, pkg, objects, deep, denylist, blocks));
         for result in futures::future::join_all(checks).await {
             let (pkg, has_artifacts, mut divs) = result?;
             if has_artifacts {
@@ -137,10 +142,19 @@ pub async fn verify_storage(
 /// denylist, used only when the store carries no enforced-excludes stamp yet; the
 /// stamp (what `serve` last enforced, via any channel) is the authority so the
 /// oracle models the same delisting the running server applied.
-pub async fn run_verify(args: VerifyArgs, fallback: &Denylist) -> Result<bool> {
+pub async fn run_verify(
+    args: VerifyArgs,
+    fallback: &Denylist,
+    malware_block: bool,
+) -> Result<bool> {
     args.storage.require_existing_disk_root()?;
     let storage = args.storage.build().await?;
     let denylist = crate::worker::enforced_denylist(storage.as_ref(), fallback).await?;
+    let blocks = if malware_block {
+        Some(crate::advisories::load_for_maintenance(storage.as_ref()).await?)
+    } else {
+        None
+    };
 
     let pending = storage.list_dir_entries(DIRTY_PREFIX).await?;
     if !pending.is_empty() {
@@ -153,7 +167,7 @@ pub async fn run_verify(args: VerifyArgs, fallback: &Denylist) -> Result<bool> {
     // One pass: the diff counts the truth it already enumerated, so the summary
     // totals cost nothing extra and no second copy of the truth map (a full
     // mirror is ~10^6 objects) is ever alive.
-    let report = verify_storage(storage.as_ref(), args.deep, &denylist).await?;
+    let report = verify_storage(storage.as_ref(), args.deep, &denylist, blocks.as_ref()).await?;
 
     for d in &report.divergences {
         println!("{}\t{}\t{}", d.kind, d.package, d.detail);
@@ -219,6 +233,7 @@ async fn check_package(
     objects: &[ObjectMeta],
     deep: bool,
     denylist: &Denylist,
+    blocks: Option<&AdvisoryState>,
 ) -> Result<(String, bool, Vec<Divergence>)> {
     let mut divs = Vec::new();
     let prefix = format!("{PACKAGES_PREFIX}{pkg}/");
@@ -386,10 +401,15 @@ async fn check_package(
         // per-project status, same quarantine link-omission — otherwise every
         // status-bearing package would read as a spurious stale-view.
         let status = crate::status::read_status(storage, pkg).await?;
+        // ...and the same malware scrub, for mirror-origin packages only.
+        let scrubbed = blocks
+            .filter(|_| pkg_origin == Some(OriginState::Mirror))
+            .and_then(|snap| crate::worker::scrub_blocked_files(snap, pkg, &files));
+        let files = scrubbed.as_deref().unwrap_or(&files);
         let render_files: &[FileMetadata] = if status.status.blocks_downloads() {
             &[]
         } else {
-            &files
+            files
         };
         for (suffix, expected) in [
             (
@@ -637,7 +657,7 @@ mod tests {
         crate::worker::rebuild_package_excluding(&state, bucket.as_ref(), "demo", None)
             .await
             .unwrap();
-        let report = verify_storage(bucket.as_ref(), true, &Denylist::default())
+        let report = verify_storage(bucket.as_ref(), true, &Denylist::default(), None)
             .await
             .unwrap();
         let view_divergences: Vec<&str> = report
@@ -680,7 +700,7 @@ mod tests {
         );
         write(&storage, "simple/ghost/index.json", b"{}".to_vec());
         let bucket: Arc<dyn Storage> = storage.clone();
-        let report = verify_storage(bucket.as_ref(), true, &Denylist::default())
+        let report = verify_storage(bucket.as_ref(), true, &Denylist::default(), None)
             .await
             .unwrap();
         assert!(
@@ -718,7 +738,7 @@ mod tests {
         // Same length, different bytes: only the re-hash can see it, which is
         // the whole argument for `--deep` existing at all.
         let swapped: Arc<dyn Storage> = store(b"BODY");
-        let shallow = verify_storage(swapped.as_ref(), false, &Denylist::default())
+        let shallow = verify_storage(swapped.as_ref(), false, &Denylist::default(), None)
             .await
             .unwrap();
         assert!(
@@ -726,7 +746,7 @@ mod tests {
             "the default pass must not read bodies: {:?}",
             kinds(&shallow)
         );
-        let deep = verify_storage(swapped.as_ref(), true, &Denylist::default())
+        let deep = verify_storage(swapped.as_ref(), true, &Denylist::default(), None)
             .await
             .unwrap();
         assert!(
@@ -738,7 +758,7 @@ mod tests {
         // Different length: the listing already told us, so no read is needed
         // and no flag either.
         let truncated: Arc<dyn Storage> = store(b"bod");
-        let report = verify_storage(truncated.as_ref(), false, &Denylist::default())
+        let report = verify_storage(truncated.as_ref(), false, &Denylist::default(), None)
             .await
             .unwrap();
         assert!(
@@ -748,7 +768,7 @@ mod tests {
         );
         // ...and having caught it, `--deep` does not also spend a read to say
         // the same thing twice.
-        let report = verify_storage(truncated.as_ref(), true, &Denylist::default())
+        let report = verify_storage(truncated.as_ref(), true, &Denylist::default(), None)
             .await
             .unwrap();
         assert!(

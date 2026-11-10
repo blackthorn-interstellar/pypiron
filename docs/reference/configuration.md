@@ -501,7 +501,10 @@ set a new `--token-signing-key` on every server.
 | `pypiron origin release PACKAGE` | Release an empty package name for deliberate private/public repurposing — the only way to flip a mirror-owned name to private; there is no in-place reclaim. Every configured bucket must be reachable and empty for that package. Safe to run again: it releases only buckets still claimed, and succeeds when all are already released. |
 
 Maintenance commands use the same storage flags and `[serve]` configuration as
-the server.
+the server. Like the server, `verify-index` and `rebuild-index` hide malware-blocked
+public files from listings, using the stored advisory snapshot; they read
+`--malware-block` and `--advisory-feed` from `PYPIRON_MALWARE_BLOCK`,
+`PYPIRON_ADVISORY_FEED`, or `[serve]`.
 
 `verify-index` compares indexes with stored files and checks recorded sizes.
 `--deep` also hashes every artifact, which reads the full corpus. A clean check

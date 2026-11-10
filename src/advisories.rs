@@ -308,6 +308,51 @@ impl AdvisoryState {
         ids
     }
 
+    /// Whether malware blocking refuses `filename` of `name_norm` — the same
+    /// baseline ∪ probe-overlay set [`Self::blocking`] reads, without the id
+    /// list. The listing scrub's predicate, so a hidden file is exactly one the
+    /// byte gate would refuse.
+    pub fn blocks_file(&self, name_norm: &str, filename: &str) -> bool {
+        let version = crate::names::infer_version_from_filename(filename);
+        let version = version.as_deref();
+        self.db
+            .as_ref()
+            .is_some_and(|db| !blocking_advisories(db, name_norm, version).is_empty())
+            || !block_hits(&self.overlay, name_norm, version).is_empty()
+    }
+
+    /// The names whose effective block rules (baseline then overlay) differ
+    /// between `old` and `self`: the packages whose scrubbed listing may change.
+    /// `old = None` is "nothing rendered against yet", so every blocked name.
+    pub fn block_names_changed_since(&self, old: Option<&AdvisoryState>) -> Vec<String> {
+        let rules = |state: Option<&AdvisoryState>, name: &str| -> Vec<MalRule> {
+            let Some(state) = state else {
+                return Vec::new();
+            };
+            let baseline = state.db.as_ref().and_then(|db| db.block_rules(name));
+            baseline
+                .into_iter()
+                .flatten()
+                .chain(state.overlay.get(name).into_iter().flatten())
+                .cloned()
+                .collect()
+        };
+        let mut names: HashSet<&str> = HashSet::new();
+        for state in [Some(self), old].into_iter().flatten() {
+            if let Some(db) = &state.db {
+                names.extend(db.block_name_iter());
+            }
+            names.extend(state.overlay.keys().map(String::as_str));
+        }
+        let mut changed: Vec<String> = names
+            .into_iter()
+            .filter(|name| rules(Some(self), name) != rules(old, name))
+            .map(str::to_string)
+            .collect();
+        changed.sort();
+        changed
+    }
+
     /// Whether a settled vulnerability advisory names `(name_norm, version)` as
     /// its fix, across the baseline (minus ids the probe superseded) ∪ the fix
     /// overlay. Such a release may skip the rolling cooldown.
@@ -654,6 +699,38 @@ async fn load_from_storage(storage: &dyn Storage) -> Result<Option<AdvisoryState
         fenced_holds: Arc::default(),
         loaded_unix: unix_now_secs(),
     }))
+}
+
+/// Whether `serve` blocks malware under this advisory configuration: `feed` and
+/// `block` as set (CLI, env, or `[serve]`), `None` when left at the default.
+/// An empty feed turns the whole feature off unless blocking was explicitly
+/// asked for. The offline maintenance commands use it to scrub listings the
+/// way the server they maintain does.
+pub fn effective_malware_block(feed: Option<&str>, block: Option<bool>) -> bool {
+    let feed_off = feed.is_some_and(|f| f.trim().is_empty());
+    match block {
+        Some(block) => block,
+        None => !feed_off,
+    }
+}
+
+/// The block set an offline maintenance command scrubs listings with: the
+/// stored `_advisories/` snapshot, or the embedded floor when none was ever
+/// delivered — what a booting server enforces before its first live feed. A
+/// stored snapshot that can't be read or is refused is an error, never a
+/// silent "nothing blocked".
+pub async fn load_for_maintenance(storage: &dyn Storage) -> Result<AdvisoryState> {
+    if let Some(state) = load_from_storage(storage)
+        .await
+        .context("loading the stored advisory snapshot (_advisories/)")?
+    {
+        return Ok(state);
+    }
+    let mut state = AdvisoryState::default();
+    if let Some((floor, _)) = embedded_floor() {
+        state.overlay = Arc::new(floor);
+    }
+    Ok(state)
 }
 
 /// Obtain the startup snapshot: try the source (URL/path), and on any failure
@@ -2334,6 +2411,71 @@ mod tests {
                 "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, {"fixed": fixed}]}],
             }],
         })
+    }
+
+    #[test]
+    fn snapshot_naming_no_pypi_advisory_is_refused() {
+        assert!(parse_snapshot(&osv_zip(&[]))
+            .unwrap_err()
+            .to_string()
+            .contains("no PyPI advisory"));
+        let npm = serde_json::json!({
+            "id": "MAL-2024-7",
+            "affected": [{"package": {"ecosystem": "npm", "name": "left-pad"}}],
+        });
+        assert!(parse_snapshot(&osv_zip(&[("n.json", npm)])).is_err());
+        assert!(parse_snapshot(&osv_zip(&[("m.json", mal_exact("MAL-1", "evil", "1.0"))])).is_ok());
+    }
+
+    #[test]
+    fn maintenance_malware_block_matches_serve() {
+        // Default on; an empty feed turns it off unless blocking is explicit.
+        assert!(effective_malware_block(None, None));
+        assert!(effective_malware_block(Some("https://x/all.zip"), None));
+        assert!(!effective_malware_block(Some(""), None));
+        assert!(!effective_malware_block(Some("  "), None));
+        assert!(effective_malware_block(Some(""), Some(true)));
+        assert!(!effective_malware_block(None, Some(false)));
+        assert!(!effective_malware_block(Some("/feed.zip"), Some(false)));
+    }
+
+    #[test]
+    fn block_change_diff_names_only_changed_rules() {
+        let base = parse_feed(&osv_zip(&[
+            ("a.json", mal_exact("MAL-1", "alpha", "1.0")),
+            ("b.json", mal_exact("MAL-2", "beta", "1.0")),
+        ]))
+        .unwrap();
+        let old = AdvisoryState {
+            db: Some(Arc::new(base)),
+            ..AdvisoryState::default()
+        };
+        // Nothing rendered against yet: every blocked name.
+        assert_eq!(old.block_names_changed_since(None), ["alpha", "beta"]);
+        assert!(old.block_names_changed_since(Some(&old)).is_empty());
+
+        // A new baseline drops beta, adds gamma, and keeps alpha's rule: a
+        // probe rule moving into the baseline is not a change either.
+        let next = parse_feed(&osv_zip(&[
+            ("a.json", mal_exact("MAL-1", "alpha", "1.0")),
+            ("g.json", mal_exact("MAL-3", "gamma", "2.0")),
+        ]))
+        .unwrap();
+        let probed = AdvisoryState {
+            overlay: Arc::new(HashMap::from([(
+                "gamma".to_string(),
+                next.block_rules("gamma").unwrap().clone(),
+            )])),
+            ..old.clone()
+        };
+        assert_eq!(probed.block_names_changed_since(Some(&old)), ["gamma"]);
+        let new = AdvisoryState {
+            db: Some(Arc::new(next)),
+            ..AdvisoryState::default()
+        };
+        assert_eq!(new.block_names_changed_since(Some(&probed)), ["beta"]);
+        assert!(new.blocks_file("gamma", "gamma-2.0-py3-none-any.whl"));
+        assert!(!new.blocks_file("gamma", "gamma-2.1-py3-none-any.whl"));
     }
 
     fn inv(package: &str, version: &str, origin: &str, downloads: u64) -> AuditInventory {

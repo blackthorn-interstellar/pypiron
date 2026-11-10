@@ -81,7 +81,7 @@ const MAX_CLAUSES_PER_ADVISORY: usize = 1_000;
 // ---------------------------------------------------------------------------
 
 /// How an advisory's affected clause selects versions of one package.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum VersionScope {
     /// Every version (an `introduced: "0"` range with no fix, or a bare package
     /// clause). Matches even an unparseable requested version — fail-closed, so
@@ -120,7 +120,7 @@ impl VersionScope {
 }
 
 /// Where an affected range stops.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum RangeEnd {
     /// `fixed` / `limit`: this version and later are unaffected.
     Before(Version),
@@ -138,7 +138,7 @@ impl RangeEnd {
 }
 
 /// One malware-block rule: a `MAL-*` id and the versions it condemns.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct MalRule {
     pub id: String,
     pub scope: VersionScope,
@@ -188,6 +188,16 @@ pub struct AdvisoryDb {
 
 impl AdvisoryDb {
     /// Distinct package names carrying at least one malware-block rule.
+    /// The baseline `MAL-*` rules for one normalized name.
+    pub(crate) fn block_rules(&self, name_norm: &str) -> Option<&Vec<MalRule>> {
+        self.block.get(name_norm)
+    }
+
+    /// Every normalized name the baseline block set covers.
+    pub(crate) fn block_name_iter(&self) -> impl Iterator<Item = &str> {
+        self.block.keys().map(String::as_str)
+    }
+
     pub(crate) fn block_names(&self) -> usize {
         self.block.len()
     }

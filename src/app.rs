@@ -79,11 +79,28 @@ pub(crate) const VERSION: &str = concat!(
 /// durably un-delist it. The denylist is read from the persisted stamp (what
 /// `serve` last enforced, via whatever channel), with `fallback` — this command's
 /// own config — used only when no stamp exists yet.
-async fn run_rebuild_index(args: RebuildIndexArgs, fallback: denylist::Denylist) -> Result<()> {
+///
+/// Malware blocking rides along the same way: with `malware_block` on, the
+/// rebuild scrubs blocked mirror files from listings using the stored
+/// `_advisories/` snapshot (or the embedded floor), as the live worker does.
+async fn run_rebuild_index(
+    args: RebuildIndexArgs,
+    fallback: denylist::Denylist,
+    malware_block: bool,
+) -> Result<()> {
     let storage = args.storage.build_for_write().await?;
     let denylist = worker::enforced_denylist(storage.as_ref(), &fallback).await?;
+    let advisories = if malware_block {
+        Some(advisories::load_for_maintenance(storage.as_ref()).await?)
+    } else {
+        None
+    };
     let mut state = AppState::headless(storage);
     state.denylist = Some(Arc::new(denylist));
+    if let Some(snapshot) = advisories {
+        state.malware_block = true;
+        state.advisories = Arc::new(std::sync::RwLock::new(Arc::new(snapshot)));
+    }
     let state = Arc::new(state);
     let pinned = state.pin();
     worker::audit(&state, &pinned, true).await?;
@@ -116,6 +133,26 @@ fn resolve_maintenance_denylist(
     let file = config::load(config_path)?;
     let mirror = sync::MirrorArgs::default().resolve(Some(&file.mirror))?;
     Ok(denylist::Denylist::from_specs(&mirror.exclude_packages))
+}
+
+/// Whether the server these maintenance commands look after blocks malware, so
+/// they scrub listings the way it does: `PYPIRON_MALWARE_BLOCK` /
+/// `PYPIRON_ADVISORY_FEED` (the server's own env, inherited by a `docker exec`),
+/// else `pypiron.toml`'s `[serve]`, else the default (on).
+fn resolve_maintenance_malware_block(config_path: Option<&std::path::Path>) -> Result<bool> {
+    let file = config::load(config_path)?;
+    let block = match std::env::var("PYPIRON_MALWARE_BLOCK") {
+        Ok(raw) => Some(match raw.trim() {
+            "true" => true,
+            "false" => false,
+            other => anyhow::bail!("PYPIRON_MALWARE_BLOCK must be true or false, got {other:?}"),
+        }),
+        Err(_) => file.serve.malware_block,
+    };
+    let feed = std::env::var("PYPIRON_ADVISORY_FEED")
+        .ok()
+        .or(file.serve.advisory_feed);
+    Ok(advisories::effective_malware_block(feed.as_deref(), block))
 }
 
 /// How artifact bytes reach clients. The tension: redirects move the
@@ -975,8 +1012,9 @@ pub async fn cli_main() -> Result<()> {
             // (clippy exempts `process::exit` only inside `fn main`; this
             // dispatcher moved to the library, so the exemption is explicit.)
             let denylist = resolve_maintenance_denylist(config_path.as_deref())?;
+            let malware_block = resolve_maintenance_malware_block(config_path.as_deref())?;
             #[allow(clippy::exit)]
-            match verify::run_verify(*args, &denylist).await {
+            match verify::run_verify(*args, &denylist, malware_block).await {
                 Ok(true) => Ok(()),
                 Ok(false) => std::process::exit(1),
                 Err(e) => {
@@ -993,7 +1031,8 @@ pub async fn cli_main() -> Result<()> {
                 "rebuild-index",
             )?;
             let denylist = resolve_maintenance_denylist(config_path.as_deref())?;
-            run_rebuild_index(*args, denylist).await
+            let malware_block = resolve_maintenance_malware_block(config_path.as_deref())?;
+            run_rebuild_index(*args, denylist, malware_block).await
         }
         Some(Commands::VerifyChain(mut args)) => {
             apply_maintenance_config(

@@ -4995,7 +4995,8 @@ async fn run_seed(seed: u64, profile: Profile, rerun: bool, viz: Option<Arc<Trac
         // bytes stay in `packages/` and must NOT appear in any view, so with an
         // empty denylist passed here every armed seed would red on the product
         // doing exactly what it was told.
-        match pypiron::verify::verify_storage(bucket.as_ref(), false, denylist.as_ref()).await {
+        match pypiron::verify::verify_storage(bucket.as_ref(), false, denylist.as_ref(), None).await
+        {
             Ok(report) => violations.extend(report.divergences.into_iter().map(|d| {
                 format!(
                     "VERIFY: bucket {idx} diverged from its own truth: {} {} — {}",

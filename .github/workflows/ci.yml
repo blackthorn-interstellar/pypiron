@@ -772,7 +772,9 @@ jobs:
           # GitHub retired the macos-13 (Intel) image on 2025-12-04; macos-15-intel
           # is its standard x86_64 replacement (last Intel image, supported to ~2027-08).
           - { kind: macos,     runner: macos-15-intel, target: x86_64,  triple: x86_64-apple-darwin, smoke: true }
-          - { kind: macos,     runner: macos-14,       target: aarch64, triple: aarch64-apple-darwin, smoke: true }
+          # GitHub retired every macos-14 image on 2026-11-02 ("The configuration
+          # 'macos-14-arm64-us-default' is not supported"); macos-15 is arm64.
+          - { kind: macos,     runner: macos-15,       target: aarch64, triple: aarch64-apple-darwin, smoke: true }
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

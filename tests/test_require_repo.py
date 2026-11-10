@@ -176,7 +176,8 @@ default = true
         [uv_path, "lock", "--no-cache"], cwd=project, env=env, capture_output=True, text=True
     )
     assert cp.returncode != 0
-    assert REASON in cp.stderr, cp.stderr
+    # uv wraps the message to the terminal width, so compare modulo whitespace.
+    assert REASON in " ".join(cp.stderr.split()), cp.stderr
 
     (project / "pyproject.toml").write_text(
         pyproject.format(userinfo="ci+repo=acme%2Fapi@", bind=server["bind"])

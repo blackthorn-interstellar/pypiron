@@ -160,7 +160,9 @@ def test_rebuild_index_appends_no_chain_link(pypiron_bin, tmp_path):
     churn instead."""
     data_dir = tmp_path / "data"
     data_dir.mkdir()
-    with _serve(pypiron_bin, data_dir, extra_args=[]) as server:
+    # Plant a package only: a live audit would race this assertion (the worker
+    # interval is 1s, and wait_for_file_in_index already waits on a rebuild).
+    with _serve(pypiron_bin, data_dir, extra_args=["--transparency", "false"]) as server:
         _upload(server, make_wheel("transofflinea", "1.0.0", tmp_path))
     rebuilt = _rebuild_index(pypiron_bin, data_dir)
     assert rebuilt.returncode == 0, rebuilt.stdout + rebuilt.stderr

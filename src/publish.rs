@@ -873,12 +873,31 @@ pub async fn publish_record(
     drop(write_permit);
     match store_result {
         Ok(true) => {}
-        Ok(false) => {
-            if let Err(e) = intent.commit().await {
-                warn!(error=?e, "legacy: failed to close duplicate-upload intent marker");
+        // The key is taken. Usually by a finished upload (409), but a write
+        // that failed after its bytes landed (a sidecar PUT, a fence HEAD, a
+        // client timeout) leaves the body with no sidecar naming it. A retry of
+        // those exact bytes finishes that write rather than lock its uploader
+        // out and leave the body to a lossy backfill. Other bytes still 409.
+        Ok(false) => match own_unfinished_write(storage, &key, &sha256, size).await {
+            Ok(true) => {
+                warn!(%filename, "resuming an interrupted upload of identical bytes");
             }
-            return Err((StatusCode::CONFLICT, format!("{FILE_EXISTS}: {filename}")));
-        }
+            Ok(false) => {
+                if let Err(e) = intent.commit().await {
+                    warn!(error=?e, "legacy: failed to close duplicate-upload intent marker");
+                }
+                return Err((StatusCode::CONFLICT, format!("{FILE_EXISTS}: {filename}")));
+            }
+            Err(e) => {
+                if let Err(commit_error) = intent.commit().await {
+                    warn!(error=?commit_error, "legacy: failed to close duplicate-upload intent marker");
+                }
+                return Err((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    format!("storage error checking the existing file: {e}"),
+                ));
+            }
+        },
         Err(e) => {
             return Err((
                 StatusCode::SERVICE_UNAVAILABLE,
@@ -1192,6 +1211,23 @@ pub async fn publish_record(
 
     // Return a simple OK text body compatible with legacy clients.
     Ok((StatusCode::OK, "OK"))
+}
+
+/// Whether an occupied artifact key is an unfinished write of exactly these
+/// bytes: no sidecar names it, and it holds `sha256` at `size`. One HEAD on an
+/// ordinary duplicate (the sidecar is there); the body is hashed only when it
+/// is unnamed, which a completed upload never is.
+async fn own_unfinished_write(
+    storage: &dyn Storage,
+    key: &str,
+    sha256: &str,
+    size: u64,
+) -> Result<bool> {
+    if storage.head_exists(&sidecar_key(key)).await? {
+        return Ok(false);
+    }
+    let (stored_sha, stored_size) = storage::stream_sha256(storage, key).await?;
+    Ok(stored_sha == sha256 && stored_size == size)
 }
 
 /// A mutation whose replication gap could not be written down answers 503, not

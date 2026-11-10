@@ -153,7 +153,9 @@ control hostnames it resolves. [Forward proxy and private CA setup](reference/co
 
 When PyPI provides a Sigstore provenance bundle, pypiron independently verifies
 the signature, publisher identity, and artifact digest against its built-in
-trust root. The project page shows the verified publisher identity. This proves
+trust root. The project page shows the verified publisher identity and names
+the file it checked: the newest file of the release that has a bundle, not every
+file of the release. This proves
 who signed those bytes; it does not prove that the publisher is trustworthy or
 the package is safe. pypiron relays public provenance but does not mint
 attestations for private uploads.

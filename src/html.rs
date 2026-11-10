@@ -654,9 +654,10 @@ fn version_is_shell_safe(version: &str) -> bool {
 /// `pinned` marks that it came from a `/project/<pkg>/<version>/` request (it
 /// pins the `uv add` snippet). `meta` is the selected version's representative
 /// core metadata (the README is rendered when it declares Markdown, else shown
-/// verbatim). `prov` is the selected version's relayed PEP 740 provenance —
-/// the upstream-attested publisher plus whether that attestation is digest-bound
-/// to the served bytes — present only for files that carry attestations. The
+/// verbatim). `prov` is the selected version's relayed PEP 740 provenance and
+/// the one file it was checked on — the upstream-attested publisher plus
+/// whether that attestation is digest-bound to that file's bytes — present only
+/// for files that carry attestations. The
 /// content area has three tab panels — description, release history, download
 /// files — switched by the sidebar.
 #[allow(clippy::too_many_arguments)]
@@ -667,7 +668,7 @@ pub fn project_html(
     selected: &str,
     pinned: bool,
     meta: Option<&CoreMetadata>,
-    prov: Option<&Provenance>,
+    prov: Option<(&str, &Provenance)>,
     downloads: &[(String, u64)],
     advisories: &[AdvisoryPanelRow],
     used_by: &crate::used_by::Lines,
@@ -761,7 +762,7 @@ pub fn project_html(
         advisories = advisory_panel_section(advisories),
         downloads = downloads_section(downloads),
         used_by = used_by_section(used_by),
-        verified = provenance_section(prov),
+        verified = provenance_section(prov, sel_files.len() > 1),
         details = meta_sections(meta),
         desc = description_panel(meta),
         history = release_history_panel(pkg, files, selected),
@@ -1021,9 +1022,19 @@ fn used_by_section(used_by: &crate::used_by::Lines) -> String {
 /// claim pypiron *can* make itself — that the attestation's in-toto subject
 /// digest matches the bytes it serves — is shown as a checksum-match cue only
 /// when [`Provenance::digest_bound`] holds; otherwise no binding is implied.
-fn provenance_section(prov: Option<&Provenance>) -> String {
-    let Some(pv) = prov else {
+///
+/// Only `file` — one representative of the release — was checked, so every
+/// claim names it, and `others` (the release has more files) says the rest
+/// were not.
+fn provenance_section(prov: Option<(&str, &Provenance)>, others: bool) -> String {
+    let Some((file, pv)) = prov else {
         return String::new();
+    };
+    let file = encode_text(file);
+    let unchecked = if others {
+        " Other files in this release were not checked."
+    } else {
+        ""
     };
 
     // When pypiron itself verified the Sigstore bundle offline, the identity we
@@ -1031,7 +1042,7 @@ fn provenance_section(prov: Option<&Provenance>) -> String {
     // JSON, which an attacker can set to any project while signing with a
     // throwaway identity. The relayed publisher does not appear in this state.
     if let Some(signer) = &pv.verified_signer {
-        return verified_provenance_section(signer);
+        return verified_provenance_section(signer, &file, unchecked);
     }
 
     // Not independently verified: attribute the relayed (unsigned) publisher, and
@@ -1059,10 +1070,12 @@ fn provenance_section(prov: Option<&Provenance>) -> String {
     // subject digest matches the bytes served (an integrity match, not a
     // signature check). Shown only when it holds.
     let bound = if pv.digest_bound {
-        "<p class=\"sb-bound\">✓ The attestation names this file's checksum, \
-so it describes the exact bytes served here.</p>"
+        format!(
+            "<p class=\"sb-bound\">✓ The attestation names the checksum of <code>{file}</code>, \
+so it describes the exact bytes served here.{unchecked}</p>"
+        )
     } else {
-        ""
+        String::new()
     };
     format!(
         "<section class=\"sb sb-prov\"><h2>Publisher attestation</h2>\
@@ -1078,7 +1091,11 @@ Recorded there, not re-verified by this server.</p></section>"
 /// what was proven — a valid, transparency-logged signature over these bytes by
 /// this identity — and the caption is explicit that this is *who signed*, not a
 /// judgement that the signer is the package's rightful owner.
-fn verified_provenance_section(signer: &crate::attest::VerifiedSigner) -> String {
+fn verified_provenance_section(
+    signer: &crate::attest::VerifiedSigner,
+    file: &str,
+    unchecked: &str,
+) -> String {
     let link_row = |label: &str, value: &str| -> String {
         match markdown::safe_href(value) {
             Some(href) => format!(
@@ -1099,9 +1116,9 @@ fn verified_provenance_section(signer: &crate::attest::VerifiedSigner) -> String
     }
     format!(
         "<section class=\"sb sb-prov\"><h2>Publisher attestation</h2>\
-<p class=\"sb-verified\">✓ Cryptographically verified by this server — this file has a valid \
-Sigstore attestation, recorded in the transparency log, signed over the exact bytes served \
-here by the identity below. Checked offline against a trust root built into this server.</p>\
+<p class=\"sb-verified\">✓ Cryptographically verified by this server — <code>{file}</code> has a \
+valid Sigstore attestation, recorded in the transparency log, signed over the exact bytes served \
+here by the identity below. Checked offline against a trust root built into this server.{unchecked}</p>\
 <dl class=\"sb-dl\">{rows}</dl>\
 <p class=\"sb-note\">This confirms who signed the file, verified from the signing \
 certificate — not that the signer is the package's rightful owner. Check that the signer \
@@ -1667,7 +1684,7 @@ mod tests {
             "15.0.0",
             false,
             Some(&m),
-            Some(&prov),
+            Some(("imaginAIry-15.0.0-py3-none-any.whl", &prov)),
             &[],
             &[],
             &Default::default(),
@@ -1683,7 +1700,7 @@ mod tests {
         assert!(html.contains("as attested to the publishing index (PyPI)"));
         assert!(html.contains("not re-verified by this server"));
         // With no digest binding, no checksum-match cue is shown.
-        assert!(!html.contains("names this file's checksum"));
+        assert!(!html.contains("names the checksum of"));
         assert!(!html.contains("class=\"sb-bound\""));
     }
 
@@ -1706,14 +1723,16 @@ mod tests {
             "15.0.0",
             false,
             Some(&m),
-            Some(&prov),
+            Some(("imaginAIry-15.0.0-py3-none-any.whl", &prov)),
             &[],
             &[],
             &Default::default(),
         );
         assert!(html.contains("<h2>Publisher attestation</h2>"));
         assert!(html.contains("class=\"sb-bound\""));
-        assert!(html.contains("names this file's checksum"));
+        assert!(
+            html.contains("names the checksum of <code>imaginAIry-15.0.0-py3-none-any.whl</code>")
+        );
         // Even bound, it is never labelled a bare "Verified" claim.
         assert!(!html.contains("Verified details"));
         assert!(html.contains("not re-verified by this server"));
@@ -1752,7 +1771,7 @@ mod tests {
             "15.0.0",
             false,
             Some(&m),
-            Some(&prov),
+            Some(("imaginAIry-15.0.0-py3-none-any.whl", &prov)),
             &[],
             &[],
             &Default::default(),
@@ -1776,6 +1795,31 @@ mod tests {
         // And the weaker relayed cue/caption are gone in this state.
         assert!(!html.contains("not re-verified by this server"));
         assert!(!html.contains("Publisher as attested to the publishing index"));
+        // The claim names the one file it was checked on; with no other file in
+        // the release there is nothing left unchecked to mention.
+        assert!(sec.contains("<code>imaginAIry-15.0.0-py3-none-any.whl</code> has a valid"));
+        assert!(!sec.contains("Other files in this release were not checked."));
+
+        // A release with more files says the others were not checked.
+        let mut more = files.clone();
+        more.push(file(
+            "imaginAIry-15.0.0.tar.gz",
+            "15.0.0",
+            "2026-06-09T00:00:00Z",
+        ));
+        let html = project_html(
+            &ctx(),
+            "imaginairy",
+            &more,
+            "15.0.0",
+            false,
+            Some(&m),
+            Some(("imaginAIry-15.0.0-py3-none-any.whl", &prov)),
+            &[],
+            &[],
+            &Default::default(),
+        );
+        assert!(html.contains("Other files in this release were not checked."));
     }
 
     #[test]

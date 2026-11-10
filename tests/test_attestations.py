@@ -139,8 +139,9 @@ def test_project_page_shows_digest_binding_when_subject_matches(disk_server, tmp
     assert "Publisher attestation" in page
     assert "not re-verified by this server" in page
     assert "Verified details" not in page
-    # The digest binding is claimed only because the subject matched the bytes.
-    assert "names this file's checksum" in page
+    # The digest binding is claimed only because the subject matched the bytes,
+    # and names the one file it was checked on.
+    assert f"names the checksum of <code>{wheel.name}</code>" in page
 
 
 def test_project_page_omits_binding_when_subject_mismatches(disk_server, tmp_path):
@@ -157,7 +158,7 @@ def test_project_page_omits_binding_when_subject_mismatches(disk_server, tmp_pat
     assert "not re-verified by this server" in page
     assert "Verified details" not in page
     # No checksum-match cue — binding was not demonstrated.
-    assert "names this file's checksum" not in page
+    assert "names the checksum of" not in page
 
 
 def test_mirror_upload_without_provenance_advertises_nothing(disk_server, tmp_path):

@@ -355,8 +355,11 @@ async fn render_project(
         Some(f) => load_core_metadata(storage.as_ref(), &pkg, f).await,
         None => None,
     };
+    // The provenance shown is this one file's; the page names it.
     let provenance = match representative(&files, &selected, |f| f.provenance) {
-        Some(f) => load_provenance(storage.as_ref(), &pkg, f).await,
+        Some(f) => load_provenance(storage.as_ref(), &pkg, f)
+            .await
+            .map(|p| (coremeta::strip_control_chars(&f.filename), p)),
         None => None,
     };
     // Hosted projects whose newest release requires this one, narrowed to those
@@ -403,7 +406,7 @@ async fn render_project(
         &selected,
         pinned,
         meta.as_ref(),
-        provenance.as_ref(),
+        provenance.as_ref().map(|(file, p)| (file.as_str(), p)),
         &downloads,
         &advisory_panel,
         &used_by,

@@ -197,7 +197,10 @@ credentials cross an untrusted network.
 
 Enable `--trusted-proxy` only behind a reverse proxy that replaces forwarding
 headers. Without it, all clients behind that proxy share one address and one
-login-failure budget. [Authentication and throttle settings](reference/configuration.md#server)
+login-failure budget. pypiron trusts one proxy hop: it uses the last address in
+`X-Forwarded-For`, the one added by the proxy in front of it. Behind two hops,
+such as a CDN in front of a load balancer, every client shares the CDN's
+address and its login-failure budget. [Authentication and throttle settings](reference/configuration.md#server)
 
 ## What pypiron does not defend
 

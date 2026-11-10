@@ -229,7 +229,7 @@ backends are supported. With more than one bucket:
 | `--allow-legacy-versions` | `PYPIRON_ALLOW_LEGACY_VERSIONS` | `false` | Accept direct uploads with non-PEP-440 versions. File type is irrelevant. Sync has a separate flag below. |
 | `--access-log` | `PYPIRON_ACCESS_LOG` | `false` | Log reads too, not only mutations. |
 | `--access-log-format structured\|clf` | `PYPIRON_ACCESS_LOG_FORMAT` | `structured` | Structured logs or Combined Log Format. |
-| `--trusted-proxy` | `PYPIRON_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For`/`X-Real-IP`. Enable only behind a proxy that replaces these headers; otherwise callers can forge their logged address. [Login throttling](../security.md#login-throttling). |
+| `--trusted-proxy` | `PYPIRON_TRUSTED_PROXY` | `false` | Honor `X-Forwarded-For`/`X-Real-IP`. Enable only behind a proxy that replaces these headers; otherwise callers can forge their logged address. One proxy hop only: pypiron uses the last `X-Forwarded-For` address, so behind two proxies every client shares the outer proxy's address. [Login throttling](../security.md#login-throttling). |
 | `--login-cooldown-secs N` | `PYPIRON_LOGIN_COOLDOWN_SECS` | `300` | Lock one address for this long after five failed logins, including ones sent at the same time; returns `429` with `Retry-After`. Per instance; IPv6 groups by `/64`; `0` disables. |
 | `--worker-interval-secs N` | `PYPIRON_WORKER_INTERVAL_SECS` | `1` | Index, replication, and bucket-health poll cadence. |
 | `--bucket-leave-failures N` | `PYPIRON_BUCKET_LEAVE_FAILURES` | `3` | Consecutive timeout (including 408), connection, or 5xx failures before selecting the next bucket. |
@@ -485,6 +485,10 @@ public-read server that shares its key.
 Keep server clocks in sync (NTP): a server refuses a token issued more than a
 minute in its future, so tokens minted on a server whose clock runs fast fail
 with 401 on the others.
+
+Changing a password does not revoke tokens already minted with it; they keep
+working until they expire, within 5 minutes. To revoke every token at once,
+set a new `--token-signing-key` on every server.
 
 ## Health and maintenance
 

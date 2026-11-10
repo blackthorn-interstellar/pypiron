@@ -9,9 +9,10 @@
 # Every key also has a --flag and a PYPIRON_* env var. Full reference:
 # https://pypiron.com/reference/configuration/
 #
-# Secrets are never read from this file, so it is safe to commit: the admin,
-# uploader, and read passwords, the token signing key, and the Azure access key
-# come only from the CLI or the environment.
+# The server's secrets are never read from this file: the admin, uploader,
+# and read passwords, the token signing key, and the Azure access key come only
+# from the CLI or the environment. [sync] does accept its source and admin
+# passwords here; keep those in their env vars if you commit this file.
 
 # Log output: text (human-readable) or json (one object per line, for log
 # pipelines). Applies to every command.

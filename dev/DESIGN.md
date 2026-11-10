@@ -1067,8 +1067,9 @@ input they read; `verify` stays an independent oracle of it on purpose.
 
 
 **Replication class (multi-bucket).** Every top-level prefix is classified in one
-registry — `src/layout.rs`, enforced by a unit test so a new prefix without a
-declared class fails CI. Six classes:
+registry — `src/layout.rs`. A unit test fails CI when a prefix const it lists has
+no declared class; the list is hand-kept, so a new prefix const joins it in the
+same change. Six classes:
 
 | Prefix | Class | Replicates? |
 | --- | --- | --- |
@@ -1077,14 +1078,13 @@ declared class fails CI. Six classes:
 | `_counters/day/` | replicated-rollup | yes — leader-authored, immutable day-rollups, each naming the bucket whose segments it summed (`<shard>@<bucket>.json`), reseeded copy-if-absent until every bucket holds the union, so a failover keeps the /audit ranking and /stats history. The reseed is a union mesh, not a push from the write pin: each bucket authors its own variants, so a peer's rollup has to reach the pin too or a read there would report a short day |
 | `_counters/seg/`, `_quarantine/` | declared-loss | no — two bounded, annotated losses. `_counters/seg/`: the current day's un-rolled-up live tallies, at most one day. `_quarantine/`: the losing byte-sets of freezes and demotions resolved on that bucket — never a byte the fleet serves, never the winner, and always announced by a fence (`.frozen` + tombstone, or `.mirror-quarantined`) that *does* replicate. Calling the quarantine tree "derived" was the comfortable lie: a preserved loser is not recomputable from anything |
 | `simple/`, `_advisories/report.json`, `_state/`, `_sync/cursors.json` | derived-per-bucket | no — each bucket rebuilds/re-derives its own from the truth it holds |
-| `_leader/lease.json`, `_repl/`, `_topology/stamp.json`, `_staging/`, `_dirty/` | coordination-per-bucket | no — bucket-local by design; replicating it would be wrong |
+| `_leader/lease.json`, `_repl/`, `_topology/stamp.json`, `_format/stamp.json`, `_staging/`, `_dirty/` | coordination-per-bucket | no — bucket-local by design; replicating it would be wrong |
 
-`_format/stamp.json` is the one top-level prefix deliberately not yet in the
-`src/layout.rs` manifest: nothing writes it at format 1 (absent == format 1), so
-there is no class to enforce until the format-2 stamp-writer/CAS-bump tooling
-ships — the parked format-2 deferral in `private/ROADMAP.md`. When written it will
-be fleet-uniform and write-through replicated (like the singleton control files),
-not bucket-local, so its MANIFEST row lands with that writer, not here.
+`_format/stamp.json` is coordination-per-bucket even though nothing writes it at
+format 1 (absent == format 1): each bucket's stamp records the format of *that*
+bucket's tree, so copying a format-2 stamp onto a bucket not yet migrated would
+make it lie. Migration (the parked format-2 deferral in `private/ROADMAP.md`)
+writes each bucket's stamp as it converts that bucket.
 
 The transparency chain is singleton-replicated: leader-authored links are written
 through to every bucket so a failover continues the chain instead of restarting at

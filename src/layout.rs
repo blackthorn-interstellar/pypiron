@@ -1,9 +1,11 @@
 //! The storage-layout replication-class manifest — one registry naming every
 //! top-level key prefix, how it relates to a multi-bucket fleet, and a one-line
-//! why. A new prefix that ships without a declared class trips the unit tests
-//! below, so the "does this replicate?" decision is never left implicit (the
-//! motivating exhibit: the transparency chain's non-replication used to be a
-//! silent accident of prefix scoping — now it is a stated class).
+//! why. The unit test below fails when a prefix const it lists has no declared
+//! class; that list is kept by hand, so a new prefix const goes into it in the
+//! same change — nothing discovers one on its own. The point is that the "does
+//! this replicate?" decision is never left implicit (the motivating exhibit:
+//! the transparency chain's non-replication used to be a silent accident of
+//! prefix scoping — now it is a stated class).
 //!
 //! This module also owns the mechanism for the [`Class::SingletonReplicated`]
 //! files: [`write_singleton`] writes a leader-authored control record to the
@@ -157,6 +159,11 @@ pub const MANIFEST: &[PrefixClass] = &[
         prefix: crate::buckets::TOPOLOGY_STAMP_KEY,
         class: Class::CoordinationPerBucket,
         why: "per-bucket topology fence stamp; identity of the local bucket, never copied",
+    },
+    PrefixClass {
+        prefix: crate::format::FORMAT_STAMP_KEY,
+        class: Class::CoordinationPerBucket,
+        why: "storage-format fence: absent means format 1; each bucket records the format its own tree is at, so it is never copied onto a bucket not yet migrated",
     },
     PrefixClass {
         prefix: crate::transparency::CHAIN_PREFIX,
@@ -361,6 +368,7 @@ mod tests {
             crate::sync::CURSORS_KEY,
             crate::proxy::FOLLOW_KEY,
             crate::buckets::TOPOLOGY_STAMP_KEY,
+            crate::format::FORMAT_STAMP_KEY,
             crate::transparency::CHAIN_PREFIX,
         ] {
             assert!(

@@ -144,7 +144,15 @@ fuzz_target!(|data: &[u8]| {
             // ever something else (today every package-html link is /files/).
             if raw_attr.starts_with("/files/") {
                 let decoded = html_escape::decode_html_entities(raw_attr);
-                let intended = format!("/files/{}/{}#sha256={}", pkg, fm.filename, fm.sha256);
+                // The filename is a URL path segment: the renderer percent-encodes
+                // the bytes that would end or restructure it (CI
+                // crash-8eac83002381b3fe1befad18cb5868cf0a5d5b0a: a form feed).
+                let intended = format!(
+                    "/files/{}/{}#sha256={}",
+                    pkg,
+                    render::file_url_segment(&fm.filename),
+                    fm.sha256
+                );
                 assert_eq!(
                     decoded.as_ref(),
                     intended.as_str(),

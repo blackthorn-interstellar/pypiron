@@ -127,9 +127,7 @@ def test_zero_disables(disk_server_login_cooldown_off):
 
 
 def _held_mint(server: dict, user: str, password: str) -> socket.socket:
-    """Send `POST /tokens` headers but hold back the 2-byte body. The handler
-    reads the body before checking the credential, so an admitted guess sits
-    in flight until `_release` sends it."""
+    """Send `POST /tokens` headers but hold back the 2-byte body."""
     url = urlsplit(server["base_url"])
     sock = socket.create_connection((url.hostname, url.port), timeout=10)
     sock.sendall(
@@ -160,57 +158,43 @@ def _answered_early(sock: socket.socket) -> bool:
     return bool(readable)
 
 
-def _release(sock: socket.socket) -> int:
-    sock.sendall(b"{}")
-    return _status(sock)
+def test_a_wrong_credential_minting_a_token_is_refused_before_its_body(
+    disk_server_login_cooldown,
+):
+    """A slow body must not hold a login slot: the wrong credential is answered
+    401 before the body arrives, and counts. When the body was read first, five
+    trickling bodies held all five slots, every login from the address got
+    429, and none of them counted as a failure."""
+    server = disk_server_login_cooldown
+    for attempt in range(5):
+        sock = _held_mint(server, "reader", f"wrong{attempt}")
+        assert _answered_early(sock), f"attempt {attempt} waited for its body"
+        assert _status(sock) == 401, f"attempt {attempt}"
+    code, _, _ = http_get(
+        f"{server['simple']}index.json", headers=_auth_header("reader", "readersecret")
+    )
+    assert code == 429
 
 
 def test_concurrent_guesses_share_one_budget(disk_server_login_cooldown):
-    """Ten different wrong passwords in flight at once get five evaluations,
-    not ten: the budget is reserved on admission, not tallied after a 401.
-    Which five is up to the order the server reads the request heads in."""
+    """Thirty different wrong passwords sent at once get at most five
+    evaluations: the budget is reserved on admission, not tallied after a 401,
+    so however the requests interleave the rest are refused with 429."""
     server = disk_server_login_cooldown
     url = f"{server['simple']}index.json"
-    held = [_held_mint(server, "reader", f"wrong{i}") for i in range(10)]
+    with ThreadPoolExecutor(max_workers=30) as pool:
+        codes = list(
+            pool.map(
+                lambda i: http_get(url, headers=_auth_header("reader", f"wrong{i}"))[0],
+                range(30),
+            )
+        )
+    assert set(codes) <= {401, 429}, codes
+    assert 1 <= codes.count(401) <= 5, codes
 
-    # Five are refused without waiting for their bodies; five wait.
-    refused: list[socket.socket] = []
-    deadline = time.time() + 10
-    while len(refused) < 5 and time.time() < deadline:
-        waiting = [sock for sock in held if sock not in refused]
-        readable, _, _ = select.select(waiting, [], [], 0.2)
-        refused += readable
-    assert len(refused) == 5, f"{len(refused)} guesses refused early, not 5"
-    admitted = [sock for sock in held if sock not in refused]
-    assert not any(_answered_early(sock) for sock in admitted[:1]), "a sixth was refused"
-    assert [_status(sock) for sock in refused] == [429] * 5
-
-    # The right password is refused too while the budget is spoken for —
-    # a 200 here would answer the guess the 429s were meant to withhold.
+    # Locked out now, the right password included: a 200 here would answer
+    # the guesses the 429s were meant to withhold.
     code, _, _ = http_get(url, headers=_auth_header("reader", "readersecret"))
-    assert code == 429
-
-    assert [_release(sock) for sock in admitted] == [401] * 5
-    code, _, _ = http_get(url, headers=_auth_header("reader", "readersecret"))
-    assert code == 429
-
-
-def test_one_wrong_credential_in_parallel_is_one_guess(disk_server_login_cooldown):
-    """Retrying the same stale credential on parallel requests is one guess:
-    every copy is answered 401 and together they count one failure."""
-    server = disk_server_login_cooldown
-    url = f"{server['simple']}index.json"
-    held = [_held_mint(server, "reader", "stale") for _ in range(10)]
-    time.sleep(0.5)
-    assert not any(_answered_early(sock) for sock in held[-1:])
-    assert [_release(sock) for sock in held] == [401] * 10
-
-    # Four more failures make five: the address locks out on the next try.
-    bad = _auth_header("reader", "stale")
-    for attempt in range(4):
-        code, _, _ = http_get(url, headers=bad)
-        assert code == 401, f"attempt {attempt}"
-    code, _, _ = http_get(url, headers=bad)
     assert code == 429
 
 

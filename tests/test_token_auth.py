@@ -286,3 +286,27 @@ def test_a_short_signing_key_refuses_startup(pypiron_bin, tmp_path):
     assert cp.returncode != 0, out
     assert "openssl rand -hex 32" in out, out
     assert weak not in out, out
+
+
+@pytest.fixture()
+def public_read_token_server(tmp_path_factory, pypiron_bin):
+    """Reads are public, uploads need a credential, and tokens are minted."""
+    gen = _start_disk_server(
+        tmp_path_factory,
+        pypiron_bin,
+        extra_args=["--token-signing-key", SIGNING_KEY.decode()],
+    )
+    try:
+        yield next(gen)
+    finally:
+        gen.close()
+
+
+def test_a_wrong_password_never_mints_on_a_public_read_server(public_read_token_server):
+    """Reads are open, so a reader token needs no credential. But a wrong one
+    is a failed login, not an anonymous request: it gets 401, not a token."""
+    server = public_read_token_server
+    assert _mint(server)[0] == 200
+    assert _mint(server, auth=(server["uploader_user"], server["uploader_password"]))[0] == 200
+    code, body, _ = _mint(server, auth=(server["uploader_user"], "wrong"))
+    assert code == 401, body

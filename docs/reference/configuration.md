@@ -475,6 +475,8 @@ export UV_INDEX_COMPANY_PASSWORD=$(
 | `--user VALUE` | none | local user | Attribution override. |
 
 Tokens live for 5 minutes and cannot outrank the credential that minted them.
+When reads are public, a reader token needs no credential, but a wrong
+credential gets `401` and counts as a failed login.
 A server with no write credential stays read-only for every token, including
 ones minted by another server that shares its signing key.
 Keep server clocks in sync (NTP): a server refuses a token issued more than a

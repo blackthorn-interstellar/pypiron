@@ -685,7 +685,7 @@ struct MintResponse {
 /// (a signing key), and the presenting credential must already grant the
 /// requested role — a token can never escalate beyond the credential that
 /// minted it. On an open (public-read) server, a reader token needs no
-/// credential, since reader access is already public.
+/// credential, since reader access is already public; a wrong one still gets 401.
 pub(crate) async fn mint_token(
     State(state): State<Arc<AppState>>,
     request: axum::extract::Request,
@@ -712,6 +712,17 @@ pub(crate) async fn mint_token(
         return Err((
             StatusCode::FORBIDDEN,
             "a token cannot mint tokens; authenticate with a configured credential".to_string(),
+        ));
+    }
+    // A wrong credential is answered before the body too. Read first, it held one
+    // of its address's login-throttle slots for as long as the body trickled in,
+    // and a slow sender could hold all five without one counted failure, locking
+    // out every login from that address. And on a public-read server it would
+    // pass as anonymous and get a reader token: a wrong password never succeeds.
+    if headers.contains_key(header::AUTHORIZATION) && !state.authenticates(&headers) {
+        return Err((
+            StatusCode::UNAUTHORIZED,
+            "the supplied credential is not valid".to_string(),
         ));
     }
     let body = axum::body::to_bytes(request.into_body(), 64 * 1024)

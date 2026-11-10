@@ -452,8 +452,7 @@ def _start_login_cooldown_server(
     tmp_path_factory, bin_path: Path, cooldown_secs: int
 ) -> Iterator[Dict]:
     """Read-auth disk server with an explicit failed-login cooldown. It also
-    mints tokens, so `POST /tokens` (which reads its body before checking the
-    credential) can hold a guess in flight."""
+    mints tokens, so `POST /tokens` can be sent with its body held back."""
     for server in _start_disk_server(
         tmp_path_factory,
         bin_path,

@@ -235,7 +235,12 @@ def _eventually_bucket_stays_gone(
     next periodic write a 404 and the failure counter advances. A bucket that
     vanishes between the exists-check and the DELETE makes `minio_remove_bucket`
     raise AssertionError, which `_eventually` catches as a "not yet" and retries
-    — that catch is what makes this safe on a bucket that can vanish under it."""
+    — that catch is what makes this safe on a bucket that can vanish under it.
+
+    The re-delete wipes whatever the resurrected bucket holds, including records
+    the server legitimately replicated into it while it looked healthy. A test
+    that writes and then counts on that bucket owing the write must first wait
+    here for the server to fail the bucket out."""
 
     def _step():
         if predicate():
@@ -1015,19 +1020,26 @@ def test_upload_replicates_and_second_bucket_builds_its_own_index(
 def test_repl_marker_accumulates_then_drains_when_destination_returns(
     minio_two, s3_server_multi, tmp_path
 ):
-    """With bucket B unreachable, the eager push fails and drops a `_repl/`
-    marker in bucket A; A keeps serving. When B returns, the leader's marker
-    sweep delivers the record and deletes the marker."""
+    """With bucket B down, an upload drops a `_repl/` marker for it in bucket A;
+    A keeps serving. When B returns, the leader's marker sweep delivers the
+    record and deletes the marker."""
     server = s3_server_multi
     minio = minio_two
     a, b = minio["buckets"]
     pkg = "markertest"
-
-    # Build the wheel first so the DELETE -> fan-out gap is only the upload.
     wheel = make_wheel(pkg, "2.0", tmp_path)
 
-    # Kill tier-1: the destination bucket is gone.
+    # Kill tier-1, and hold the upload until the server has failed B out. A
+    # write in flight at the DELETE can resurrect B empty, and an empty bucket
+    # probes healthy (its missing stamp is a plain 404). Uploading then fans out
+    # into it — correctly: B holds the record, so no note is owed — and the
+    # re-delete below wipes that copy, leaving A with no note to wait for. Once
+    # B is unhealthy the server stops writing to it, so whatever comes back is
+    # empty and gets swept before the record exists.
     minio_remove_bucket(minio, b)
+    _eventually_bucket_stays_gone(
+        minio, b, lambda: _bucket_health(server, b) == -1, what="server fails B out"
+    )
 
     _upload(server, wheel)
     # The selected bucket is unaffected — uploads and indexing keep flowing.
@@ -1039,8 +1051,8 @@ def test_repl_marker_accumulates_then_drains_when_destination_returns(
             k.startswith(f"_repl/{s3_repl_tag(b)}/{pkg}/") for k in minio_list_keys_in(minio, a)
         )
 
-    # Both waits need B to stay down: a resurrected B lets the sweep deliver the
-    # note and delete it, which starves the marker check and zeroes the backlog.
+    # Both waits keep B down; B returning early lets the sweep deliver the note
+    # and delete it, which starves the marker check and zeroes the backlog.
     _eventually_bucket_stays_gone(
         minio, b, _marker_present, what="_repl/ marker for the down bucket"
     )

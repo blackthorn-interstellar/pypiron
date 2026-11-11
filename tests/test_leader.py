@@ -7,12 +7,13 @@ hands the lease to the survivor within the TTL and uploads keep flowing.
 from __future__ import annotations
 
 import json
+import subprocess
 import time
 from contextlib import ExitStack, contextmanager
 
 import pytest
 
-from .conftest import _start_s3_server, minio_get_key
+from .conftest import _start_s3_server, _tail, minio_get_key
 from .helpers import (
     download_pypi_wheel,
     get_index_json,
@@ -85,8 +86,13 @@ def test_graceful_shutdown_hands_the_lease_over_at_once(minio, pypiron_bin, tmp_
         assert "lease acquired" not in server_b["log_path"].read_text()
 
         server_a["proc"].terminate()
-        server_a["proc"].wait(timeout=15.0)
-        assert "lease released on shutdown" in server_a["log_path"].read_text()
+        try:
+            server_a["proc"].wait(timeout=15.0)
+        except subprocess.TimeoutExpired:
+            pytest.fail(f"leader still running 15s after SIGTERM:\n{_tail(server_a['log_path'])}")
+        assert "lease released on shutdown" in server_a["log_path"].read_text(), _tail(
+            server_a["log_path"]
+        )
 
         deadline = time.monotonic() + 15.0
         while "lease acquired" not in server_b["log_path"].read_text():

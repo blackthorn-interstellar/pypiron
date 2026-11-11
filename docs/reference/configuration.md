@@ -292,6 +292,16 @@ HTTP status client error (400 Bad index username: unknown key delivry (custom ke
 Behind a proxy that speaks HTTP/2 to clients the reason is not shown; it is
 always in the response body.
 
+pip takes the tags from the index URL, with `/` written as `%2F`:
+
+```sh
+pip install --index-url "https://ci+repo=acme%2Fbilling-api@pypi.example.com/simple" requests
+```
+
+pip sends them on every request. It reports a refusal (this `400`, or the
+`428` below) as "No matching distribution found"; run it with `-vv` to see the
+reason.
+
 In CI, fill the tags from the job's environment:
 
 ```sh

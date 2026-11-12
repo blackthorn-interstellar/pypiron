@@ -230,11 +230,7 @@ def _start_disk_server(
 
     env = os.environ.copy()
     env.setdefault("RUST_LOG", "info,pypiron=debug")
-    # Advisory blocking is on by default and would fetch the ~30 MB OSV export at
-    # startup — non-hermetic and slow for every test server. Disable it by default;
-    # advisory tests re-enable it explicitly (a --advisory-feed CLI flag overrides
-    # this, and the implicit-default tests hand-roll their own start).
-    env.setdefault("PYPIRON_ADVISORY_FEED", "")
+    _no_default_advisory_feed(env)
     if extra_env:
         env.update(extra_env)
 
@@ -1918,12 +1914,23 @@ def prestamp_topology(minio: Dict, names: Sequence[str]) -> None:
         minio_put_key_in(minio, name, "_topology/stamp.json", json.dumps(stamp))
 
 
+def _no_default_advisory_feed(env: Dict[str, str]) -> None:
+    """Advisory blocking is on by default and would fetch the ~37 MB OSV export
+    at startup and spend seconds of CPU parsing it — non-hermetic and slow for
+    every test server. Off unless the caller's environment says otherwise;
+    advisory tests re-enable it explicitly (a `--advisory-feed` flag or an
+    `extra_env` entry overrides this, and the implicit-default tests hand-roll
+    their own start)."""
+    env.setdefault("PYPIRON_ADVISORY_FEED", "")
+
+
 def _s3_env(minio: Dict, bind: str) -> Dict[str, str]:
     # Both single- and multi-bucket fixtures go through the one `--buckets` knob:
     # a `buckets` list becomes the multi-bucket topology, a single `bucket` a
     # one-entry `s3://name` list (ordinary single-bucket mode). Region rides on
     # the ambient AWS_REGION knob.
     env = os.environ.copy()
+    _no_default_advisory_feed(env)
     names = minio.get("buckets") or [minio["bucket"]]
     env["PYPIRON_BUCKETS"] = s3_buckets_uri(*names)
     env.update(
@@ -2305,6 +2312,7 @@ def s3_server_presigned_fast_counters(
 def _cloud_creds_env(bind: str) -> Dict[str, str]:
     """Common pypiron env (auth, bind, fast worker) for a cloud-backed server."""
     env = os.environ.copy()
+    _no_default_advisory_feed(env)
     env.update(
         {
             "PYPIRON_BIND_ADDR": bind,
@@ -2638,6 +2646,7 @@ def _mixed_env(mixed: Dict, bind: str) -> Dict[str, str]:
     s3 = mixed["s3"]
     az = mixed["azure"]
     env = os.environ.copy()
+    _no_default_advisory_feed(env)
     env.update(
         {
             "PYPIRON_BIND_ADDR": bind,
